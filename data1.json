@@ -1,0 +1,270 @@
+[
+  {
+    "model": "CustomUser.CustomUser",
+    "pk": 1,
+    "fields": {
+      "password": "pbkdf2_sha256$390000$testpassword$fakehash",
+      "is_superuser": true,
+      "username": "admin",
+      "first_name": "مدیر",
+      "last_name": "سیستم",
+      "email": "admin@example.com",
+      "is_staff": true,
+      "is_active": true,
+      "date_joined": "2026-01-01T08:00:00Z"
+    }
+  },
+  {
+    "model": "CustomUser.CustomUser",
+    "pk": 2,
+    "fields": {
+      "password": "pbkdf2_sha256$390000$testpassword$fakehash",
+      "is_superuser": false,
+      "username": "mina",
+      "first_name": "مینا",
+      "last_name": "احمدی",
+      "email": "mina@example.com",
+      "is_staff": false,
+      "is_active": true,
+      "date_joined": "2026-02-01T09:00:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.project",
+    "pk": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+    "fields": {
+      "name": "پروژه استقرار سامانه نرم‌افزاری شرکت",
+      "created_by": 1,
+      "created_at": "2026-05-25T12:00:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.calendar",
+    "pk": 1,
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "name": "تقویم کاری استاندارد ایران (شنبه تا چهارشنبه)",
+      "is_default": true
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 1,
+    "fields": {
+      "calendar": 1,
+      "weekday": 5,
+      "start_time": "08:00:00",
+      "end_time": "17:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 2,
+    "fields": {
+      "calendar": 1,
+      "weekday": 6,
+      "start_time": "08:00:00",
+      "end_time": "17:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 3,
+    "fields": {
+      "calendar": 1,
+      "weekday": 0,
+      "start_time": "08:00:00",
+      "end_time": "17:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 4,
+    "fields": {
+      "calendar": 1,
+      "weekday": 1,
+      "start_time": "08:00:00",
+      "end_time": "17:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 5,
+    "fields": {
+      "calendar": 1,
+      "weekday": 2,
+      "start_time": "08:00:00",
+      "end_time": "14:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.calendarexception",
+    "pk": 1,
+    "fields": {
+      "calendar": 1,
+      "date": "2026-06-05",
+      "is_working": false,
+      "description": "تعطیلات رسمی مناسبتی ایران"
+    }
+  },
+  {
+    "model": "ktcPlanning.revision",
+    "pk": 1,
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "number": 0,
+      "description": "برنامه زمان‌بندی اولیه (Baseline 0)",
+      "is_baseline": true,
+      "created_by": 1,
+      "approved_by": 1,
+      "approved_at": "2026-05-25T13:00:00Z",
+      "created_at": "2026-05-25T12:30:00Z",
+      "project_start": "2026-05-30T08:00:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.wbsnode",
+    "pk": "11111111-2222-3333-4444-555555555555",
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "created_at": "2026-05-25T12:35:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.wbsnode",
+    "pk": "22222222-3333-4444-5555-666666666666",
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "created_at": "2026-05-25T12:35:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.wbsnodeversion",
+    "pk": 1,
+    "fields": {
+      "node": "11111111-2222-3333-4444-555555555555",
+      "revision": 1,
+      "parent": null,
+      "title": "فاز ۱: شناخت و تحلیل نیازمندی‌ها",
+      "sequence": 1,
+      "is_deleted": false,
+      "lft": 1,
+      "rght": 4,
+      "tree_id": 1,
+      "level": 0
+    }
+  },
+  {
+    "model": "ktcPlanning.wbsnodeversion",
+    "pk": 2,
+    "fields": {
+      "node": "22222222-3333-4444-5555-666666666666",
+      "revision": 1,
+      "parent": 1,
+      "title": "مراحل طراحی پایگاه داده",
+      "sequence": 1,
+      "is_deleted": false,
+      "lft": 2,
+      "rght": 3,
+      "tree_id": 1,
+      "level": 1
+    }
+  },
+  {
+    "model": "ktcPlanning.task",
+    "pk": "f1111111-aaaa-bbbb-cccc-dddddddddddd",
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "created_at": "2026-05-25T12:40:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.task",
+    "pk": "f2222222-aaaa-bbbb-cccc-dddddddddddd",
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "created_at": "2026-05-25T12:40:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.taskversion",
+    "pk": 1,
+    "fields": {
+      "task": "f1111111-aaaa-bbbb-cccc-dddddddddddd",
+      "revision": 1,
+      "wbs_node": 1,
+      "title": "برگزاری جلسات طوفان فکری و مصاحبه با ذینفعان",
+      "calendar": 1,
+      "planned_start": "2026-05-30T08:00:00Z",
+      "planned_finish": "2026-06-02T17:00:00Z",
+      "duration_hours": "24.00",
+      "is_deleted": false
+    }
+  },
+  {
+    "model": "ktcPlanning.taskversion",
+    "pk": 2,
+    "fields": {
+      "task": "f2222222-aaaa-bbbb-cccc-dddddddddddd",
+      "revision": 1,
+      "wbs_node": 2,
+      "title": "طراحی اولیه دیتابیس (ERD)",
+      "calendar": 1,
+      "planned_start": "2026-06-03T08:00:00Z",
+      "planned_finish": "2026-06-07T17:00:00Z",
+      "duration_hours": "32.00",
+      "is_deleted": false
+    }
+  },
+  {
+    "model": "ktcPlanning.dependency",
+    "pk": 1,
+    "fields": {
+      "revision": 1,
+      "predecessor": "f1111111-aaaa-bbbb-cccc-dddddddddddd",
+      "successor": "f2222222-aaaa-bbbb-cccc-dddddddddddd",
+      "dependency_type": "FS",
+      "lag_hours": 0
+    }
+  },
+  {
+    "model": "ktcPlanning.resource",
+    "pk": 1,
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "name": "مینا احمدی (توسعه‌دهنده ارشد)",
+      "user": 2,
+      "capacity_hours_per_day": "8.00"
+    }
+  },
+  {
+    "model": "ktcPlanning.assignment",
+    "pk": 1,
+    "fields": {
+      "revision": 1,
+      "task": "f1111111-aaaa-bbbb-cccc-dddddddddddd",
+      "resource": 1,
+      "units_percent": "100.00"
+    }
+  },
+  {
+    "model": "ktcPlanning.taskrole",
+    "pk": 1,
+    "fields": {
+      "revision": 1,
+      "task": "f1111111-aaaa-bbbb-cccc-dddddddddddd",
+      "user": 2,
+      "role": "executor"
+    }
+  },
+  {
+    "model": "ktcPlanning.taskrole",
+    "pk": 2,
+    "fields": {
+      "revision": 1,
+      "task": "f2222222-aaaa-bbbb-cccc-dddddddddddd",
+      "user": 2,
+      "role": "owner"
+    }
+  }
+]

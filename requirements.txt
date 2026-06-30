@@ -1,0 +1,14 @@
+# --- Core ---
+Django>=6.0,<6.1
+
+# --- PostgreSQL driver (psycopg 3, recommended for Django 4.2+) ---
+# The [binary] extra ships precompiled wheels so you don't need libpq-dev.
+psycopg[binary]>=3.1,<4.0
+
+# --- API stack ---
+djangorestframework>=3.15
+djangorestframework-simplejwt>=5.3
+django-cors-headers>=4.4
+
+# --- Config ---
+python-dotenv>=1.0

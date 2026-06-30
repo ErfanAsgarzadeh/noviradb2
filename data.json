@@ -1,0 +1,291 @@
+[
+  {
+    "model": "CustomUser.CustomUser",
+    "pk": 1,
+    "fields": {
+      "username": "manager",
+      "first_name": "مدیر پروژه",
+      "is_staff": true,
+      "is_active": true
+    }
+  },
+  {
+    "model": "CustomUser.CustomUser",
+    "pk": 2,
+    "fields": {
+      "username": "engineer_1",
+      "first_name": "مهندس ارشد",
+      "is_active": true
+    }
+  },
+  {
+    "model": "CustomUser.CustomUser",
+    "pk": 3,
+    "fields": {
+      "username": "engineer_2",
+      "first_name": "توسعه‌دهنده",
+      "is_active": true
+    }
+  },
+  {
+    "model": "ktcPlanning.project",
+    "pk": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+    "fields": {
+      "name": "پروژه توسعه نرم‌افزار آلفا",
+      "created_by": 1,
+      "created_at": "2026-05-25T12:00:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.calendar",
+    "pk": 1,
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "name": "تقویم استاندارد ایران",
+      "is_default": true
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 1,
+    "fields": {
+      "calendar": 1,
+      "weekday": 5,
+      "start_time": "08:00:00",
+      "end_time": "17:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 2,
+    "fields": {
+      "calendar": 1,
+      "weekday": 6,
+      "start_time": "08:00:00",
+      "end_time": "17:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 3,
+    "fields": {
+      "calendar": 1,
+      "weekday": 0,
+      "start_time": "08:00:00",
+      "end_time": "17:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 4,
+    "fields": {
+      "calendar": 1,
+      "weekday": 1,
+      "start_time": "08:00:00",
+      "end_time": "17:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 5,
+    "fields": {
+      "calendar": 1,
+      "weekday": 2,
+      "start_time": "08:00:00",
+      "end_time": "17:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.workinginterval",
+    "pk": 6,
+    "fields": {
+      "calendar": 1,
+      "weekday": 3,
+      "start_time": "08:00:00",
+      "end_time": "12:00:00"
+    }
+  },
+  {
+    "model": "ktcPlanning.calendarexception",
+    "pk": 1,
+    "fields": {
+      "calendar": 1,
+      "date": "2024-03-20",
+      "is_working": false,
+      "description": "۱ فروردین - عید نوروز"
+    }
+  },
+  {
+    "model": "ktcPlanning.calendarexception",
+    "pk": 2,
+    "fields": {
+      "calendar": 1,
+      "date": "2024-03-21",
+      "is_working": false,
+      "description": "۲ فروردین - عید نوروز"
+    }
+  },
+  {
+    "model": "ktcPlanning.revision",
+    "pk": 1,
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "number": 1,
+      "description": "نسخه اولیه برنامه زمان‌بندی",
+      "is_baseline": true,
+      "approved_by": 1,
+      "approved_at": "2024-04-01T10:00:00Z",
+      "created_at": "2024-04-01T08:00:00Z",
+      "project_start": "2024-04-02T04:30:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.wbsnode",
+    "pk": 1,
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "parent": null,
+      "title": "کل پروژه آلفا",
+      "sequence": 1,
+      "lft": 1,
+      "rght": 6,
+      "tree_id": 1,
+      "level": 0
+    }
+  },
+  {
+    "model": "ktcPlanning.wbsnode",
+    "pk": 2,
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "parent": 1,
+      "title": "فاز ۱: نیازمندی‌ها و طراحی",
+      "sequence": 1,
+      "lft": 2,
+      "rght": 3,
+      "tree_id": 1,
+      "level": 1
+    }
+  },
+  {
+    "model": "ktcPlanning.wbsnode",
+    "pk": 3,
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "parent": 1,
+      "title": "فاز ۲: توسعه و پیاده‌سازی",
+      "sequence": 2,
+      "lft": 4,
+      "rght": 5,
+      "tree_id": 1,
+      "level": 1
+    }
+  },
+  {
+    "model": "ktcPlanning.task",
+    "pk": "11111111-1111-1111-1111-111111111111",
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "created_at": "2024-04-01T08:30:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.task",
+    "pk": "22222222-2222-2222-2222-222222222222",
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "created_at": "2024-04-01T08:35:00Z"
+    }
+  },
+  {
+    "model": "ktcPlanning.taskversion",
+    "pk": 1,
+    "fields": {
+      "task": "11111111-1111-1111-1111-111111111111",
+      "revision": 1,
+      "wbs_node": 2,
+      "title": "تحلیل نیازمندی‌ها و ساخت مستند معماری",
+      "calendar": 1,
+      "duration_hours": "40.00",
+      "planned_start": null,
+      "planned_finish": null,
+      "is_deleted": false
+    }
+  },
+  {
+    "model": "ktcPlanning.taskversion",
+    "pk": 2,
+    "fields": {
+      "task": "22222222-2222-2222-2222-222222222222",
+      "revision": 1,
+      "wbs_node": 3,
+      "title": "طراحی و توسعه دیتابیس (Schema)",
+      "calendar": 1,
+      "duration_hours": "24.00",
+      "planned_start": null,
+      "planned_finish": null,
+      "is_deleted": false
+    }
+  },
+  {
+    "model": "ktcPlanning.dependency",
+    "pk": 1,
+    "fields": {
+      "revision": 1,
+      "predecessor": "11111111-1111-1111-1111-111111111111",
+      "successor": "22222222-2222-2222-2222-222222222222",
+      "dependency_type": "FS",
+      "lag_hours": 0
+    }
+  },
+  {
+    "model": "ktcPlanning.resource",
+    "pk": 1,
+    "fields": {
+      "project": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
+      "name": "تیم مهندسی نرم‌افزار",
+      "user": 2,
+      "capacity_hours_per_day": "8.00"
+    }
+  },
+  {
+    "model": "ktcPlanning.assignment",
+    "pk": 1,
+    "fields": {
+      "revision": 1,
+      "task": "11111111-1111-1111-1111-111111111111",
+      "resource": 1,
+      "units_percent": "100.00"
+    }
+  },
+  {
+    "model": "ktcPlanning.taskrole",
+    "pk": 1,
+    "fields": {
+      "revision": 1,
+      "task": "11111111-1111-1111-1111-111111111111",
+      "user": 1,
+      "role": "reviewer"
+    }
+  },
+  {
+    "model": "ktcPlanning.taskrole",
+    "pk": 2,
+    "fields": {
+      "revision": 1,
+      "task": "11111111-1111-1111-1111-111111111111",
+      "user": 2,
+      "role": "executor"
+    }
+  },
+  {
+    "model": "ktcPlanning.taskrole",
+    "pk": 3,
+    "fields": {
+      "revision": 1,
+      "task": "22222222-2222-2222-2222-222222222222",
+      "user": 3,
+      "role": "executor"
+    }
+  }
+]
