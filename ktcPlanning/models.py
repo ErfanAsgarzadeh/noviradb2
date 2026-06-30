@@ -910,6 +910,178 @@ class ExpenseType(models.Model):
         return self.name
 
 
+class FundingSource(models.Model):
+    SOURCE_TYPES = [
+        ("CLIENT_PAYMENT", "Client Payment"),
+        ("INTERNAL_CAPITAL", "Internal Capital"),
+        ("LOAN", "Loan"),
+        ("CONTRACT", "Contract"),
+        ("GRANT", "Grant"),
+        ("OTHER", "Other"),
+    ]
+
+    title = models.CharField(max_length=255)
+    source_type = models.CharField(max_length=32, choices=SOURCE_TYPES)
+    source_party = models.CharField(max_length=255, blank=True)
+    reference_no = models.CharField(max_length=100, blank=True)
+    received_date = models.DateField()
+    total_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    currency = models.CharField(max_length=8, default="IRR")
+    description = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-received_date", "-created_at"]
+
+    def clean(self):
+        super().clean()
+        if self.total_amount is not None and self.total_amount <= 0:
+            raise ValidationError("Funding amount must be greater than zero.")
+
+    @property
+    def allocated_amount(self):
+        result = self.allocations.aggregate(total=models.Sum("allocated_amount"))
+        return result["total"] or 0
+
+    @property
+    def unallocated_amount(self):
+        return self.total_amount - self.allocated_amount
+
+    def __str__(self):
+        return f"{self.title} - {self.total_amount}"
+
+
+class BudgetAllocation(models.Model):
+    SCOPE_TYPES = [
+        ("PROJECT", "Project"),
+        ("WBS", "WBS"),
+        ("TASK", "Task"),
+        ("RESERVE", "Reserve"),
+        ("ORG_UNIT", "Org Unit"),
+    ]
+
+    COST_TYPES = [
+        ("LABOR", "Labor"),
+        ("MATERIAL", "Material"),
+        ("EQUIPMENT", "Equipment"),
+        ("EXPENSE", "Expense"),
+        ("SUBCONTRACT", "Subcontract"),
+        ("COST", "Cost"),
+        ("OVERHEAD", "Overhead"),
+        ("RESERVE", "Reserve"),
+    ]
+
+    funding_source = models.ForeignKey(
+        FundingSource,
+        on_delete=models.PROTECT,
+        related_name="allocations",
+    )
+    project = models.ForeignKey(
+        Project,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="budget_allocations",
+    )
+    revision = models.ForeignKey(
+        Revision,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="budget_allocations",
+    )
+    scope_type = models.CharField(max_length=16, choices=SCOPE_TYPES)
+    wbs_node = models.ForeignKey(
+        WBSNodeVersion,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="budget_allocations",
+    )
+    task = models.ForeignKey(
+        Task,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="budget_allocations",
+    )
+    org_unit = models.ForeignKey(
+        'CustomUser.OrgUnit',
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="budget_allocations",
+    )
+    cost_type = models.CharField(max_length=20, choices=COST_TYPES)
+    allocated_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    description = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["project__name", "scope_type", "cost_type"]
+        indexes = [
+            models.Index(fields=["project", "scope_type"]),
+            models.Index(fields=["project", "cost_type"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.allocated_amount is not None and self.allocated_amount <= 0:
+            raise ValidationError("Allocated amount must be greater than zero.")
+
+        project_scopes = {"PROJECT", "WBS", "TASK"}
+        if self.scope_type in project_scopes and not self.project_id:
+            raise ValidationError("Project is required for project, WBS, and task allocations.")
+
+        if self.revision_id and self.revision.project_id != self.project_id:
+            raise ValidationError("Revision must belong to the selected project.")
+        if self.task_id and self.task.project_id != self.project_id:
+            raise ValidationError("Task must belong to the selected project.")
+        if self.wbs_node_id and self.wbs_node.revision.project_id != self.project_id:
+            raise ValidationError("WBS node must belong to the selected project.")
+
+        if self.scope_type == "TASK" and not self.task_id:
+            raise ValidationError("Task allocation requires a task.")
+        if self.scope_type == "WBS" and not self.wbs_node_id:
+            raise ValidationError("WBS allocation requires a WBS node.")
+        if self.scope_type == "ORG_UNIT" and not self.org_unit_id:
+            raise ValidationError("Org unit allocation requires an org unit.")
+
+        if self.scope_type != "TASK" and self.task_id:
+            raise ValidationError("Task can only be set for TASK allocations.")
+        if self.scope_type != "WBS" and self.wbs_node_id:
+            raise ValidationError("WBS node can only be set for WBS allocations.")
+        if self.scope_type != "ORG_UNIT" and self.org_unit_id:
+            raise ValidationError("Org unit can only be set for ORG_UNIT allocations.")
+
+        if not self.funding_source_id:
+            raise ValidationError("Funding source is required.")
+
+        existing = BudgetAllocation.objects.filter(
+            funding_source=self.funding_source
+        )
+        if self.pk:
+            existing = existing.exclude(pk=self.pk)
+        current_total = existing.aggregate(total=models.Sum("allocated_amount"))["total"] or 0
+        if self.funding_source_id and current_total + self.allocated_amount > self.funding_source.total_amount:
+            raise ValidationError("Allocations cannot exceed funding source amount.")
+
+    @property
+    def actual_amount(self):
+        result = self.transactions.aggregate(total=models.Sum("amount"))
+        return result["total"] or 0
+
+    @property
+    def remaining_amount(self):
+        return self.allocated_amount - self.actual_amount
+
+    def __str__(self):
+        target = self.project or self.org_unit or "Company"
+        return f"{target} - {self.scope_type} - {self.allocated_amount}"
+
+
 class CostTransaction(models.Model):
     TRANSACTION_TYPES = [
         ("LABOR", "Labor"),
@@ -970,6 +1142,13 @@ class CostTransaction(models.Model):
         on_delete=models.SET_NULL
     )
 
+    budget_allocation = models.ForeignKey(
+        BudgetAllocation,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="transactions",
+    )
 
     transaction_type = models.CharField(
         max_length=20,
@@ -1019,14 +1198,34 @@ class CostTransaction(models.Model):
         ordering = ["-transaction_date", "-created_at"]
 
     def clean(self):
+        super().clean()
+
+        if self.quantity is not None and self.quantity <= 0:
+            raise ValidationError("Quantity must be greater than zero.")
+
+        if (
+            self.budget_allocation_id
+            and self.budget_allocation.project_id
+            and self.budget_allocation.project_id != self.project_id
+        ):
+            raise ValidationError("Budget allocation must belong to the selected project.")
 
         if self.transaction_type == "EXPENSE":
 
             if not self.expense_type:
                 raise ValidationError("ExpenseType is required.")
 
+            if self.expense_rate is None:
+                raise ValidationError("Expense rate is required.")
+
             if self.resource_rate:
                 raise ValidationError("Expense cannot have ResourceRate.")
+
+            if self.assignment:
+                raise ValidationError("Expense cannot have Assignment.")
+
+            if self.expense_rate < 0:
+                raise ValidationError("Expense rate cannot be negative.")
 
         else:
 
@@ -1041,14 +1240,41 @@ class CostTransaction(models.Model):
                     "ResourceRate must belong to Assignment resource."
                 )
 
+            if self.task_id and self.assignment.task_id != self.task_id:
+                raise ValidationError("Assignment must belong to the selected task.")
+
+            if self.revision_id and self.assignment.revision_id != self.revision_id:
+                raise ValidationError("Assignment must belong to the selected revision.")
+
+            if self.resource_rate.regular_rate < 0:
+                raise ValidationError("Resource rate cannot be negative.")
+
     def save(self, *args, **kwargs):
 
         if self.transaction_type == "EXPENSE":
+            if self.expense_rate is None:
+                raise ValidationError("Expense rate is required.")
             rate = self.expense_rate
+            self.assignment = None
+            self.resource_rate = None
+            self.resource = None
         else:
+            if not self.assignment:
+                raise ValidationError("Assignment is required.")
+            if not self.resource_rate:
+                raise ValidationError("ResourceRate is required.")
+            if self.assignment:
+                if not self.task_id:
+                    self.task = self.assignment.task
+                if not self.revision_id:
+                    self.revision = self.assignment.revision
+                self.resource = self.assignment.resource
             rate = self.resource_rate.regular_rate
+            if self.unit_rate is None:
+                self.unit_rate = rate
 
         self.amount = self.quantity * rate
+        self.full_clean()
 
         super().save(*args, **kwargs)
 

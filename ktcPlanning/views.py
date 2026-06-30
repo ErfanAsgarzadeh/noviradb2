@@ -8,6 +8,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.db import transaction
+from django.db.models import Q
 from datetime import date, timedelta, datetime
 from decimal import Decimal
 from collections import defaultdict
@@ -19,7 +20,7 @@ from .cpm import CPMEngine
 from .models import Project, Revision, WBSNodeVersion, TaskVersion, Dependency, TaskRole, Task, WBSNode, TaskReportLog, \
     TaskActual, TaskChatMessage, Assignment, Resource, ResourcePool, ResourceRole, ResourceSkill, ResourceSkillMapping, \
     ResourceException, ResourceRate, VarianceReport, Calendar, ProjectViewer, SystemSettings, UnitOfMeasure, \
-    ExpenseType, CostTransaction
+    ExpenseType, FundingSource, BudgetAllocation, CostTransaction
 from .serializers import (
     ProjectSerializer,
     RevisionSerializer,
@@ -30,7 +31,8 @@ from .serializers import (
     ResourceRoleSerializer, ResourceSkillSerializer, ResourceSerializer, ResourceSkillMappingSerializer,
     ResourceExceptionSerializer, ResourceRateSerializer, AssignmentSerializer, VarianceReportSerializer,
     CalendarSerializer, ProjectViewerSerializer, SystemSettingsSerializer, UnitOfMeasureSerializer,
-    ExpenseTypeSerializer, CostTransactionSerializer, TaskDropdownSerializer
+    ExpenseTypeSerializer, FundingSourceSerializer, BudgetAllocationSerializer,
+    CostTransactionSerializer, TaskDropdownSerializer
 )
 from rest_framework.parsers import MultiPartParser, FormParser
 
@@ -363,9 +365,21 @@ class WbsNodeViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
         queryset = queryset.filter(revision__project_id__in=accessible_project_ids(self.request.user))
+        project_id = self.request.query_params.get('project_id')
+        if project_id:
+            queryset = queryset.filter(revision__project_id=project_id)
         revision_id = self.request.query_params.get('revision_id')
         if revision_id:
             queryset = queryset.filter(revision_id=revision_id)
+        elif project_id:
+            revision = (
+                Revision.objects.filter(project_id=project_id, approved_at__isnull=True).order_by('-number').first()
+                or Revision.objects.filter(project_id=project_id).order_by('-number').first()
+            )
+            if revision:
+                queryset = queryset.filter(revision=revision)
+        else:
+            queryset = queryset.filter(revision__approved_at__isnull=True)
         return queryset
 
     # --- هندل کردن ساخت صحیح گره WBS ---
@@ -1581,6 +1595,57 @@ class ExpenseTypeViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
 
+class FundingSourceViewSet(viewsets.ModelViewSet):
+    queryset = FundingSource.objects.all().order_by('-received_date', '-created_at')
+    serializer_class = FundingSourceSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        source_type = self.request.query_params.get('source_type')
+        if source_type:
+            queryset = queryset.filter(source_type=source_type)
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+
+class BudgetAllocationViewSet(viewsets.ModelViewSet):
+    queryset = BudgetAllocation.objects.select_related(
+        'funding_source', 'project', 'revision', 'wbs_node', 'task', 'org_unit'
+    ).all()
+    serializer_class = BudgetAllocationSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        queryset = queryset.filter(
+            Q(project_id__in=accessible_project_ids(self.request.user)) |
+            Q(project__isnull=True)
+        )
+
+        project_id = self.request.query_params.get('project_id')
+        if project_id:
+            queryset = queryset.filter(project_id=project_id)
+        funding_source_id = self.request.query_params.get('funding_source_id')
+        if funding_source_id:
+            queryset = queryset.filter(funding_source_id=funding_source_id)
+        scope_type = self.request.query_params.get('scope_type')
+        if scope_type:
+            queryset = queryset.filter(scope_type=scope_type)
+        cost_type = self.request.query_params.get('cost_type')
+        if cost_type:
+            queryset = queryset.filter(cost_type=cost_type)
+        task_id = self.request.query_params.get('task_id')
+        if task_id:
+            queryset = queryset.filter(task_id=task_id)
+        return queryset
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+
 class CostTransactionViewSet(viewsets.ModelViewSet):
     """مدیریت تراکنش‌های مالی و هزینه‌ها"""
     queryset = CostTransaction.objects.all().order_by('-transaction_date', '-created_at')
@@ -1595,6 +1660,12 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
         project_id = self.request.query_params.get('project_id')
         if project_id:
             queryset = queryset.filter(project_id=project_id)
+        transaction_type = self.request.query_params.get('transaction_type')
+        if transaction_type:
+            queryset = queryset.filter(transaction_type=transaction_type)
+        task_id = self.request.query_params.get('task_id')
+        if task_id:
+            queryset = queryset.filter(task_id=task_id)
         return queryset
 
     def perform_create(self, serializer):
@@ -1618,5 +1689,11 @@ class TaskViewSet(viewsets.ReadOnlyModelViewSet):
         project_id = self.request.query_params.get('project_id')
         if project_id:
             queryset = queryset.filter(project_id=project_id)
+        wbs_node_id = self.request.query_params.get('wbs_node_id')
+        if wbs_node_id:
+            queryset = queryset.filter(
+                versions__wbs_node__node_id=wbs_node_id,
+                versions__is_deleted=False,
+            ).distinct()
 
         return queryset

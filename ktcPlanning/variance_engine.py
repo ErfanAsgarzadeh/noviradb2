@@ -5,7 +5,7 @@ from django.utils import timezone
 from django.db import transaction
 
 from ktcPlanning.models import (
-    Project, Revision, TaskVersion, TaskReportLog, VarianceReport, Calendar
+    Project, Revision, TaskVersion, VarianceReport, Calendar, CostTransaction
 )
 # فرض می‌کنیم CalendarEngine در مسیر زیر قرار دارد
 from ktcPlanning.calendar import CalendarEngine
@@ -122,13 +122,13 @@ class EVMEngine:
             )
         }
 
-        # حل مشکل N+1 Query برای محاسبه AC
-        # استخراج مجموع ساعات کاری تایید شده برای تمام تسک‌های این پروژه در یک کوئری
+        # AC is the sum of posted cost transactions up to the engine data date.
         active_task_ids = [tv.task_id for tv in active_tvs]
-        ac_aggregates = TaskReportLog.objects.filter(
+        ac_aggregates = CostTransaction.objects.filter(
+            project_id=self.project_id,
             task_id__in=active_task_ids,
-            is_approved=True
-        ).values('task_id').annotate(total_ac=Sum('time_spent_hours'))
+            transaction_date__lte=self.data_datetime.date(),
+        ).values('task_id').annotate(total_ac=Sum('amount'))
 
         # تبدیل به دیکشنری برای دسترسی سریع: {task_id: total_ac}
         ac_dict = {item['task_id']: (item['total_ac'] or Decimal('0.00')) for item in ac_aggregates}

@@ -9,7 +9,8 @@ from .views import (
     ImportMSPView, ResourcePoolViewSet, AssignmentViewSet, ResourceRateViewSet, ResourceExceptionViewSet,
     ResourceSkillMappingViewSet, ResourceViewSet, ResourceSkillViewSet, ResourceRoleViewSet, PersonalTaskViewSet,
     VarianceReportViewSet, CalendarViewSet, ProjectViewerViewSet, SystemSettingsView, ExpenseTypeViewSet,
-    UnitOfMeasureViewSet, CostTransactionViewSet, TaskViewSet
+    UnitOfMeasureViewSet, FundingSourceViewSet, BudgetAllocationViewSet,
+    CostTransactionViewSet, TaskViewSet
 )
 
 # ایجاد یک نمونه از روتور پیش‌فرض DRF
@@ -39,6 +40,8 @@ router.register(r'personal-tasks', PersonalTaskViewSet, basename='personal-tasks
 router.register(r'variance-reports', VarianceReportViewSet, basename='variance-report')
 router.register(r'expense-types', ExpenseTypeViewSet, basename='expense-type')
 router.register(r'units-of-measure', UnitOfMeasureViewSet, basename='unit-of-measure')
+router.register(r'funding-sources', FundingSourceViewSet, basename='funding-source')
+router.register(r'budget-allocations', BudgetAllocationViewSet, basename='budget-allocation')
 router.register(r'cost-transactions', CostTransactionViewSet, basename='cost-transaction')
 router.register(r'tasks', TaskViewSet, basename='task')
 # مسیرهای نهایی اپلیکیشن

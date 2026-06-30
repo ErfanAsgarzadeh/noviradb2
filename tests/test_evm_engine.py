@@ -17,6 +17,7 @@ from decimal import Decimal
 from ktcPlanning.variance_engine import EVMEngine
 from ktcPlanning.models import (
     VarianceReport, TaskActual, TaskVersion, Revision,
+    UnitOfMeasure, ExpenseType, CostTransaction, TaskReportLog,
 )
 from .factories import (
     make_company_admin, make_project, make_revision,
@@ -168,6 +169,41 @@ class TestEVMCalculation:
         assert float(report.budget_at_completion) == pytest.approx(
             float(self.tv.duration_hours), abs=0.01
         )
+
+    def test_actual_cost_comes_from_cost_transactions(self):
+        set_task_actual(self.tv, progress=100)
+        TaskReportLog.objects.create(
+            task=self.task,
+            user=self.admin,
+            status="on-track",
+            progress_percent=100,
+            time_spent_hours=99,
+            is_approved=True,
+        )
+        unit = UnitOfMeasure.objects.create(code="EA", name="Each")
+        expense_type = ExpenseType.objects.create(
+            name="Direct Cost",
+            unit=unit,
+        )
+        CostTransaction.objects.create(
+            project=self.project,
+            revision=self.revision,
+            task=self.task,
+            transaction_type="EXPENSE",
+            transaction_date=timezone.now().date(),
+            quantity=Decimal("3.00"),
+            expense_rate=Decimal("10.00"),
+            expense_type=expense_type,
+            created_by=self.admin,
+        )
+
+        engine = EVMEngine(project_id=self.project.id)
+        engine.run_task_level_variances()
+
+        report = VarianceReport.objects.get(
+            task=self.task, revision=self.revision
+        )
+        assert report.actual_cost == Decimal("30.00")
 
 
 # ══════════════════════════════════════════════════════════

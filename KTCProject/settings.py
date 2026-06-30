@@ -20,12 +20,28 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Load environment variables from a local .env file (if present).
 # Keeps secrets and DB credentials out of the codebase.
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding='utf-8').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+
+        key, value = line.split('=', 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 try:
     from dotenv import load_dotenv
     load_dotenv(BASE_DIR / '.env')
 except ImportError:
-    # python-dotenv is optional; env vars can also be set by the shell.
-    pass
+    # Keep local development working even when python-dotenv is not installed.
+    _load_env_file(BASE_DIR / '.env')
 
 
 # Quick-start development settings - unsuitable for production

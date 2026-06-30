@@ -4,4 +4,6 @@ from .models import *
 
 admin.site.register(Project)
 admin.site.register(WBSNode)
+admin.site.register(FundingSource)
+admin.site.register(BudgetAllocation)
 
