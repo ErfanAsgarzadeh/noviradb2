@@ -509,7 +509,6 @@ class ResourceRateSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'resource',
-            'budget_allocation',
             'effective_from',
             'regular_rate',
             'overtime_rate',
@@ -707,6 +706,38 @@ class BudgetAllocationSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class BudgetConsumptionSerializer(serializers.ModelSerializer):
+    budget_allocation_label = serializers.SerializerMethodField()
+    funding_source_title = serializers.CharField(source='budget_allocation.funding_source.title', read_only=True)
+
+    class Meta:
+        model = BudgetConsumption
+        fields = [
+            'id',
+            'budget_allocation',
+            'budget_allocation_label',
+            'funding_source_title',
+            'amount',
+            'created_at',
+        ]
+        read_only_fields = fields
+
+    def get_budget_allocation_label(self, obj):
+        allocation = obj.budget_allocation
+        target = allocation.project_name if hasattr(allocation, 'project_name') else None
+        if allocation.task_id:
+            target = f"Task {allocation.task_id}"
+        elif allocation.wbs_node_id:
+            target = allocation.wbs_node.title
+        elif allocation.project_id:
+            target = allocation.project.name
+        elif allocation.org_unit_id:
+            target = allocation.org_unit.name
+        else:
+            target = "Company"
+        return f"{allocation.funding_source.title} / {target} / {allocation.cost_type}"
+
+
 class CostTransactionSerializer(serializers.ModelSerializer):
     # فیلدهای read-only که بکند محاسبه می‌کند
     amount = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
@@ -717,6 +748,7 @@ class CostTransactionSerializer(serializers.ModelSerializer):
     resource_name = serializers.CharField(source='resource.name', read_only=True, default=None)
     expense_type_name = serializers.CharField(source='expense_type.name', read_only=True, default=None)
     task_title = serializers.SerializerMethodField()
+    budget_consumptions = BudgetConsumptionSerializer(many=True, read_only=True)
 
     class Meta:
         model = CostTransaction
@@ -729,6 +761,7 @@ class CostTransactionSerializer(serializers.ModelSerializer):
             'resource_rate',   # FK — برای non-EXPENSE اجباری
             'resource',        # FK — اختیاری (خوانده می‌شود از resource_rate.resource در clean)
             'expense_type',    # FK — برای EXPENSE اجباری
+            'budget_allocation',
             'transaction_type',
             'transaction_date',
             'quantity',
@@ -742,8 +775,9 @@ class CostTransactionSerializer(serializers.ModelSerializer):
             'resource_name',
             'expense_type_name',
             'task_title',
+            'budget_consumptions',
         ]
-        read_only_fields = ['amount', 'created_by', 'created_at']
+        read_only_fields = ['amount', 'created_by', 'created_at', 'budget_consumptions']
 
     def get_task_title(self, obj):
         if not obj.task:
@@ -768,6 +802,7 @@ class CostTransactionSerializer(serializers.ModelSerializer):
         budget_allocation = value('budget_allocation')
         expense_type = value('expense_type')
         expense_rate = value('expense_rate')
+        unit_rate = value('unit_rate')
 
         if quantity is not None and quantity <= 0:
             raise serializers.ValidationError({'quantity': 'Quantity must be greater than zero.'})
@@ -794,9 +829,14 @@ class CostTransactionSerializer(serializers.ModelSerializer):
 
         if not assignment:
             raise serializers.ValidationError({'assignment': 'Assignment is required.'})
-        if not resource_rate:
+        if transaction_type == 'COST':
+            if unit_rate is None:
+                raise serializers.ValidationError({'unit_rate': 'Unit rate is required for cost resources.'})
+            if unit_rate < 0:
+                raise serializers.ValidationError({'unit_rate': 'Unit rate cannot be negative.'})
+        elif not resource_rate:
             raise serializers.ValidationError({'resource_rate': 'ResourceRate is required.'})
-        if resource_rate.resource_id != assignment.resource_id:
+        if resource_rate and resource_rate.resource_id != assignment.resource_id:
             raise serializers.ValidationError({'resource_rate': 'ResourceRate must belong to Assignment resource.'})
         if task and assignment.task_id != task.id:
             raise serializers.ValidationError({'assignment': 'Assignment must belong to the selected task.'})

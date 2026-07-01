@@ -8,7 +8,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.core.exceptions import ValidationError as DjangoValidationError
 from datetime import date, timedelta, datetime
 from decimal import Decimal
@@ -21,7 +21,7 @@ from .cpm import CPMEngine
 from .models import Project, Revision, WBSNodeVersion, TaskVersion, Dependency, TaskRole, Task, WBSNode, TaskReportLog, \
     TaskActual, TaskChatMessage, Assignment, Resource, ResourcePool, ResourceRole, ResourceSkill, ResourceSkillMapping, \
     ResourceException, ResourceRate, VarianceReport, Calendar, ProjectViewer, SystemSettings, UnitOfMeasure, \
-    ExpenseType, FundingSource, BudgetAllocation, CostTransaction, TaskReportAttachment
+    ExpenseType, FundingSource, BudgetAllocation, CostTransaction, TaskReportAttachment, BudgetConsumption
 from .serializers import (
     ProjectSerializer,
     RevisionSerializer,
@@ -1686,9 +1686,100 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(task_id=task_id)
         return queryset
 
+    def _allocation_remaining(self, allocation):
+        consumed = allocation.consumptions.aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        legacy_direct = allocation.transactions.filter(budget_consumptions__isnull=True).aggregate(
+            total=Sum('amount')
+        )['total'] or Decimal('0')
+        return allocation.allocated_amount - consumed - legacy_direct
+
+    def _task_wbs_chain(self, cost_transaction):
+        if not cost_transaction.task_id:
+            return []
+
+        versions = cost_transaction.task.versions.filter(is_deleted=False)
+        if cost_transaction.revision_id:
+            task_version = versions.filter(revision_id=cost_transaction.revision_id).first()
+        else:
+            task_version = versions.filter(revision__approved_at__isnull=True).order_by('-revision__number').first()
+            if not task_version:
+                task_version = versions.order_by('-revision__number').first()
+
+        if not task_version:
+            return []
+
+        return list(reversed(list(task_version.wbs_node.get_ancestors(include_self=True))))
+
+    def _eligible_budget_allocations(self, cost_transaction):
+        base = BudgetAllocation.objects.select_for_update().filter(
+            project=cost_transaction.project,
+            cost_type=cost_transaction.transaction_type,
+        )
+
+        ordered_allocations = []
+        seen = set()
+
+        def append_scope(queryset):
+            for allocation in queryset.order_by('created_at', 'id'):
+                if allocation.id in seen:
+                    continue
+                seen.add(allocation.id)
+                ordered_allocations.append(allocation)
+
+        if cost_transaction.task_id:
+            append_scope(base.filter(scope_type='TASK', task=cost_transaction.task))
+            for wbs_node in self._task_wbs_chain(cost_transaction):
+                append_scope(base.filter(scope_type='WBS', wbs_node=wbs_node))
+
+        append_scope(base.filter(scope_type='PROJECT'))
+        return ordered_allocations
+
+    def _allocate_budget_for_transaction(self, cost_transaction):
+        required = Decimal(cost_transaction.amount)
+        remaining_to_allocate = required
+        first_allocation = None
+
+        for allocation in self._eligible_budget_allocations(cost_transaction):
+            available = self._allocation_remaining(allocation)
+            if available <= 0:
+                continue
+
+            draw_amount = min(available, remaining_to_allocate)
+            draw_amount = draw_amount.quantize(Decimal("0.01"))
+            BudgetConsumption.objects.create(
+                transaction=cost_transaction,
+                budget_allocation=allocation,
+                amount=draw_amount,
+            )
+            if first_allocation is None:
+                first_allocation = allocation
+
+            remaining_to_allocate -= draw_amount
+            if remaining_to_allocate <= 0:
+                break
+
+        if remaining_to_allocate > 0:
+            raise ValidationError({
+                'budget': (
+                    f'Insufficient allocated budget. Required {required}, '
+                    f'missing {remaining_to_allocate}.'
+                )
+            })
+
+        CostTransaction.objects.filter(pk=cost_transaction.pk).update(budget_allocation=first_allocation)
+        cost_transaction.budget_allocation = first_allocation
+
+    @transaction.atomic
     def perform_create(self, serializer):
-        # اختصاص کاربری که تراکنش را ثبت می‌کند
-        serializer.save(created_by=self.request.user)
+        cost_transaction = serializer.save(created_by=self.request.user, budget_allocation=None)
+        self._allocate_budget_for_transaction(cost_transaction)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        cost_transaction = serializer.instance
+        cost_transaction.budget_consumptions.all().delete()
+        cost_transaction = serializer.save(budget_allocation=None)
+        self._allocate_budget_for_transaction(cost_transaction)
 
 
 class TaskViewSet(viewsets.ReadOnlyModelViewSet):

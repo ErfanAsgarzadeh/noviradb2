@@ -1,6 +1,7 @@
 import uuid
 import uuid
 from django.db import models
+from decimal import Decimal, ROUND_HALF_UP
 from django.core.exceptions import ValidationError
 from django.contrib.auth import get_user_model
 from django.db.models.signals import post_save
@@ -1089,8 +1090,11 @@ class BudgetAllocation(models.Model):
 
     @property
     def actual_amount(self):
-        result = self.transactions.aggregate(total=models.Sum("amount"))
-        return result["total"] or 0
+        consumed = self.consumptions.aggregate(total=models.Sum("amount"))["total"] or 0
+        legacy_direct = self.transactions.filter(budget_consumptions__isnull=True).aggregate(
+            total=models.Sum("amount")
+        )["total"] or 0
+        return consumed + legacy_direct
 
     @property
     def remaining_amount(self):
@@ -1251,10 +1255,13 @@ class CostTransaction(models.Model):
             if not self.assignment:
                 raise ValidationError("Assignment is required.")
 
-            if not self.resource_rate:
+            if self.transaction_type == "COST" and (self.unit_rate is None or self.unit_rate < 0):
+                raise ValidationError("Unit rate is required for cost resources.")
+
+            if self.transaction_type != "COST" and not self.resource_rate:
                 raise ValidationError("ResourceRate is required.")
 
-            if self.resource_rate.resource != self.assignment.resource:
+            if self.resource_rate and self.resource_rate.resource != self.assignment.resource:
                 raise ValidationError(
                     "ResourceRate must belong to Assignment resource."
                 )
@@ -1265,7 +1272,7 @@ class CostTransaction(models.Model):
             if self.revision_id and self.assignment.revision_id != self.revision_id:
                 raise ValidationError("Assignment must belong to the selected revision.")
 
-            if self.resource_rate.regular_rate < 0:
+            if self.resource_rate and self.resource_rate.regular_rate < 0:
                 raise ValidationError("Resource rate cannot be negative.")
 
     def save(self, *args, **kwargs):
@@ -1280,22 +1287,54 @@ class CostTransaction(models.Model):
         else:
             if not self.assignment:
                 raise ValidationError("Assignment is required.")
-            if not self.resource_rate:
-                raise ValidationError("ResourceRate is required.")
             if self.assignment:
                 if not self.task_id:
                     self.task = self.assignment.task
                 if not self.revision_id:
                     self.revision = self.assignment.revision
                 self.resource = self.assignment.resource
-            rate = self.resource_rate.regular_rate
-            if self.unit_rate is None:
-                self.unit_rate = rate
+            if self.transaction_type == "COST":
+                if self.unit_rate is None:
+                    raise ValidationError("Unit rate is required for cost resources.")
+                rate = self.unit_rate
+                self.resource_rate = None
+            else:
+                if not self.resource_rate:
+                    raise ValidationError("ResourceRate is required.")
+                rate = self.resource_rate.regular_rate
+                if self.unit_rate is None:
+                    self.unit_rate = rate
 
-        self.amount = self.quantity * rate
+        self.amount = (self.quantity * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         self.full_clean()
 
         super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.transaction_type} - {self.amount}"
+
+
+class BudgetConsumption(models.Model):
+    transaction = models.ForeignKey(
+        CostTransaction,
+        on_delete=models.CASCADE,
+        related_name="budget_consumptions",
+    )
+    budget_allocation = models.ForeignKey(
+        BudgetAllocation,
+        on_delete=models.PROTECT,
+        related_name="consumptions",
+    )
+    amount = models.DecimalField(max_digits=16, decimal_places=2)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def clean(self):
+        super().clean()
+        if self.amount is not None and self.amount <= 0:
+            raise ValidationError("Budget consumption amount must be greater than zero.")
+
+    def __str__(self):
+        return f"{self.transaction_id} -> {self.budget_allocation_id}: {self.amount}"
