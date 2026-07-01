@@ -328,7 +328,26 @@ class TaskRoleSerializer(serializers.ModelSerializer):
 # My Tasks: Reporting & Chat Serializers
 # ==========================================
 
+class TaskReportAttachmentSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TaskReportAttachment
+        fields = ['id', 'file', 'file_url', 'file_name', 'file_type', 'file_size', 'uploaded_at']
+        read_only_fields = fields
+
+    def get_file_url(self, obj):
+        if obj.file:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
 class TaskReportLogSerializer(serializers.ModelSerializer):
+    attachments = TaskReportAttachmentSerializer(many=True, read_only=True)
+
     class Meta:
         model = TaskReportLog
         fields = [
@@ -351,6 +370,7 @@ class TaskReportLogSerializer(serializers.ModelSerializer):
             'is_approved',
             'approved_by',
             'approved_at',
+            'attachments',
         ]
         read_only_fields = [
             'id',
@@ -364,6 +384,7 @@ class TaskReportLogSerializer(serializers.ModelSerializer):
             'is_approved',
             'approved_by',
             'approved_at',
+            'attachments',
         ]
 
 class TaskChatMessageSerializer(serializers.ModelSerializer):
@@ -664,14 +685,14 @@ class BudgetAllocationSerializer(serializers.ModelSerializer):
 
         if scope_type == 'TASK' and not task:
             raise serializers.ValidationError({'task': 'Task allocation requires a task.'})
-        if scope_type == 'WBS' and not wbs_node:
+        if scope_type in {'WBS', 'TASK'} and not wbs_node:
             raise serializers.ValidationError({'wbs_node': 'WBS allocation requires a WBS node.'})
         if scope_type == 'ORG_UNIT' and not org_unit:
             raise serializers.ValidationError({'org_unit': 'Org unit allocation requires an org unit.'})
         if scope_type != 'TASK' and task:
             raise serializers.ValidationError({'task': 'Task can only be set for TASK allocations.'})
-        if scope_type != 'WBS' and wbs_node:
-            raise serializers.ValidationError({'wbs_node': 'WBS node can only be set for WBS allocations.'})
+        if scope_type not in {'WBS', 'TASK'} and wbs_node:
+            raise serializers.ValidationError({'wbs_node': 'WBS node can only be set for WBS or TASK allocations.'})
         if scope_type != 'ORG_UNIT' and org_unit:
             raise serializers.ValidationError({'org_unit': 'Org unit can only be set for ORG_UNIT allocations.'})
 

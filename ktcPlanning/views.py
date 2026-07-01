@@ -9,6 +9,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.db import transaction
 from django.db.models import Q
+from django.core.exceptions import ValidationError as DjangoValidationError
 from datetime import date, timedelta, datetime
 from decimal import Decimal
 from collections import defaultdict
@@ -20,7 +21,7 @@ from .cpm import CPMEngine
 from .models import Project, Revision, WBSNodeVersion, TaskVersion, Dependency, TaskRole, Task, WBSNode, TaskReportLog, \
     TaskActual, TaskChatMessage, Assignment, Resource, ResourcePool, ResourceRole, ResourceSkill, ResourceSkillMapping, \
     ResourceException, ResourceRate, VarianceReport, Calendar, ProjectViewer, SystemSettings, UnitOfMeasure, \
-    ExpenseType, FundingSource, BudgetAllocation, CostTransaction
+    ExpenseType, FundingSource, BudgetAllocation, CostTransaction, TaskReportAttachment
 from .serializers import (
     ProjectSerializer,
     RevisionSerializer,
@@ -34,7 +35,8 @@ from .serializers import (
     ExpenseTypeSerializer, FundingSourceSerializer, BudgetAllocationSerializer,
     CostTransactionSerializer, TaskDropdownSerializer
 )
-from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from ktcPlanning.validators import validate_chat_file
 
 from .msp_importer import import_msp_xml
 from django.db.models import Max
@@ -601,6 +603,7 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
     queryset = TaskReportLog.objects.all()
     serializer_class = TaskReportLogSerializer
     permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     def get_queryset(self):
         queryset = super().get_queryset()
@@ -634,7 +637,22 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        uploaded_files = self.request.FILES.getlist('attachments')
+        for uploaded_file in uploaded_files:
+            try:
+                validate_chat_file(uploaded_file)
+            except DjangoValidationError as exc:
+                raise ValidationError({'attachments': exc.messages})
+
+        report = serializer.save(user=self.request.user)
+        for uploaded_file in uploaded_files:
+            TaskReportAttachment.objects.create(
+                report=report,
+                file=uploaded_file,
+                file_name=uploaded_file.name,
+                file_type=getattr(uploaded_file, 'content_type', '') or '',
+                file_size=getattr(uploaded_file, 'size', 0) or 0,
+            )
 
     def perform_update(self, serializer):
         report = serializer.instance

@@ -831,6 +831,25 @@ class TaskReportLog(models.Model):
         return f"Report {self.progress_percent}% by {self.user} - {self.approval_status}"
 
 
+class TaskReportAttachment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    report = models.ForeignKey(TaskReportLog, on_delete=models.CASCADE, related_name="attachments")
+    file = models.FileField(
+        upload_to='task_report_attachments/%Y/%m/',
+        validators=[validate_chat_file],
+    )
+    file_name = models.CharField(max_length=255, blank=True, default='')
+    file_type = models.CharField(max_length=100, blank=True, default='')
+    file_size = models.PositiveIntegerField(default=0)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['uploaded_at']
+
+    def __str__(self):
+        return self.file_name or str(self.file)
+
+
 
 # =========================================================
 # 15. TASK CHAT & COLLABORATION
@@ -1044,15 +1063,15 @@ class BudgetAllocation(models.Model):
 
         if self.scope_type == "TASK" and not self.task_id:
             raise ValidationError("Task allocation requires a task.")
-        if self.scope_type == "WBS" and not self.wbs_node_id:
+        if self.scope_type in {"WBS", "TASK"} and not self.wbs_node_id:
             raise ValidationError("WBS allocation requires a WBS node.")
         if self.scope_type == "ORG_UNIT" and not self.org_unit_id:
             raise ValidationError("Org unit allocation requires an org unit.")
 
         if self.scope_type != "TASK" and self.task_id:
             raise ValidationError("Task can only be set for TASK allocations.")
-        if self.scope_type != "WBS" and self.wbs_node_id:
-            raise ValidationError("WBS node can only be set for WBS allocations.")
+        if self.scope_type not in {"WBS", "TASK"} and self.wbs_node_id:
+            raise ValidationError("WBS node can only be set for WBS or TASK allocations.")
         if self.scope_type != "ORG_UNIT" and self.org_unit_id:
             raise ValidationError("Org unit can only be set for ORG_UNIT allocations.")
 
