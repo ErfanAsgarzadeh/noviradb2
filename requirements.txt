@@ -13,3 +13,7 @@ django-mptt>=0.16
 
 # --- Config ---
 python-dotenv>=1.0
+
+# --- Private object storage (MinIO/S3-compatible) ---
+django-storages[s3]>=1.14
+boto3>=1.34

@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.shortcuts import get_object_or_404
+from django.http import FileResponse
 from django.utils import timezone
 from django.db import transaction
 from django.db.models import Q, Sum
@@ -660,6 +661,19 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
         if report.approval_status != 'pending':
             raise PermissionDenied("این گزارش در حال بررسی یا تایید شده و دیگر قابل ویرایش نیست.")
         serializer.save()
+
+    @action(detail=True, methods=['get'], url_path=r'attachments/(?P<attachment_id>[^/.]+)/download')
+    def download_attachment(self, request, pk=None, attachment_id=None):
+        report = self.get_object()
+        attachment = get_object_or_404(report.attachments, pk=attachment_id)
+        response = FileResponse(
+            attachment.file.open('rb'),
+            as_attachment=True,
+            filename=attachment.file_name or attachment.file.name,
+        )
+        if attachment.file_type:
+            response['Content-Type'] = attachment.file_type
+        return response
 
     @action(detail=True, methods=['post'], url_path='approve')
     def approve_report(self, request, pk=None):
