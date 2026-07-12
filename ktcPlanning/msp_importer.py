@@ -3,7 +3,6 @@ MSP XML Importer — msp_importer.py
 Imports Tasks and WBS hierarchy from a Microsoft Project XML file
 into an existing Project + Revision.
 """
-import string
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from decimal import Decimal
@@ -183,9 +182,9 @@ def _infer_parents(tasks: dict) -> dict[str, str | None]:
 @transaction.atomic
 def import_msp_xml(
     xml_file: IO[bytes],
-    project_id: string,
+    project_id: str,
     revision_id: int,
-    active_node_id: string | None = None,
+    active_node_id: str | None = None,
     user: Any = None,
 ) -> dict:
     warnings: list[str] = []

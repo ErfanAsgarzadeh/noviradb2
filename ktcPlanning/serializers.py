@@ -74,13 +74,54 @@ class ProjectSerializer(serializers.ModelSerializer):
         required=False, allow_null=True
     )
     calendarName = serializers.CharField(source='calendar.name', read_only=True, default=None)
+    parentProjectId = serializers.PrimaryKeyRelatedField(
+        source='parent_project',
+        queryset=Project.objects.filter(is_deleted=False),
+        required=False,
+        allow_null=True,
+    )
+    parentProjectName = serializers.CharField(source='parent_project.name', read_only=True, default=None)
+    childProjectCount = serializers.SerializerMethodField()
+    parentScheduleWarning = serializers.JSONField(source='parent_schedule_warning', read_only=True)
+    parentScheduleWarningUpdatedAt = serializers.DateTimeField(source='parent_schedule_warning_updated_at', read_only=True)
 
     class Meta:
         model = Project
-        fields = ['id', 'name', 'description', 'createdAt', 'start_date', 'end_date', 'calendarId', 'calendarName', 'scope']
+        fields = [
+            'id', 'name', 'description', 'createdAt', 'start_date', 'end_date',
+            'calendarId', 'calendarName', 'scope', 'parentProjectId',
+            'parentProjectName', 'childProjectCount', 'parentScheduleWarning',
+            'parentScheduleWarningUpdatedAt',
+        ]
 
     def get_description(self, obj):
         return ""
+
+    def get_childProjectCount(self, obj):
+        return obj.subprojects.filter(is_deleted=False).count()
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        parent_project = attrs.get('parent_project')
+        instance = self.instance
+
+        if parent_project is None:
+            return attrs
+
+        if instance and parent_project.pk == instance.pk:
+            raise serializers.ValidationError({
+                'parentProjectId': 'Project cannot be its own parent.'
+            })
+
+        ancestor = parent_project
+        while ancestor is not None:
+            if instance and ancestor.pk == instance.pk:
+                raise serializers.ValidationError({
+                    'parentProjectId': 'Subproject hierarchy cannot contain a cycle.'
+                })
+            ancestor = ancestor.parent_project
+
+        return attrs
 
 
 class ProjectViewerSerializer(serializers.ModelSerializer):
@@ -114,6 +155,23 @@ class RevisionSerializer(serializers.ModelSerializer):
         fields = ['id', 'projectId', 'number', 'description', 'projectStart','projectEnd',
                   'createdAt','approvedAt', 'isBaseline',
                   'designatedApproverId', 'designatedApproverName']
+
+    def validate(self, attrs):
+        has_approver_update = 'designated_approver' in attrs
+        approver = attrs.get('designated_approver')
+        revision = self.instance
+        project = revision.project if revision else attrs.get('project')
+        if has_approver_update and project is not None:
+            default_approver = project.get_default_approver()
+            if default_approver and (approver is None or approver.id != default_approver.id):
+                raise serializers.ValidationError({
+                    'designatedApproverId': 'Project approver must be the manager of the project creator unit.'
+                })
+            if default_approver is None and approver is not None:
+                raise serializers.ValidationError({
+                    'designatedApproverId': 'The project creator unit has no manager.'
+                })
+        return attrs
 
 
 class WbsNodeSerializer(serializers.ModelSerializer):
@@ -250,6 +308,10 @@ class ActivityNodeSerializer(serializers.ModelSerializer):
         return 0
 
     def get_resources(self, obj):
+        prefetched_assignments = getattr(obj.task, 'revision_assignments', None)
+        if prefetched_assignments is not None:
+            return [assign.resource.name for assign in prefetched_assignments]
+
         assignments = Assignment.objects.filter(task=obj.task, revision=obj.revision)
         # به جای برگرداندن یک آبجکت دارای نام و آیدی، فقط نام منابع را به صورت متن ساده برمی‌گردانیم
         # خروجی به این شکل می‌شود: ['Ali', 'Crane', 'Excavator']
@@ -301,17 +363,110 @@ class DependencySerializer(serializers.ModelSerializer):
         model = Dependency
         fields = ['id', 'fromId', 'toId', 'type', 'lag']
 
+    def _lag_hours_from_request(self, revision):
+        lag_days = float(self.initial_data.get('lag') or 0)
+        return int(round(lag_days * project_work_hours_per_day(revision.project)))
+
     def create(self, validated_data):
         predecessor_id = validated_data.pop('predecessor_id')
         successor_id = validated_data.pop('successor_id')
 
         validated_data['predecessor_id'] = predecessor_id
         validated_data['successor_id'] = successor_id
+        revision = validated_data.get('revision')
+        if revision is not None:
+            validated_data['lag_hours'] = self._lag_hours_from_request(revision)
 
         return super().create(validated_data)
 
+    def update(self, instance, validated_data):
+        if 'lag' in self.initial_data:
+            validated_data['lag_hours'] = self._lag_hours_from_request(instance.revision)
+        return super().update(instance, validated_data)
+
     def get_lag(self, obj):
-        return obj.lag_hours / 8 if obj.lag_hours else 0
+        work_hours = project_work_hours_per_day(obj.revision.project)
+        return obj.lag_hours / work_hours if obj.lag_hours else 0
+
+
+def subproject_virtual_id(project_id):
+    return f"subproject-{project_id}"
+
+
+def project_work_hours_per_day(project):
+    calendar = getattr(project, 'calendar', None)
+    if calendar is None:
+        calendar = Calendar.objects.filter(project=project, is_default=True).first()
+    if calendar is None:
+        return 8
+
+    hours_by_weekday = {}
+    for interval in calendar.intervals.all():
+        start_minutes = interval.start_time.hour * 60 + interval.start_time.minute
+        end_minutes = interval.end_time.hour * 60 + interval.end_time.minute
+        if end_minutes > start_minutes:
+            hours_by_weekday[interval.weekday] = hours_by_weekday.get(interval.weekday, 0) + (end_minutes - start_minutes) / 60
+
+    working_day_hours = [hours for hours in hours_by_weekday.values() if hours > 0]
+    if not working_day_hours:
+        return 8
+    return sum(working_day_hours) / len(working_day_hours)
+
+
+class SubprojectDependencySerializer(serializers.ModelSerializer):
+    revisionId = serializers.PrimaryKeyRelatedField(source='revision', queryset=Revision.objects.all(), write_only=True)
+    taskId = serializers.PrimaryKeyRelatedField(source='task', queryset=Task.objects.all(), write_only=True)
+    subprojectId = serializers.PrimaryKeyRelatedField(source='subproject', queryset=Project.objects.all(), write_only=True)
+    fromId = serializers.SerializerMethodField()
+    toId = serializers.SerializerMethodField()
+    type = serializers.CharField(source='dependency_type')
+    lag = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SubprojectDependency
+        fields = ['id', 'revisionId', 'taskId', 'subprojectId', 'direction', 'fromId', 'toId', 'type', 'lag']
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['id'] = f"subdep-{instance.id}"
+        return data
+
+    def validate(self, attrs):
+        dependency_type = attrs.get('dependency_type')
+        if dependency_type and dependency_type not in dict(Dependency.LINK_TYPES):
+            raise serializers.ValidationError({'type': 'Invalid dependency type.'})
+
+        revision = attrs.get('revision') or getattr(self.instance, 'revision', None)
+        task = attrs.get('task') or getattr(self.instance, 'task', None)
+        subproject = attrs.get('subproject') or getattr(self.instance, 'subproject', None)
+        if revision and task and task.project_id != revision.project_id:
+            raise serializers.ValidationError({'taskId': 'Task must belong to the parent project revision.'})
+        if revision and subproject and subproject.parent_project_id != revision.project_id:
+            raise serializers.ValidationError({'subprojectId': 'Subproject must be assigned under this parent project.'})
+        return attrs
+
+    def create(self, validated_data):
+        validated_data['lag_hours'] = int(round(float(self.initial_data.get('lag') or 0) * project_work_hours_per_day(validated_data['revision'].project)))
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'lag' in self.initial_data:
+            validated_data['lag_hours'] = int(round(float(self.initial_data.get('lag') or 0) * project_work_hours_per_day(instance.revision.project)))
+        return super().update(instance, validated_data)
+
+    def get_fromId(self, obj):
+        if obj.direction == SubprojectDependency.DIRECTION_TASK_TO_SUBPROJECT:
+            return str(obj.task_id)
+        return subproject_virtual_id(obj.subproject_id)
+
+    def get_toId(self, obj):
+        if obj.direction == SubprojectDependency.DIRECTION_TASK_TO_SUBPROJECT:
+            return subproject_virtual_id(obj.subproject_id)
+        return str(obj.task_id)
+
+    def get_lag(self, obj):
+        work_hours = project_work_hours_per_day(obj.revision.project)
+        return obj.lag_hours / work_hours if obj.lag_hours else 0
 
 
 class TaskRoleSerializer(serializers.ModelSerializer):
@@ -602,45 +757,77 @@ class FundingSourceSerializer(serializers.ModelSerializer):
     allocated_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
     unallocated_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
     created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    submitted_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    approved_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    rejected_by = serializers.PrimaryKeyRelatedField(read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = FundingSource
         fields = [
             'id', 'title', 'source_type', 'source_party', 'reference_no',
-            'received_date', 'total_amount', 'currency', 'description',
-            'allocated_amount', 'unallocated_amount', 'created_by', 'created_at',
+            'received_date', 'total_amount', 'currency', 'status', 'description',
+            'allocated_amount', 'unallocated_amount',
+            'created_by', 'submitted_by', 'submitted_at',
+            'approved_by', 'approved_at', 'rejected_by', 'rejected_at',
+            'rejection_reason', 'created_at',
         ]
-        read_only_fields = ['allocated_amount', 'unallocated_amount', 'created_by', 'created_at']
+        read_only_fields = [
+            'status', 'allocated_amount', 'unallocated_amount',
+            'created_by', 'submitted_by', 'submitted_at',
+            'approved_by', 'approved_at', 'rejected_by', 'rejected_at',
+            'rejection_reason', 'created_at',
+        ]
 
     def validate_total_amount(self, value):
         if value <= 0:
             raise serializers.ValidationError('Funding amount must be greater than zero.')
+        if self.instance and value < self.instance.allocated_amount:
+            raise serializers.ValidationError('Funding amount cannot be less than existing root allocations.')
         return value
 
 
 class BudgetAllocationSerializer(serializers.ModelSerializer):
     actual_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
+    child_allocated_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
     remaining_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
+    borrowed_in_amount = serializers.SerializerMethodField()
+    borrowed_out_amount = serializers.SerializerMethodField()
+    effective_amount = serializers.SerializerMethodField()
     funding_source_title = serializers.CharField(source='funding_source.title', read_only=True)
     project_name = serializers.CharField(source='project.name', read_only=True)
     task_title = serializers.SerializerMethodField()
     wbs_title = serializers.CharField(source='wbs_node.title', read_only=True, default=None)
     org_unit_name = serializers.CharField(source='org_unit.name', read_only=True, default=None)
     created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    submitted_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    approved_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    rejected_by = serializers.PrimaryKeyRelatedField(read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = BudgetAllocation
         fields = [
             'id', 'funding_source', 'funding_source_title',
+            'parent_allocation',
             'project', 'project_name', 'revision',
             'scope_type', 'wbs_node', 'wbs_title', 'task', 'task_title',
             'org_unit', 'org_unit_name', 'cost_type', 'allocated_amount',
-            'actual_amount', 'remaining_amount', 'description',
-            'created_by', 'created_at',
+            'is_borrow_sink', 'status', 'actual_amount', 'child_allocated_amount',
+            'borrowed_in_amount', 'borrowed_out_amount', 'effective_amount',
+            'remaining_amount', 'description',
+            'created_by', 'submitted_by', 'submitted_at',
+            'approved_by', 'approved_at', 'rejected_by', 'rejected_at',
+            'rejection_reason', 'created_at',
         ]
-        read_only_fields = ['actual_amount', 'remaining_amount', 'created_by', 'created_at']
+        read_only_fields = [
+            'status', 'is_borrow_sink', 'actual_amount', 'remaining_amount',
+            'child_allocated_amount', 'borrowed_in_amount', 'borrowed_out_amount',
+            'effective_amount',
+            'created_by', 'submitted_by', 'submitted_at',
+            'approved_by', 'approved_at', 'rejected_by', 'rejected_at',
+            'rejection_reason', 'created_at',
+        ]
         extra_kwargs = {'project': {'required': False, 'allow_null': True}}
 
     def get_task_title(self, obj):
@@ -650,6 +837,15 @@ class BudgetAllocationSerializer(serializers.ModelSerializer):
         if not tv:
             tv = obj.task.versions.filter(is_deleted=False).last()
         return tv.title if tv else str(obj.task.id)
+
+    def get_borrowed_in_amount(self, obj):
+        return obj.borrowed_in_amount()
+
+    def get_borrowed_out_amount(self, obj):
+        return obj.borrowed_out_amount()
+
+    def get_effective_amount(self, obj):
+        return obj.allocated_amount + obj.borrowed_in_amount() - obj.borrowed_out_amount()
 
     def validate(self, attrs):
         instance = self.instance
@@ -666,9 +862,12 @@ class BudgetAllocationSerializer(serializers.ModelSerializer):
         wbs_node = value('wbs_node')
         task = value('task')
         org_unit = value('org_unit')
+        cost_type = value('cost_type')
         allocated_amount = value('allocated_amount')
+        parent_allocation = value('parent_allocation')
+        is_borrow_sink = value('is_borrow_sink')
 
-        if allocated_amount is not None and allocated_amount <= 0:
+        if allocated_amount is not None and allocated_amount <= 0 and not is_borrow_sink:
             raise serializers.ValidationError({'allocated_amount': 'Allocated amount must be greater than zero.'})
         if scope_type in {'PROJECT', 'WBS', 'TASK'} and not project:
             raise serializers.ValidationError({'project': 'Project is required for project, WBS, and task allocations.'})
@@ -683,22 +882,69 @@ class BudgetAllocationSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'task': 'Task allocation requires a task.'})
         if scope_type in {'WBS', 'TASK'} and not wbs_node:
             raise serializers.ValidationError({'wbs_node': 'WBS allocation requires a WBS node.'})
-        if scope_type == 'ORG_UNIT' and not org_unit:
-            raise serializers.ValidationError({'org_unit': 'Org unit allocation requires an org unit.'})
         if scope_type != 'TASK' and task:
             raise serializers.ValidationError({'task': 'Task can only be set for TASK allocations.'})
         if scope_type not in {'WBS', 'TASK'} and wbs_node:
             raise serializers.ValidationError({'wbs_node': 'WBS node can only be set for WBS or TASK allocations.'})
         if scope_type != 'ORG_UNIT' and org_unit:
             raise serializers.ValidationError({'org_unit': 'Org unit can only be set for ORG_UNIT allocations.'})
+        if value('status') == 'APPROVED' and funding_source and funding_source.status != 'APPROVED':
+            raise serializers.ValidationError({'status': 'Approved allocations require an approved funding source.'})
+        if parent_allocation:
+            if instance and parent_allocation.id == instance.id:
+                raise serializers.ValidationError({'parent_allocation': 'Budget allocation cannot be its own parent.'})
+            if funding_source and parent_allocation.funding_source_id != funding_source.id:
+                raise serializers.ValidationError({'parent_allocation': 'Child allocation must use the same funding source as its parent.'})
+            if cost_type and parent_allocation.cost_type != cost_type:
+                raise serializers.ValidationError({'cost_type': 'Child allocation must use the same cost type as its parent.'})
+            if value('status') == 'APPROVED' and parent_allocation.status != 'APPROVED':
+                raise serializers.ValidationError({'status': 'Approved child allocations require an approved parent allocation.'})
+            if parent_allocation.project_id and (not project or parent_allocation.project_id != project.id):
+                raise serializers.ValidationError({'project': 'Child allocation must stay inside the parent project.'})
+            if parent_allocation.scope_type == 'PROJECT' and scope_type == 'ORG_UNIT':
+                raise serializers.ValidationError({'scope_type': 'Project budget children cannot target org units.'})
+            if parent_allocation.scope_type == 'WBS':
+                if scope_type not in {'WBS', 'TASK'}:
+                    raise serializers.ValidationError({'scope_type': 'WBS budget children must target WBS nodes or tasks inside that WBS.'})
+                if scope_type == 'WBS' and (not wbs_node or not wbs_node.is_descendant_of(parent_allocation.wbs_node, include_self=True)):
+                    raise serializers.ValidationError({'wbs_node': 'Child WBS allocation must be inside the parent WBS.'})
+                if scope_type == 'TASK':
+                    versions = task.versions.filter(is_deleted=False) if task else TaskVersion.objects.none()
+                    task_version = versions.filter(revision=revision or parent_allocation.revision).first() if (revision or parent_allocation.revision) else versions.order_by('-revision__number').first()
+                    if not task_version or not task_version.wbs_node.is_descendant_of(parent_allocation.wbs_node, include_self=True):
+                        raise serializers.ValidationError({'task': 'Child task allocation must be inside the parent WBS.'})
+            if parent_allocation.scope_type == 'TASK' and (scope_type != 'TASK' or not task or parent_allocation.task_id != task.id):
+                raise serializers.ValidationError({'task': 'Task budget children must target the same task.'})
+            if parent_allocation.scope_type == 'ORG_UNIT':
+                if scope_type != 'ORG_UNIT':
+                    raise serializers.ValidationError({'scope_type': 'Org unit budget children must stay inside org unit scope.'})
+                if parent_allocation.org_unit_id and (not org_unit or parent_allocation.org_unit_id != org_unit.id):
+                    raise serializers.ValidationError({'org_unit': 'Org unit budget children must stay inside the same org unit.'})
+            existing_children = parent_allocation.child_allocations.all()
+            if instance:
+                existing_children = existing_children.exclude(pk=instance.pk)
+            current_child_total = existing_children.aggregate(total=Sum('allocated_amount'))['total'] or 0
+            if allocated_amount is not None and current_child_total + allocated_amount > parent_allocation.allocated_amount:
+                raise serializers.ValidationError({'allocated_amount': 'Child allocations cannot exceed parent allocation amount.'})
+
+        if instance and allocated_amount is not None:
+            children_total = instance.child_allocations.aggregate(total=Sum('allocated_amount'))['total'] or 0
+            required_capacity = instance.actual_amount + children_total + instance.borrowed_out_amount() - instance.borrowed_in_amount()
+            if required_capacity < 0:
+                required_capacity = 0
+            if allocated_amount < required_capacity:
+                raise serializers.ValidationError({
+                    'allocated_amount': 'Allocation amount cannot be less than actual usage, child budgets, and borrowed-out capacity.'
+                })
 
         if funding_source and allocated_amount is not None:
-            existing = BudgetAllocation.objects.filter(funding_source=funding_source)
-            if instance:
-                existing = existing.exclude(pk=instance.pk)
-            current_total = existing.aggregate(total=Sum('allocated_amount'))['total'] or 0
-            if current_total + allocated_amount > funding_source.total_amount:
-                raise serializers.ValidationError({'allocated_amount': 'Allocations cannot exceed funding source amount.'})
+            if not parent_allocation:
+                existing = BudgetAllocation.objects.filter(funding_source=funding_source, parent_allocation__isnull=True)
+                if instance:
+                    existing = existing.exclude(pk=instance.pk)
+                current_total = existing.aggregate(total=Sum('allocated_amount'))['total'] or 0
+                if current_total + allocated_amount > funding_source.total_amount:
+                    raise serializers.ValidationError({'allocated_amount': 'Allocations cannot exceed funding source amount.'})
 
         return attrs
 
@@ -733,6 +979,237 @@ class BudgetConsumptionSerializer(serializers.ModelSerializer):
         else:
             target = "Company"
         return f"{allocation.funding_source.title} / {target} / {allocation.cost_type}"
+
+
+class BudgetBorrowSerializer(serializers.ModelSerializer):
+    from_allocation_label = serializers.SerializerMethodField()
+    to_allocation_label = serializers.SerializerMethodField()
+    requested_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    submitted_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    approved_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    rejected_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    settled_by = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = BudgetBorrow
+        fields = [
+            'id',
+            'from_allocation',
+            'from_allocation_label',
+            'to_allocation',
+            'to_allocation_label',
+            'destination_project',
+            'destination_revision',
+            'destination_scope_type',
+            'destination_wbs_node',
+            'destination_task',
+            'destination_org_unit',
+            'destination_cost_type',
+            'destination_description',
+            'amount',
+            'reason',
+            'status',
+            'requested_by',
+            'submitted_by',
+            'submitted_at',
+            'approved_by',
+            'approved_at',
+            'rejected_by',
+            'rejected_at',
+            'rejection_reason',
+            'settled_by',
+            'settled_at',
+            'created_at',
+        ]
+        read_only_fields = [
+            'status',
+            'requested_by',
+            'submitted_by',
+            'submitted_at',
+            'approved_by',
+            'approved_at',
+            'rejected_by',
+            'rejected_at',
+            'rejection_reason',
+            'settled_by',
+            'settled_at',
+            'created_at',
+        ]
+        extra_kwargs = {'to_allocation': {'required': False, 'allow_null': True}}
+
+    def get_allocation_label(self, allocation):
+        target = allocation.project.name if allocation.project_id else None
+        if allocation.task_id:
+            target = f"Task {allocation.task_id}"
+        elif allocation.wbs_node_id:
+            target = allocation.wbs_node.title
+        elif allocation.org_unit_id:
+            target = allocation.org_unit.name
+        return f"{target or 'Company'} / {allocation.scope_type} / {allocation.cost_type}"
+
+    def get_from_allocation_label(self, obj):
+        return self.get_allocation_label(obj.from_allocation)
+
+    def get_to_allocation_label(self, obj):
+        if obj.to_allocation_id:
+            return self.get_allocation_label(obj.to_allocation)
+        if obj.destination_task_id:
+            target = f"Task {obj.destination_task_id}"
+        elif obj.destination_wbs_node_id:
+            target = obj.destination_wbs_node.title
+        elif obj.destination_project_id:
+            target = obj.destination_project.name
+        elif obj.destination_org_unit_id:
+            target = obj.destination_org_unit.name
+        else:
+            target = "New destination"
+        return f"{target} / {obj.destination_scope_type or '-'} / {obj.destination_cost_type or '-'}"
+
+    def validate(self, attrs):
+        instance = self.instance
+
+        def value(name):
+            if name in attrs:
+                return attrs[name]
+            return getattr(instance, name, None) if instance else None
+
+        from_allocation = value('from_allocation')
+        to_allocation = value('to_allocation')
+        destination_scope_type = value('destination_scope_type')
+        destination_project = value('destination_project')
+        destination_wbs_node = value('destination_wbs_node')
+        destination_task = value('destination_task')
+        destination_org_unit = value('destination_org_unit')
+        destination_cost_type = value('destination_cost_type')
+        amount = value('amount')
+        status = value('status') or 'DRAFT'
+
+        if amount is not None and amount <= 0:
+            raise serializers.ValidationError({'amount': 'Borrow amount must be greater than zero.'})
+        if from_allocation:
+            if from_allocation.status != 'APPROVED':
+                raise serializers.ValidationError({'from_allocation': 'Budget borrow requires an approved source allocation.'})
+            if to_allocation:
+                if from_allocation.id == to_allocation.id:
+                    raise serializers.ValidationError({'to_allocation': 'Borrow source and destination cannot be the same allocation.'})
+                if to_allocation.status != 'APPROVED':
+                    raise serializers.ValidationError({'to_allocation': 'Budget borrow requires an approved destination allocation.'})
+            else:
+                if not destination_scope_type:
+                    raise serializers.ValidationError({'destination_scope_type': 'Destination scope type is required when destination allocation is new.'})
+                if not destination_cost_type:
+                    raise serializers.ValidationError({'destination_cost_type': 'Destination cost type is required when destination allocation is new.'})
+                if destination_scope_type in {'PROJECT', 'WBS', 'TASK'} and not destination_project:
+                    raise serializers.ValidationError({'destination_project': 'Destination project is required for project, WBS, and task borrow targets.'})
+                if destination_scope_type in {'WBS', 'TASK'} and not destination_wbs_node:
+                    raise serializers.ValidationError({'destination_wbs_node': 'Destination WBS is required for WBS and task borrow targets.'})
+                if destination_scope_type == 'TASK' and not destination_task:
+                    raise serializers.ValidationError({'destination_task': 'Destination task is required for task borrow targets.'})
+            if status == 'APPROVED' and amount > from_allocation.borrow_available_amount(exclude_borrow_id=instance.pk if instance else None):
+                raise serializers.ValidationError({'amount': 'Borrow amount exceeds source allocation available capacity.'})
+
+        return attrs
+
+
+class UnfundedForecastCostSerializer(serializers.ModelSerializer):
+    project_name = serializers.CharField(source='project.name', read_only=True)
+    task_title = serializers.SerializerMethodField()
+    wbs_title = serializers.CharField(source='wbs_node.title', read_only=True, default=None)
+    org_unit_name = serializers.CharField(source='org_unit.name', read_only=True, default=None)
+    linked_allocation_label = serializers.SerializerMethodField()
+    created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    created_at = serializers.DateTimeField(read_only=True)
+    updated_at = serializers.DateTimeField(read_only=True)
+
+    class Meta:
+        model = UnfundedForecastCost
+        fields = [
+            'id',
+            'title',
+            'project',
+            'project_name',
+            'revision',
+            'scope_type',
+            'wbs_node',
+            'wbs_title',
+            'task',
+            'task_title',
+            'org_unit',
+            'org_unit_name',
+            'cost_type',
+            'forecast_date',
+            'amount',
+            'confidence',
+            'status',
+            'linked_allocation',
+            'linked_allocation_label',
+            'description',
+            'created_by',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['created_by', 'created_at', 'updated_at', 'linked_allocation_label']
+        extra_kwargs = {'project': {'required': False, 'allow_null': True}}
+
+    def get_task_title(self, obj):
+        if not obj.task:
+            return None
+        tv = obj.task.versions.filter(revision=obj.revision, is_deleted=False).first()
+        if not tv:
+            tv = obj.task.versions.filter(is_deleted=False).last()
+        return tv.title if tv else str(obj.task.id)
+
+    def get_linked_allocation_label(self, obj):
+        if not obj.linked_allocation_id:
+            return None
+        allocation = obj.linked_allocation
+        target = allocation.project.name if allocation.project_id else None
+        if allocation.task_id:
+            target = f"Task {allocation.task_id}"
+        elif allocation.wbs_node_id:
+            target = allocation.wbs_node.title
+        elif allocation.org_unit_id:
+            target = allocation.org_unit.name
+        return f"{allocation.funding_source.title} / {target or 'Company'} / {allocation.scope_type} / {allocation.cost_type}"
+
+    def validate(self, attrs):
+        instance = self.instance
+
+        def value(name):
+            if name in attrs:
+                return attrs[name]
+            return getattr(instance, name, None) if instance else None
+
+        project = value('project')
+        revision = value('revision')
+        scope_type = value('scope_type')
+        wbs_node = value('wbs_node')
+        task = value('task')
+        org_unit = value('org_unit')
+        amount = value('amount')
+
+        if amount is not None and amount <= 0:
+            raise serializers.ValidationError({'amount': 'Forecast amount must be greater than zero.'})
+        if scope_type in {'PROJECT', 'WBS', 'TASK'} and not project:
+            raise serializers.ValidationError({'project': 'Project is required for project, WBS, and task forecast costs.'})
+        if revision and project and revision.project_id != project.id:
+            raise serializers.ValidationError({'revision': 'Revision must belong to the selected project.'})
+        if wbs_node and project and wbs_node.revision.project_id != project.id:
+            raise serializers.ValidationError({'wbs_node': 'WBS node must belong to the selected project.'})
+        if task and project and task.project_id != project.id:
+            raise serializers.ValidationError({'task': 'Task must belong to the selected project.'})
+        if scope_type == 'TASK' and not task:
+            raise serializers.ValidationError({'task': 'Task forecast requires a task.'})
+        if scope_type in {'WBS', 'TASK'} and not wbs_node:
+            raise serializers.ValidationError({'wbs_node': 'WBS forecast requires a WBS node.'})
+        if scope_type != 'TASK' and task:
+            raise serializers.ValidationError({'task': 'Task can only be set for TASK forecasts.'})
+        if scope_type not in {'WBS', 'TASK'} and wbs_node:
+            raise serializers.ValidationError({'wbs_node': 'WBS node can only be set for WBS or TASK forecasts.'})
+        if scope_type != 'ORG_UNIT' and org_unit:
+            raise serializers.ValidationError({'org_unit': 'Org unit can only be set for ORG_UNIT forecasts.'})
+
+        return attrs
 
 
 class CostTransactionSerializer(serializers.ModelSerializer):

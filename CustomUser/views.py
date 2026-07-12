@@ -74,14 +74,18 @@ class UsersInMyUnitView(generics.ListAPIView):
         u = self.request.user
         role = getattr(u, 'org_role', 'member') or 'member'
 
-        if u.is_superuser or role in ('company_admin', 'company_pm'):
-            return CustomUser.objects.all().order_by('id')
-
         unit_id = getattr(u, 'unit_id', None)
-        if not unit_id:
-            return CustomUser.objects.filter(pk=u.pk)
+        unit_manager_id = getattr(getattr(u, 'unit', None), 'manager_id', None)
+        if unit_manager_id:
+            return CustomUser.objects.filter(pk=unit_manager_id).order_by('id')
 
-        return CustomUser.objects.filter(unit_id=unit_id).order_by('id')
+        if u.is_superuser or role in ('company_admin', 'company_pm'):
+            return CustomUser.objects.filter(org_role__in=('company_admin', 'company_pm', 'unit_manager')).order_by('id')
+
+        if not unit_id:
+            return CustomUser.objects.none()
+
+        return CustomUser.objects.none()
 
 
 class OrgUnitViewSet(viewsets.ModelViewSet):

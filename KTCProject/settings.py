@@ -90,6 +90,8 @@ INSTALLED_APPS = [
     'ktcPlanning.apps.KtcplanningConfig',
     'CustomUser.apps.CustomuserConfig',
     'auditlog.apps.AuditlogConfig',
+    'opc.apps.OpcConfig',
+    'enterprise_items.apps.EnterpriseItemsConfig',
     'corsheaders',
     "rest_framework_simplejwt.token_blacklist",
     'management_reports.apps.ManagementReportsConfig'
@@ -205,6 +207,10 @@ STATIC_URL = 'static/'
 # Media files (uploaded by users)
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+MSP_IMPORT_MAX_UPLOAD_MB = int(os.environ.get('MSP_IMPORT_MAX_UPLOAD_MB', '100'))
+FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get('FILE_UPLOAD_MAX_MEMORY_SIZE', str(10 * 1024 * 1024)))
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get('DATA_UPLOAD_MAX_MEMORY_SIZE', str(100 * 1024 * 1024)))
 
 USE_S3_STORAGE = os.environ.get('USE_S3_STORAGE', '0').lower() in ('1', 'true', 'yes')
 

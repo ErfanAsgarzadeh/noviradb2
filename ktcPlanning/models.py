@@ -13,6 +13,16 @@ from ktcPlanning.validators import validate_chat_file
 User = get_user_model()
 
 
+BUDGET_STATUS_CHOICES = [
+    ("DRAFT", "Draft"),
+    ("SUBMITTED", "Submitted"),
+    ("APPROVED", "Approved"),
+    ("REJECTED", "Rejected"),
+    ("LOCKED", "Locked"),
+    ("CLOSED", "Closed"),
+]
+
+
 # =========================================================
 # 1. PROJECT
 # =========================================================
@@ -49,8 +59,42 @@ class Project(models.Model):
         on_delete=models.SET_NULL, related_name='owned_projects'
     )
 
+    parent_project = models.ForeignKey(
+        'self',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='subprojects',
+        verbose_name="پروژه مادر",
+        help_text="برای ساخت ساختار پروژه/زیرپروژه شبیه Primavera استفاده می‌شود."
+    )
+
+    # اولویت پروژه در رقابت سراسری بر سر منابع (عدد کمتر = اولویت بالاتر، هم‌راستا با Resource.priority)
+    priority = models.IntegerField(
+        default=100,
+        verbose_name="اولویت پروژه",
+        help_text="در تسطیح چندپروژه‌ای، پروژه‌های با عدد کمتر اولویت بالاتری در رقابت بر سر منابع دارند."
+    )
+
     def __str__(self):
         return self.name
+
+    def clean(self):
+        super().clean()
+        if not self.parent_project_id:
+            return
+        if self.pk and self.parent_project_id == self.pk:
+            raise ValidationError({"parent_project": "پروژه نمی‌تواند زیرپروژه خودش باشد."})
+
+        ancestor = self.parent_project
+        while ancestor is not None:
+            if self.pk and ancestor.pk == self.pk:
+                raise ValidationError({"parent_project": "ساختار زیرپروژه نمی‌تواند حلقه داشته باشد."})
+            ancestor = ancestor.parent_project
+
+    def get_default_approver(self):
+        creator_unit = getattr(self.created_by, 'unit', None)
+        return getattr(creator_unit, 'manager', None) if creator_unit else None
 
 class UnitOfMeasure(models.Model):
     code = models.CharField(max_length=20, unique=True)   # HOUR, DAY, LITER
@@ -218,6 +262,7 @@ def create_revision_zero(sender, instance, created, **kwargs):
             description="Initial Automatic Base Version (Rev 0)",
             is_baseline=True,
             created_by=instance.created_by,
+            designated_approver=instance.get_default_approver(),
             project_start=instance.start_date if instance.start_date else instance.created_at,
             project_end=instance.end_date if instance.end_date else instance.created_at
         )
@@ -299,6 +344,35 @@ class Dependency(models.Model):
     def clean(self):
         if self.predecessor_id == self.successor_id:
             raise ValidationError("Self dependency not allowed.")
+
+
+class SubprojectDependency(models.Model):
+    DIRECTION_TASK_TO_SUBPROJECT = "TASK_TO_SUBPROJECT"
+    DIRECTION_SUBPROJECT_TO_TASK = "SUBPROJECT_TO_TASK"
+    DIRECTION_CHOICES = [
+        (DIRECTION_TASK_TO_SUBPROJECT, "Task to Subproject"),
+        (DIRECTION_SUBPROJECT_TO_TASK, "Subproject to Task"),
+    ]
+
+    revision = models.ForeignKey(Revision, on_delete=models.CASCADE, related_name="subproject_dependencies")
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="subproject_dependencies")
+    subproject = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="parent_schedule_dependencies")
+    direction = models.CharField(max_length=24, choices=DIRECTION_CHOICES)
+    dependency_type = models.CharField(max_length=2, choices=Dependency.LINK_TYPES, default="FS")
+    lag_hours = models.IntegerField(default=0)
+
+    class Meta:
+        unique_together = [("revision", "task", "subproject", "direction")]
+
+    def clean(self):
+        super().clean()
+        if self.revision_id and self.subproject_id:
+            if self.revision.project_id == self.subproject_id:
+                raise ValidationError("Project cannot depend on itself as a subproject.")
+            if self.subproject.parent_project_id != self.revision.project_id:
+                raise ValidationError("Subproject must belong to the dependency revision project.")
+        if self.revision_id and self.task_id and self.task.project_id != self.revision.project_id:
+            raise ValidationError("Task must belong to the dependency revision project.")
 
 
 # =========================================================
@@ -412,6 +486,13 @@ class Resource(models.Model):
         default=100
     )
 
+    parent_schedule_warning = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="هشدار زمان‌بندی پروژه مادر",
+        help_text="آخرین تعارض تاریخ این پروژه با شبکه CPM پروژه مادر. با اجرای CPM مادر به‌روزرسانی می‌شود.",
+    )
+    parent_schedule_warning_updated_at = models.DateTimeField(null=True, blank=True)
     priority = models.IntegerField(
         default=100
     )
@@ -593,6 +674,38 @@ class Assignment(models.Model):
 
 class GlobalLevelingRun(models.Model):
     """ذخیره کانتکست اجرای یک تسطیح منابع سراسری روی چندین پروژه"""
+
+    # ─── معیارهای قابل انتخاب برای اولویت‌بندی رقابت تسک‌ها بر سر منابع ───
+    PRIORITY_TOTAL_FLOAT = "total_float"
+    PRIORITY_LATE_START = "late_start"
+    PRIORITY_EARLY_START = "early_start"
+    PRIORITY_PLANNED_START = "planned_start"
+    PRIORITY_TASK_WEIGHT = "task_weight"
+    PRIORITY_SEQUENCE = "sequence"
+    PRIORITY_RESOURCE_PRIORITY = "resource_priority"
+    PRIORITY_PROJECT_PRIORITY = "project_priority"
+
+    PRIORITY_CRITERIA_CHOICES = [
+        (PRIORITY_TOTAL_FLOAT, "کمترین شناوری کل (Total Float) — بحرانی‌ترین تسک‌ها اول"),
+        (PRIORITY_LATE_START, "زودترین تاریخ شروع دیرهنگام (Late Start)"),
+        (PRIORITY_EARLY_START, "زودترین تاریخ شروع زودهنگام (Early Start)"),
+        (PRIORITY_PLANNED_START, "زودترین تاریخ شروع برنامه‌ریزی‌شده (Planned Start)"),
+        (PRIORITY_TASK_WEIGHT, "بیشترین وزن تسک (Weight)"),
+        (PRIORITY_SEQUENCE, "کمترین شماره ترتیب نمایش (Sequence) در گانت‌چارت"),
+        (PRIORITY_RESOURCE_PRIORITY, "بالاترین اولویت منبع تخصیص‌یافته (Resource.priority)"),
+        (PRIORITY_PROJECT_PRIORITY, "بالاترین اولویت پروژه (Project.priority)"),
+    ]
+
+    DIRECTION_CHOICES = [
+        ("asc", "صعودی (کمترین مقدار، اولویت بالاتر)"),
+        ("desc", "نزولی (بیشترین مقدار، اولویت بالاتر)"),
+    ]
+
+    DEFAULT_PRIORITY_RULES = [
+        {"criterion": PRIORITY_TOTAL_FLOAT, "direction": "asc"},
+        {"criterion": PRIORITY_LATE_START, "direction": "asc"},
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     executed_at = models.DateTimeField(auto_now_add=True)
     executed_by = models.ForeignKey(User, on_delete=models.PROTECT)
@@ -601,6 +714,35 @@ class GlobalLevelingRun(models.Model):
     participating_projects = models.ManyToManyField(Project, related_name="leveling_runs")
     # وضعیت لولینگ: در حد پیش‌نویس/شبیه‌سازی است یا روی برنامه‌ها اعمال نهایی شده؟
     is_committed = models.BooleanField(default=False, verbose_name="اعمال نهایی شده روی برنامه اصلی")
+
+    # فهرست مرتب معیارهای اولویت‌بندی، هر آیتم به شکل {"criterion": <کد>, "direction": "asc"|"desc"}
+    # اولین آیتم مهم‌ترین معیار است؛ در صورت تساوی، معیار بعدی تعیین‌کننده می‌شود.
+    # اگر خالی باشد، پیش‌فرض سیستم (DEFAULT_PRIORITY_RULES) اعمال می‌شود.
+    priority_rules = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="معیارهای اولویت‌بندی تسک‌ها",
+        help_text=(
+            "ترتیب معیارهایی که مشخص می‌کند وقتی چند تسک هم‌زمان بر سر یک منبع رقابت می‌کنند، "
+            "کدام تسک زودتر منبع را می‌گیرد. مثال: "
+            '[{"criterion": "total_float", "direction": "asc"}, '
+            '{"criterion": "resource_priority", "direction": "asc"}]'
+        ),
+    )
+
+    def get_priority_rules(self) -> list:
+        """فهرست نهایی معیارهای اولویت‌بندی؛ در صورت عدم تنظیم توسط کاربر، پیش‌فرض سیستم برگردانده می‌شود."""
+        valid_criteria = {c[0] for c in self.PRIORITY_CRITERIA_CHOICES}
+        rules = []
+        for rule in (self.priority_rules or []):
+            criterion = rule.get("criterion")
+            direction = rule.get("direction", "asc")
+            if criterion not in valid_criteria:
+                raise ValidationError(f"معیار اولویت‌بندی نامعتبر است: {criterion}")
+            if direction not in ("asc", "desc"):
+                raise ValidationError(f"جهت مرتب‌سازی نامعتبر است: {direction}")
+            rules.append({"criterion": criterion, "direction": direction})
+        return rules or list(self.DEFAULT_PRIORITY_RULES)
 
     def __str__(self):
         return f"Run {self.id} - {self.executed_at.date()}"
@@ -947,21 +1089,35 @@ class FundingSource(models.Model):
     received_date = models.DateField()
     total_amount = models.DecimalField(max_digits=18, decimal_places=2)
     currency = models.CharField(max_length=8, default="IRR")
+    status = models.CharField(max_length=16, choices=BUDGET_STATUS_CHOICES, default="DRAFT")
     description = models.TextField(blank=True)
     created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    submitted_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="submitted_funding_sources")
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="approved_funding_sources")
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="rejected_funding_sources")
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["-received_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["source_type", "status"]),
+        ]
 
     def clean(self):
         super().clean()
         if self.total_amount is not None and self.total_amount <= 0:
             raise ValidationError("Funding amount must be greater than zero.")
+        if self.pk and self.total_amount is not None and self.total_amount < self.allocated_amount:
+            raise ValidationError("Funding amount cannot be less than existing root allocations.")
 
     @property
     def allocated_amount(self):
-        result = self.allocations.aggregate(total=models.Sum("allocated_amount"))
+        result = self.allocations.filter(parent_allocation__isnull=True, is_borrow_sink=False).aggregate(total=models.Sum("allocated_amount"))
         return result["total"] or 0
 
     @property
@@ -996,6 +1152,13 @@ class BudgetAllocation(models.Model):
         FundingSource,
         on_delete=models.PROTECT,
         related_name="allocations",
+    )
+    parent_allocation = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="child_allocations",
     )
     project = models.ForeignKey(
         Project,
@@ -1035,8 +1198,17 @@ class BudgetAllocation(models.Model):
     )
     cost_type = models.CharField(max_length=20, choices=COST_TYPES)
     allocated_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    is_borrow_sink = models.BooleanField(default=False)
+    status = models.CharField(max_length=16, choices=BUDGET_STATUS_CHOICES, default="DRAFT")
     description = models.TextField(blank=True)
     created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    submitted_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="submitted_budget_allocations")
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="approved_budget_allocations")
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="rejected_budget_allocations")
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -1044,11 +1216,14 @@ class BudgetAllocation(models.Model):
         indexes = [
             models.Index(fields=["project", "scope_type"]),
             models.Index(fields=["project", "cost_type"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["project", "status"]),
+            models.Index(fields=["parent_allocation"]),
         ]
 
     def clean(self):
         super().clean()
-        if self.allocated_amount is not None and self.allocated_amount <= 0:
+        if self.allocated_amount is not None and self.allocated_amount <= 0 and not self.is_borrow_sink:
             raise ValidationError("Allocated amount must be greater than zero.")
 
         project_scopes = {"PROJECT", "WBS", "TASK"}
@@ -1066,9 +1241,6 @@ class BudgetAllocation(models.Model):
             raise ValidationError("Task allocation requires a task.")
         if self.scope_type in {"WBS", "TASK"} and not self.wbs_node_id:
             raise ValidationError("WBS allocation requires a WBS node.")
-        if self.scope_type == "ORG_UNIT" and not self.org_unit_id:
-            raise ValidationError("Org unit allocation requires an org unit.")
-
         if self.scope_type != "TASK" and self.task_id:
             raise ValidationError("Task can only be set for TASK allocations.")
         if self.scope_type not in {"WBS", "TASK"} and self.wbs_node_id:
@@ -1078,15 +1250,89 @@ class BudgetAllocation(models.Model):
 
         if not self.funding_source_id:
             raise ValidationError("Funding source is required.")
+        if self.status == "APPROVED" and self.funding_source.status != "APPROVED":
+            raise ValidationError("Approved allocations require an approved funding source.")
+        if self.parent_allocation_id:
+            if self.pk and self.parent_allocation_id == self.pk:
+                raise ValidationError("Budget allocation cannot be its own parent.")
+            if self.parent_allocation.funding_source_id != self.funding_source_id:
+                raise ValidationError("Child allocation must use the same funding source as its parent.")
+            if self.parent_allocation.cost_type != self.cost_type:
+                raise ValidationError("Child allocation must use the same cost type as its parent.")
+            if self.status == "APPROVED" and self.parent_allocation.status != "APPROVED":
+                raise ValidationError("Approved child allocations require an approved parent allocation.")
+            self._validate_parent_scope()
+            existing_children = self.parent_allocation.child_allocations.all()
+            if self.pk:
+                existing_children = existing_children.exclude(pk=self.pk)
+            child_total = existing_children.aggregate(total=models.Sum("allocated_amount"))["total"] or 0
+            if child_total + self.allocated_amount > self.parent_allocation.allocated_amount:
+                raise ValidationError("Child allocations cannot exceed parent allocation amount.")
 
-        existing = BudgetAllocation.objects.filter(
-            funding_source=self.funding_source
-        )
-        if self.pk:
-            existing = existing.exclude(pk=self.pk)
-        current_total = existing.aggregate(total=models.Sum("allocated_amount"))["total"] or 0
-        if self.funding_source_id and current_total + self.allocated_amount > self.funding_source.total_amount:
-            raise ValidationError("Allocations cannot exceed funding source amount.")
+        if self.pk and self.allocated_amount is not None:
+            required_capacity = self.actual_amount + self.child_allocated_amount + self.borrowed_out_amount() - self.borrowed_in_amount()
+            if required_capacity < 0:
+                required_capacity = 0
+            if self.allocated_amount < required_capacity:
+                raise ValidationError("Allocation amount cannot be less than actual usage, child budgets, and borrowed-out capacity.")
+
+        if not self.parent_allocation_id:
+            existing = BudgetAllocation.objects.filter(
+                funding_source=self.funding_source,
+                parent_allocation__isnull=True,
+                is_borrow_sink=False,
+            )
+            if self.pk:
+                existing = existing.exclude(pk=self.pk)
+            current_total = existing.aggregate(total=models.Sum("allocated_amount"))["total"] or 0
+            if self.funding_source_id and current_total + self.allocated_amount > self.funding_source.total_amount:
+                raise ValidationError("Allocations cannot exceed funding source amount.")
+
+    def _task_wbs_node_for_validation(self, task, revision):
+        if not task:
+            return None
+        versions = task.versions.filter(is_deleted=False)
+        if revision:
+            version = versions.filter(revision=revision).first()
+        else:
+            version = versions.order_by('-revision__number').first()
+        return version.wbs_node if version else None
+
+    def _validate_parent_scope(self):
+        parent = self.parent_allocation
+        if not parent:
+            return
+
+        if parent.project_id and self.project_id != parent.project_id:
+            raise ValidationError("Child allocation must stay inside the parent project.")
+
+        if parent.scope_type == "PROJECT":
+            if self.scope_type == "ORG_UNIT":
+                raise ValidationError("Project budget children cannot target org units.")
+            return
+
+        if parent.scope_type == "WBS":
+            if self.scope_type not in {"WBS", "TASK"}:
+                raise ValidationError("WBS budget children must target WBS nodes or tasks inside that WBS.")
+            if self.scope_type == "WBS":
+                if not self.wbs_node_id or not self.wbs_node.is_descendant_of(parent.wbs_node, include_self=True):
+                    raise ValidationError("Child WBS allocation must be inside the parent WBS.")
+            if self.scope_type == "TASK":
+                task_wbs = self._task_wbs_node_for_validation(self.task, self.revision or parent.revision)
+                if not task_wbs or not task_wbs.is_descendant_of(parent.wbs_node, include_self=True):
+                    raise ValidationError("Child task allocation must be inside the parent WBS.")
+            return
+
+        if parent.scope_type == "TASK":
+            if self.scope_type != "TASK" or self.task_id != parent.task_id:
+                raise ValidationError("Task budget children must target the same task.")
+            return
+
+        if parent.scope_type == "ORG_UNIT":
+            if self.scope_type != "ORG_UNIT":
+                raise ValidationError("Org unit budget children must stay inside org unit scope.")
+            if parent.org_unit_id and self.org_unit_id != parent.org_unit_id:
+                raise ValidationError("Org unit budget children must stay inside the same org unit.")
 
     @property
     def actual_amount(self):
@@ -1097,8 +1343,27 @@ class BudgetAllocation(models.Model):
         return consumed + legacy_direct
 
     @property
+    def child_allocated_amount(self):
+        result = self.child_allocations.aggregate(total=models.Sum("allocated_amount"))
+        return result["total"] or 0
+
+    def borrowed_in_amount(self):
+        result = self.borrowed_in_records.filter(status__in=["APPROVED", "SETTLED"]).aggregate(total=models.Sum("amount"))
+        return result["total"] or 0
+
+    def borrowed_out_amount(self, exclude_borrow_id=None):
+        queryset = self.borrowed_out_records.filter(status__in=["APPROVED", "SETTLED"])
+        if exclude_borrow_id:
+            queryset = queryset.exclude(pk=exclude_borrow_id)
+        result = queryset.aggregate(total=models.Sum("amount"))
+        return result["total"] or 0
+
+    def borrow_available_amount(self, exclude_borrow_id=None):
+        return self.allocated_amount + self.borrowed_in_amount() - self.actual_amount - self.child_allocated_amount - self.borrowed_out_amount(exclude_borrow_id)
+
+    @property
     def remaining_amount(self):
-        return self.allocated_amount - self.actual_amount
+        return self.borrow_available_amount()
 
     def __str__(self):
         target = self.project or self.org_unit or "Company"
@@ -1338,3 +1603,154 @@ class BudgetConsumption(models.Model):
 
     def __str__(self):
         return f"{self.transaction_id} -> {self.budget_allocation_id}: {self.amount}"
+
+
+class BudgetBorrow(models.Model):
+    BORROW_STATUS_CHOICES = [
+        ("DRAFT", "Draft"),
+        ("SUBMITTED", "Submitted"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+        ("SETTLED", "Settled"),
+    ]
+
+    from_allocation = models.ForeignKey(
+        BudgetAllocation,
+        on_delete=models.PROTECT,
+        related_name="borrowed_out_records",
+    )
+    to_allocation = models.ForeignKey(
+        BudgetAllocation,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="borrowed_in_records",
+    )
+    destination_project = models.ForeignKey(Project, null=True, blank=True, on_delete=models.PROTECT, related_name="budget_borrow_destinations")
+    destination_revision = models.ForeignKey(Revision, null=True, blank=True, on_delete=models.SET_NULL, related_name="budget_borrow_destinations")
+    destination_scope_type = models.CharField(max_length=16, choices=BudgetAllocation.SCOPE_TYPES, blank=True)
+    destination_wbs_node = models.ForeignKey(WBSNodeVersion, null=True, blank=True, on_delete=models.PROTECT, related_name="budget_borrow_destinations")
+    destination_task = models.ForeignKey(Task, null=True, blank=True, on_delete=models.PROTECT, related_name="budget_borrow_destinations")
+    destination_org_unit = models.ForeignKey('CustomUser.OrgUnit', null=True, blank=True, on_delete=models.PROTECT, related_name="budget_borrow_destinations")
+    destination_cost_type = models.CharField(max_length=20, choices=BudgetAllocation.COST_TYPES, blank=True)
+    destination_description = models.TextField(blank=True)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    reason = models.TextField(blank=True)
+    status = models.CharField(max_length=16, choices=BORROW_STATUS_CHOICES, default="DRAFT")
+    requested_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="requested_budget_borrows")
+    submitted_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="submitted_budget_borrows")
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="approved_budget_borrows")
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="rejected_budget_borrows")
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
+    settled_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="settled_budget_borrows")
+    settled_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["from_allocation", "status"]),
+            models.Index(fields=["to_allocation", "status"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.amount is not None and self.amount <= 0:
+            raise ValidationError("Borrow amount must be greater than zero.")
+        if self.from_allocation_id:
+            if self.from_allocation.status != "APPROVED":
+                raise ValidationError("Budget borrow requires an approved source allocation.")
+            if self.to_allocation_id and self.from_allocation_id == self.to_allocation_id:
+                raise ValidationError("Borrow source and destination cannot be the same allocation.")
+            if self.to_allocation_id and self.to_allocation.status != "APPROVED":
+                raise ValidationError("Budget borrow requires an approved destination allocation.")
+            if not self.to_allocation_id:
+                if not self.destination_scope_type:
+                    raise ValidationError("Destination scope type is required when destination allocation is new.")
+                if not self.destination_cost_type:
+                    raise ValidationError("Destination cost type is required when destination allocation is new.")
+                if self.destination_scope_type in {"PROJECT", "WBS", "TASK"} and not self.destination_project_id:
+                    raise ValidationError("Destination project is required for project, WBS, and task borrow targets.")
+                if self.destination_scope_type in {"WBS", "TASK"} and not self.destination_wbs_node_id:
+                    raise ValidationError("Destination WBS is required for WBS and task borrow targets.")
+                if self.destination_scope_type == "TASK" and not self.destination_task_id:
+                    raise ValidationError("Destination task is required for task borrow targets.")
+            if self.status == "APPROVED" and self.amount > self.from_allocation.borrow_available_amount(exclude_borrow_id=self.pk):
+                raise ValidationError("Borrow amount exceeds source allocation available capacity.")
+
+    def __str__(self):
+        return f"{self.from_allocation_id} -> {self.to_allocation_id}: {self.amount}"
+
+
+class UnfundedForecastCost(models.Model):
+    SCOPE_TYPES = BudgetAllocation.SCOPE_TYPES
+    COST_TYPES = BudgetAllocation.COST_TYPES
+    CONFIDENCE_CHOICES = [
+        ("ESTIMATE", "Estimate"),
+        ("EXPECTED", "Expected"),
+        ("COMMITTED", "Committed"),
+    ]
+    STATUS_CHOICES = [
+        ("PLANNED", "Planned"),
+        ("DUE", "Due"),
+        ("OVERDUE", "Overdue"),
+        ("FUNDED", "Funded"),
+        ("CANCELLED", "Cancelled"),
+    ]
+
+    title = models.CharField(max_length=255)
+    project = models.ForeignKey(Project, null=True, blank=True, on_delete=models.SET_NULL, related_name="unfunded_forecast_costs")
+    revision = models.ForeignKey(Revision, null=True, blank=True, on_delete=models.SET_NULL, related_name="unfunded_forecast_costs")
+    scope_type = models.CharField(max_length=16, choices=SCOPE_TYPES, default="RESERVE")
+    wbs_node = models.ForeignKey(WBSNodeVersion, null=True, blank=True, on_delete=models.SET_NULL, related_name="unfunded_forecast_costs")
+    task = models.ForeignKey(Task, null=True, blank=True, on_delete=models.SET_NULL, related_name="unfunded_forecast_costs")
+    org_unit = models.ForeignKey('CustomUser.OrgUnit', null=True, blank=True, on_delete=models.SET_NULL, related_name="unfunded_forecast_costs")
+    cost_type = models.CharField(max_length=20, choices=COST_TYPES, default="EXPENSE")
+    forecast_date = models.DateField()
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    confidence = models.CharField(max_length=16, choices=CONFIDENCE_CHOICES, default="ESTIMATE")
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="PLANNED")
+    linked_allocation = models.ForeignKey(BudgetAllocation, null=True, blank=True, on_delete=models.SET_NULL, related_name="forecast_costs")
+    description = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_unfunded_forecast_costs")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["forecast_date", "id"]
+        indexes = [
+            models.Index(fields=["forecast_date"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["project", "forecast_date"]),
+            models.Index(fields=["scope_type", "cost_type"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.amount is not None and self.amount <= 0:
+            raise ValidationError("Forecast amount must be greater than zero.")
+        if self.scope_type in {"PROJECT", "WBS", "TASK"} and not self.project_id:
+            raise ValidationError("Project is required for project, WBS, and task forecast costs.")
+        if self.revision_id and self.project_id and self.revision.project_id != self.project_id:
+            raise ValidationError("Revision must belong to the selected project.")
+        if self.wbs_node_id and self.project_id and self.wbs_node.revision.project_id != self.project_id:
+            raise ValidationError("WBS node must belong to the selected project.")
+        if self.task_id and self.project_id and self.task.project_id != self.project_id:
+            raise ValidationError("Task must belong to the selected project.")
+        if self.scope_type == "TASK" and not self.task_id:
+            raise ValidationError("Task forecast requires a task.")
+        if self.scope_type in {"WBS", "TASK"} and not self.wbs_node_id:
+            raise ValidationError("WBS forecast requires a WBS node.")
+        if self.scope_type != "TASK" and self.task_id:
+            raise ValidationError("Task can only be set for TASK forecasts.")
+        if self.scope_type not in {"WBS", "TASK"} and self.wbs_node_id:
+            raise ValidationError("WBS node can only be set for WBS or TASK forecasts.")
+        if self.scope_type != "ORG_UNIT" and self.org_unit_id:
+            raise ValidationError("Org unit can only be set for ORG_UNIT forecasts.")
+
+    def __str__(self):
+        return f"{self.title} - {self.amount} - {self.forecast_date}"

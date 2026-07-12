@@ -15,6 +15,8 @@ urlpatterns = [
 
     # ۲. متصل کردن مسیرهای بخش برنامه‌ریزی و گانت چارت
     path('api/planning/', include('ktcPlanning.urls')),
+    path('api/opc/', include('opc.urls')),
+    path('api/items/', include('enterprise_items.urls')),
     path('api/auth/', include('CustomUser.urls')),
     path('api/reports/', include('management_reports.urls')),
 ]

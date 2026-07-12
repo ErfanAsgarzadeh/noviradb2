@@ -16,16 +16,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class CPMCycleError(ValueError):
+    def __init__(self, cycle_task_ids: list[str]):
+        self.cycle_task_ids = cycle_task_ids
+        super().__init__("Cycle detected in CPM graph")
+
+
 # ─────────────────────────────────────────
 # Graph Node
 # ─────────────────────────────────────────
 
 @dataclass
 class TaskNode:
-    tv_id: int
+    tv_id: int | None
     task_id: str
     duration_hours: float
     calendar_id: int | None
+    is_external: bool = False
+    fixed_start: datetime.datetime | None = None
+    fixed_finish: datetime.datetime | None = None
 
     early_start: datetime.datetime | None = None
     early_finish: datetime.datetime | None = None
@@ -141,7 +150,7 @@ class CPMEngine:
     # ═══════════════════════════════════════
 
     def _load(self) -> None:
-        from .models import TaskVersion, Dependency, TaskActual, Calendar
+        from .models import TaskVersion, Dependency, TaskActual
 
         versions = TaskVersion.objects.filter(
             revision=self.revision,
@@ -165,6 +174,8 @@ class CPMEngine:
             self._classify_freeze(node)
             self.nodes[tid] = node
 
+        self._load_subproject_nodes()
+
         # ── Load dependencies ──
         deps = Dependency.objects.filter(revision=self.revision).values(
             "predecessor_id", "successor_id", "dependency_type", "lag_hours"
@@ -174,21 +185,115 @@ class CPMEngine:
             pred = str(d["predecessor_id"])
             succ = str(d["successor_id"])
 
-            if pred not in self.nodes or succ not in self.nodes:
-                continue
-
-            edge = EdgeInfo(
-                from_task_id=pred,
-                to_task_id=succ,
-                dep_type=d["dependency_type"],
-                lag_hours=float(d["lag_hours"]),
-            )
-
-            self.nodes[pred].successors.append(edge)
-            self.nodes[succ].predecessors.append(edge)
+            self._add_edge(pred, succ, d["dependency_type"], float(d["lag_hours"]))
 
         # ── Load calendars ──
+        self._load_subproject_dependencies()
         self._load_calendars()
+
+    def _add_edge(self, pred: str, succ: str, dependency_type: str, lag_hours: float) -> None:
+        if pred not in self.nodes or succ not in self.nodes:
+            return
+
+        edge = EdgeInfo(
+            from_task_id=pred,
+            to_task_id=succ,
+            dep_type=dependency_type,
+            lag_hours=float(lag_hours),
+        )
+
+        self.nodes[pred].successors.append(edge)
+        self.nodes[succ].predecessors.append(edge)
+
+    def _get_active_revision(self, project):
+        from .models import Revision
+
+        return (
+            Revision.objects.filter(project=project, is_deleted=False, approved_at__isnull=True).order_by('-number').first()
+            or Revision.objects.filter(project=project, is_deleted=False).order_by('-number').first()
+        )
+
+    def _get_subproject_node_id(self, project_id) -> str:
+        return f"subproject-{project_id}"
+
+    def _get_subproject_schedule(self, subproject):
+        from .models import TaskVersion
+
+        child_revision = self._get_active_revision(subproject)
+        start = None
+        finish = None
+        duration_hours = 0.0
+
+        if child_revision:
+            child_tasks = TaskVersion.objects.filter(
+                revision=child_revision,
+                is_deleted=False,
+            ).values("planned_start", "planned_finish", "duration_hours")
+            for task in child_tasks:
+                planned_start = task["planned_start"]
+                planned_finish = task["planned_finish"]
+                if planned_start and (start is None or planned_start < start):
+                    start = planned_start
+                if planned_finish and (finish is None or planned_finish > finish):
+                    finish = planned_finish
+                duration_hours += float(task["duration_hours"] or 0)
+
+            if start is None:
+                start = child_revision.project_start
+            if finish is None:
+                finish = child_revision.project_end or child_revision.project_start
+
+        if start is None:
+            start = subproject.start_date
+        if finish is None:
+            finish = subproject.end_date or start
+        if start is None:
+            start = self.revision.project_start
+        if finish is None:
+            finish = start
+
+        if duration_hours <= 0 and start and finish:
+            duration_hours = max((finish - start).total_seconds() / 3600, 0)
+
+        return start, finish, max(duration_hours, 0.0)
+
+    def _load_subproject_nodes(self) -> None:
+        from .models import Project
+
+        subprojects = Project.objects.filter(
+            parent_project=self.revision.project,
+            is_deleted=False,
+        )
+        for subproject in subprojects:
+            start, finish, duration_hours = self._get_subproject_schedule(subproject)
+            node_id = self._get_subproject_node_id(subproject.id)
+            node = TaskNode(
+                tv_id=None,
+                task_id=node_id,
+                duration_hours=duration_hours,
+                calendar_id=getattr(subproject, "calendar_id", None),
+                is_external=True,
+                fixed_start=start,
+                fixed_finish=finish,
+            )
+            node.remaining_duration_hours = duration_hours
+            self.nodes[node_id] = node
+
+    def _load_subproject_dependencies(self) -> None:
+        from .models import SubprojectDependency
+
+        deps = SubprojectDependency.objects.filter(
+            revision=self.revision,
+            subproject__parent_project=self.revision.project,
+        ).values("task_id", "subproject_id", "direction", "dependency_type", "lag_hours")
+
+        for dep in deps:
+            task_id = str(dep["task_id"])
+            subproject_id = self._get_subproject_node_id(dep["subproject_id"])
+            if dep["direction"] == SubprojectDependency.DIRECTION_TASK_TO_SUBPROJECT:
+                self._add_edge(task_id, subproject_id, dep["dependency_type"], float(dep["lag_hours"]))
+            else:
+                self._add_edge(subproject_id, task_id, dep["dependency_type"], float(dep["lag_hours"]))
 
     def _load_calendars(self) -> None:
         """تقویم‌ها را بارگذاری و cache می‌کند."""
@@ -234,9 +339,42 @@ class CPMEngine:
                     queue.append(e.to_task_id)
 
         if len(order) != len(self.nodes):
-            raise ValueError("Cycle detected in CPM graph")
+            raise CPMCycleError(self._find_cycle())
 
         return order
+
+    def _find_cycle(self) -> list[str]:
+        visited: set[str] = set()
+        visiting: set[str] = set()
+        stack: list[str] = []
+
+        def dfs(task_id: str) -> list[str] | None:
+            visited.add(task_id)
+            visiting.add(task_id)
+            stack.append(task_id)
+
+            for edge in self.nodes[task_id].successors:
+                next_id = edge.to_task_id
+                if next_id not in self.nodes:
+                    continue
+                if next_id not in visited:
+                    found = dfs(next_id)
+                    if found:
+                        return found
+                elif next_id in visiting:
+                    start = stack.index(next_id)
+                    return stack[start:] + [next_id]
+
+            stack.pop()
+            visiting.remove(task_id)
+            return None
+
+        for task_id in self.nodes:
+            if task_id not in visited:
+                found = dfs(task_id)
+                if found:
+                    return found
+        return []
 
     # ═══════════════════════════════════════
     # Calendar helpers
@@ -245,21 +383,52 @@ class CPMEngine:
     def _get_engine(self, node: TaskNode) -> CalendarEngine | None:
         return self._cal_engines.get(node.calendar_id, self._default_cal_engine)
 
+    def _next_working_moment(self, dt: datetime.datetime, node: TaskNode | None = None) -> datetime.datetime:
+        engine = self._get_engine(node) if node is not None else self._default_cal_engine
+        if engine:
+            return engine.next_working_moment(dt)
+        return dt
+
+    def _normalize_data_date(self) -> None:
+        self._data_date = self._next_working_moment(self._data_date)
+
     def _add_hours(self, node: TaskNode, start: datetime.datetime, hours: float) -> datetime.datetime:
-        if hours <= 0:
+        """
+        شروع را به اندازه‌ی hours جلو می‌برد.
+        hours می‌تواند منفی باشد (لید / Lead)؛ در این حالت معادل subtract
+        با مقدار مثبت (قدرمطلق) انجام می‌شود، نه نادیده‌گرفتن آن.
+        """
+        if hours == 0:
             return start
         engine = self._get_engine(node)
-        if engine:
-            return engine.add_working_hours(start, hours)
-        return start + datetime.timedelta(hours=hours)
+        if hours > 0:
+            if engine:
+                return engine.add_working_hours(start, hours)
+            return start + datetime.timedelta(hours=hours)
+        else:
+            # لید (لگ منفی): معادل عقب‌بردن به اندازه‌ی قدرمطلق hours
+            if engine:
+                return engine.subtract_working_hours(start, -hours)
+            return start + datetime.timedelta(hours=hours)
 
     def _subtract_hours(self, node: TaskNode, end: datetime.datetime, hours: float) -> datetime.datetime:
-        if hours <= 0:
+        """
+        پایان را به اندازه‌ی hours عقب می‌برد.
+        hours می‌تواند منفی باشد (لید / Lead)؛ در این حالت معادل add
+        با مقدار مثبت (قدرمطلق) انجام می‌شود.
+        """
+        if hours == 0:
             return end
         engine = self._get_engine(node)
-        if engine:
-            return engine.subtract_working_hours(end, hours)
-        return end - datetime.timedelta(hours=hours)
+        if hours > 0:
+            if engine:
+                return engine.subtract_working_hours(end, hours)
+            return end - datetime.timedelta(hours=hours)
+        else:
+            # لید (لگ منفی): معادل جلو بردن به اندازه‌ی قدرمطلق hours
+            if engine:
+                return engine.add_working_hours(end, -hours)
+            return end - datetime.timedelta(hours=hours)
 
     # ═══════════════════════════════════════
     # Dependency resolution (all 4 types)
@@ -357,6 +526,55 @@ class CPMEngine:
         # fallback
         return succ.late_start
 
+    def _calc_free_float_for_edge(self, edge: EdgeInfo) -> float | None:
+        """
+        Free Float یک تسک نسبت به یک جانشینِ مشخص: یعنی این تسک (predecessor)
+        چقدر می‌تواند بدون تاخیرانداختن در ES/EF زودهنگام همان جانشین عقب بیفتد.
+
+        برخلاف نسخه‌ی قبلی که همیشه فرض می‌کرد رابطه FS است (یعنی فقط
+        ES(succ) - EF(pred) را حساب می‌کرد)، اینجا بر اساس نوع واقعیِ رابطه
+        محاسبه می‌شود:
+
+        FS: ES(succ) - (EF(pred) + lag)
+        SS: ES(succ) - (ES(pred) + lag)
+        FF: EF(succ) - (EF(pred) + lag)
+        SF: EF(succ) - (ES(pred) + lag)
+
+        اگر مقدار مورد نیاز هنوز None باشد (forward pass کامل نشده)، None برمی‌گرداند.
+        """
+        pred = self.nodes[edge.from_task_id]
+        succ = self.nodes[edge.to_task_id]
+        lag = edge.lag_hours
+
+        if edge.dep_type == "FS":
+            if pred.early_finish is None or succ.early_start is None:
+                return None
+            constraint = self._add_hours(succ, pred.early_finish, lag) if lag else pred.early_finish
+            delta = succ.early_start - constraint
+
+        elif edge.dep_type == "SS":
+            if pred.early_start is None or succ.early_start is None:
+                return None
+            constraint = self._add_hours(succ, pred.early_start, lag) if lag else pred.early_start
+            delta = succ.early_start - constraint
+
+        elif edge.dep_type == "FF":
+            if pred.early_finish is None or succ.early_finish is None:
+                return None
+            constraint = self._add_hours(succ, pred.early_finish, lag) if lag else pred.early_finish
+            delta = succ.early_finish - constraint
+
+        elif edge.dep_type == "SF":
+            if pred.early_start is None or succ.early_finish is None:
+                return None
+            constraint = self._add_hours(succ, pred.early_start, lag) if lag else pred.early_start
+            delta = succ.early_finish - constraint
+
+        else:
+            return None
+
+        return delta.total_seconds() / 3600
+
     # ═══════════════════════════════════════
     # Forward pass
     # ═══════════════════════════════════════
@@ -377,9 +595,15 @@ class CPMEngine:
             anchor = project_start
         else:
             anchor = self._data_date
+        anchor = self._next_working_moment(anchor)
 
         for tid in order:
             node = self.nodes[tid]
+
+            if node.is_external:
+                node.early_start = node.fixed_start or anchor
+                node.early_finish = node.fixed_finish or node.early_start
+                continue
 
             # ── تسک تکمیل‌شده: ثابت ──
             if node.is_completed:
@@ -450,6 +674,11 @@ class CPMEngine:
         for tid in reversed(order):
             node = self.nodes[tid]
 
+            if node.is_external:
+                node.late_start = node.fixed_start or node.early_start
+                node.late_finish = node.fixed_finish or node.early_finish
+                continue
+
             # ── تسک تکمیل‌شده: ثابت ──
             if node.is_completed:
                 node.late_start = node.early_start
@@ -458,8 +687,6 @@ class CPMEngine:
 
             # ── تسک در حال اجرا ──
             if node.is_in_progress:
-                node.late_start = node.early_start  # actual_start
-
                 if not node.successors:
                     node.late_finish = self._project_finish
                 else:
@@ -469,6 +696,16 @@ class CPMEngine:
                         if lf is not None:
                             lf_candidates.append(lf)
                     node.late_finish = min(lf_candidates) if lf_candidates else self._project_finish
+
+                # LS از روی LF و remaining_duration محاسبه می‌شود، نه اینکه اجباراً
+                # برابر actual_start (ES) باشد؛ در غیر این صورت Total Float همیشه صفر
+                # می‌شد و هر تسک در حال اجرا اشتباهاً بحرانی نشان داده می‌شد.
+                # اگر LS محاسبه‌شده زودتر از actual_start دربیاید، به‌معنای Float منفی
+                # واقعی است (تسک همین الان هم روی جانشین‌ها تاخیر ایجاد می‌کند) و باید
+                # همان‌طور گزارش شود.
+                node.late_start = self._subtract_hours(
+                    node, node.late_finish, node.remaining_duration_hours
+                )
 
                 continue
 
@@ -509,13 +746,12 @@ class CPMEngine:
 
             node.is_critical = node.total_float_hours <= 0
 
-            # Free Float = min(ES(successor)) - EF(this)
+            # Free Float = بر اساس نوع واقعی رابطه با هر جانشین محاسبه می‌شود
             if node.successors:
                 ff_candidates = []
                 for e in node.successors:
-                    succ = self.nodes[e.to_task_id]
-                    if node.early_finish is not None and succ.early_start is not None:
-                        ff = (succ.early_start - node.early_finish).total_seconds() / 3600
+                    ff = self._calc_free_float_for_edge(e)
+                    if ff is not None:
                         ff_candidates.append(ff)
                 node.free_float_hours = min(ff_candidates) if ff_candidates else node.total_float_hours
             else:
@@ -541,6 +777,8 @@ class CPMEngine:
         }
 
         for node in self.nodes.values():
+            if node.is_external or node.tv_id is None:
+                continue
             if node.early_start is None or node.early_finish is None:
                 continue
 
@@ -603,6 +841,31 @@ class CPMEngine:
     # Public API
     # ═══════════════════════════════════════
 
+    def _build_subproject_warnings(self) -> list[dict]:
+        """Report network date conflicts for fixed external subprojects without moving them."""
+        warnings = []
+        for node in self.nodes.values():
+            if not node.is_external:
+                continue
+            issues = []
+            if node.predecessors:
+                constrained_starts = [(self._calc_es_from_edge(edge, self.revision.project_start), edge) for edge in node.predecessors]
+                required_start, governing_edge = max(constrained_starts, key=lambda item: item[0])
+                required_finish = self._add_hours(node, required_start, node.remaining_duration_hours)
+                if governing_edge.dep_type in ('FF', 'SF'):
+                    if node.fixed_finish and node.fixed_finish < required_finish:
+                        issues.append({'field': 'finish', 'code': 'FINISH_TOO_EARLY', 'message': 'Subproject finishes before its parent-network predecessor constraint allows.', 'currentDate': node.fixed_finish.isoformat(), 'requiredDate': required_finish.isoformat(), 'requiredStart': required_start.isoformat()})
+                elif node.fixed_start and node.fixed_start < required_start:
+                    issues.append({'field': 'start', 'code': 'START_TOO_EARLY', 'message': 'Subproject starts before its parent-network predecessors allow.', 'currentDate': node.fixed_start.isoformat(), 'requiredDate': required_start.isoformat(), 'requiredFinish': required_finish.isoformat()})
+            if node.successors:
+                finish_candidates = [candidate for candidate in (self._calc_lf_from_edge(edge) for edge in node.successors) if candidate is not None]
+                latest_finish = min(finish_candidates) if finish_candidates else None
+                if node.fixed_finish and latest_finish and node.fixed_finish > latest_finish:
+                    latest_start = self._subtract_hours(node, latest_finish, node.remaining_duration_hours)
+                    issues.append({'field': 'finish', 'code': 'FINISH_TOO_LATE', 'message': 'Subproject finishes after its parent-network successors require.', 'currentDate': node.fixed_finish.isoformat(), 'requiredDate': latest_finish.isoformat(), 'requiredStart': latest_start.isoformat()})
+            if issues:
+                warnings.append({'nodeId': node.task_id, 'subprojectId': node.task_id.replace('subproject-', '', 1), 'issues': issues})
+        return warnings
     def run(self) -> dict:
         """
         اجرای CPM:
@@ -619,6 +882,8 @@ class CPMEngine:
         if not self.nodes:
             return {"total_tasks": 0}
 
+        self._normalize_data_date()
+
         order = self._topological_sort()
 
         self._forward_pass(order)
@@ -626,20 +891,24 @@ class CPMEngine:
         self._compute_floats()
         self._save_results()
 
-        frozen_count = sum(1 for n in self.nodes.values() if self._is_frozen(n))
-        completed_count = sum(1 for n in self.nodes.values() if n.is_completed)
-        in_progress_count = sum(1 for n in self.nodes.values() if n.is_in_progress)
+        real_nodes = [n for n in self.nodes.values() if not n.is_external]
+        external_count = len(self.nodes) - len(real_nodes)
+        frozen_count = sum(1 for n in real_nodes if self._is_frozen(n))
+        completed_count = sum(1 for n in real_nodes if n.is_completed)
+        in_progress_count = sum(1 for n in real_nodes if n.is_in_progress)
 
         return {
-            "total_tasks": len(self.nodes),
-            "critical_tasks": sum(n.is_critical for n in self.nodes.values()),
+            "total_tasks": len(real_nodes),
+            "external_subprojects": external_count,
+            "critical_tasks": sum(n.is_critical for n in real_nodes),
             "frozen_tasks": frozen_count,
             "completed_tasks": completed_count,
             "in_progress_tasks": in_progress_count,
-            "replanned_tasks": len(self.nodes) - frozen_count,
+            "replanned_tasks": len(real_nodes) - frozen_count,
             "data_date": self._data_date,
             "project_start": self._project_start,
             "project_finish": self._project_finish,
+            "subproject_warnings": self._build_subproject_warnings(),
         }
 
     @classmethod

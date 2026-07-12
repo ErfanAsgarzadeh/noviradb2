@@ -37,6 +37,9 @@ class MultiProjectLevelingEngine:
     def __init__(self, leveling_run: GlobalLevelingRun):
         self.leveling_run = leveling_run
 
+        # معیارهای اولویت‌بندی تسک‌ها برای رقابت بر سر منابع (قابل تنظیم توسط کاربر روی GlobalLevelingRun)
+        self.priority_rules: List[dict] = leveling_run.get_priority_rules()
+
         # مجموعه‌ای از موتورهای CPM برای هر پروژه (برای دسترسی به گراف وابستگی‌ها و تقویم تسک‌ها)
         # key: revision_id -> CPMEngine
         self.cpm_engines: Dict[int, CPMEngine] = {}
@@ -48,6 +51,12 @@ class MultiProjectLevelingEngine:
         # Engines تقویم برای منابع: resource_id -> CalendarEngine
         self.resource_cal_engines: Dict[int, CalendarEngine] = {}
         self.resources: Dict[int, Resource] = {}
+
+        # کش TaskVersion و اولویت پروژه برای استفاده در محاسبه معیارهای اولویت‌بندی (بدون کوئری تکراری)
+        # key: tv_id (str) -> TaskVersion
+        self.task_versions: Dict[str, TaskVersion] = {}
+        # key: tv_id (str) -> project priority (int)
+        self.project_priority: Dict[str, int] = {}
 
         # ظرفیت باقیمانده منابع در هر روز
         # structure: resource_id -> date -> remaining_hours
@@ -84,6 +93,17 @@ class MultiProjectLevelingEngine:
             for tid, node in engine.nodes.items():
                 # برای اطمینان از یکتا بودن آیدی در کل پایگاه داده، از tv_id استفاده می‌کنیم
                 self.global_nodes[str(node.tv_id)] = node
+
+        # ۲.۱ پیش‌بارگذاری TaskVersion و اولویت پروژه‌ی مربوطه، برای معیارهای اولویت‌بندی
+        # (planned_start, weight, sequence, project_priority) بدون نیاز به کوئری تکراری در حلقه اصلی
+        tv_ids = [int(tid) for tid in self.global_nodes.keys()]
+        task_versions_qs = TaskVersion.objects.filter(id__in=tv_ids).select_related(
+            "revision", "revision__project"
+        )
+        for tv in task_versions_qs:
+            tv_id_str = str(tv.id)
+            self.task_versions[tv_id_str] = tv
+            self.project_priority[tv_id_str] = tv.revision.project.priority
 
         # ۳. بارگذاری تمام منابعی که متعلق به این پروژه‌ها هستند
         resources = Resource.objects.filter(
@@ -130,6 +150,69 @@ class MultiProjectLevelingEngine:
         from .models import TaskVersion
         tv = TaskVersion.objects.get(id=node.tv_id)
         return self.cpm_engines[tv.revision_id]
+
+    # ------------------------------------------------------------------
+    # اولویت‌بندی قابل تنظیم تسک‌ها برای رقابت بر سر منابع
+    # ------------------------------------------------------------------
+
+    # اولویت پیش‌فرض وقتی تسکی هیچ تخصیص منبعی ندارد (نه بهترین و نه بدترین)
+    DEFAULT_RESOURCE_PRIORITY = 100
+
+    def _get_task_priority_value(self, node: TaskNode, criterion: str) -> float:
+        """محاسبه‌ی مقدار عددیِ یک معیار مشخص برای یک تسک؛ برای مقایسه در صف اولویت استفاده می‌شود."""
+        tv_id_str = str(node.tv_id)
+        tv = self.task_versions.get(tv_id_str)
+
+        if criterion == GlobalLevelingRun.PRIORITY_TOTAL_FLOAT:
+            return float(node.total_float_hours or 0)
+
+        if criterion == GlobalLevelingRun.PRIORITY_LATE_START:
+            return node.late_start.timestamp() if node.late_start else 0.0
+
+        if criterion == GlobalLevelingRun.PRIORITY_EARLY_START:
+            return node.early_start.timestamp() if node.early_start else 0.0
+
+        if criterion == GlobalLevelingRun.PRIORITY_PLANNED_START:
+            if tv and tv.planned_start:
+                return tv.planned_start.timestamp()
+            # اگر تسک تاریخ برنامه‌ریزی‌شده نداشت، از early_start به عنوان جایگزین استفاده می‌شود
+            return node.early_start.timestamp() if node.early_start else 0.0
+
+        if criterion == GlobalLevelingRun.PRIORITY_TASK_WEIGHT:
+            return float(tv.weight) if tv is not None else 0.0
+
+        if criterion == GlobalLevelingRun.PRIORITY_SEQUENCE:
+            return float(tv.sequence) if tv is not None else 0.0
+
+        if criterion == GlobalLevelingRun.PRIORITY_RESOURCE_PRIORITY:
+            assignments = self.task_assignments.get(tv_id_str, [])
+            priorities = [
+                self.resources[a["resource_id"]].priority
+                for a in assignments
+                if a["resource_id"] in self.resources
+            ]
+            # عدد کمتر در Resource.priority یعنی اولویت بالاتر؛ وقتی چند منبع به یک تسک تخصیص دارد
+            # بالاترین اولویت (کمترین عدد) بین منابع تسک ملاک قرار می‌گیرد
+            return float(min(priorities)) if priorities else float(self.DEFAULT_RESOURCE_PRIORITY)
+
+        if criterion == GlobalLevelingRun.PRIORITY_PROJECT_PRIORITY:
+            return float(self.project_priority.get(tv_id_str, self.DEFAULT_RESOURCE_PRIORITY))
+
+        raise ValueError(f"معیار اولویت‌بندی نامعتبر یا پشتیبانی‌نشده: {criterion}")
+
+    def _build_priority_key(self, node: TaskNode) -> tuple:
+        """
+        ساخت تاپل مرتب‌سازی نهایی بر اساس self.priority_rules.
+        اولین معیار مهم‌ترین است؛ در صورت تساوی، معیار بعدی تعیین‌کننده خواهد بود.
+        برای معیارهای «desc» مقدار منفی می‌شود تا با heapq (که صعودی/min-heap است) سازگار بماند.
+        در انتها یک شناسه‌ی رشته‌ای (tv_id) برای شکستن تساوی کامل و پایدار بودن مرتب‌سازی اضافه می‌شود.
+        """
+        key_parts = []
+        for rule in self.priority_rules:
+            value = self._get_task_priority_value(node, rule["criterion"])
+            key_parts.append(-value if rule["direction"] == "desc" else value)
+        key_parts.append(str(node.tv_id))
+        return tuple(key_parts)
 
     def _distribute_task_hours(self, start_dt: datetime.datetime, duration: float, cal_engine: CalendarEngine) -> Dict[datetime.date, float]:
         dist = {}
@@ -259,17 +342,16 @@ class MultiProjectLevelingEngine:
                     in_degree[succ_tv_id] += 1
 
         # ساخت Priority Queue سراسری (همه پروژه‌ها با هم رقابت می‌کنند)
-        # اولویت: 1. Total Float کمتر 2. Late Start زودتر
+        # اولویت بر اساس self.priority_rules تعیین می‌شود (پیش‌فرض: 1. Total Float کمتر 2. Late Start زودتر)
         pq = []
         for tv_id, deg in in_degree.items():
             if deg == 0:
                 n = self.global_nodes[tv_id]
-                ls_ts = n.late_start.timestamp() if n.late_start else 0
-                heapq.heappush(pq, (n.total_float_hours, ls_ts, tv_id))
+                heapq.heappush(pq, (self._build_priority_key(n), tv_id))
 
         # حلقه Leveling
         while pq:
-            _, _, tv_id = heapq.heappop(pq)
+            _, tv_id = heapq.heappop(pq)
             node = self.global_nodes[tv_id]
 
             min_start = self._earliest_start_from_predecessors(node)
@@ -285,8 +367,7 @@ class MultiProjectLevelingEngine:
                     in_degree[succ_tv_id] -= 1
                     if in_degree[succ_tv_id] == 0:
                         succ_node = self.global_nodes[succ_tv_id]
-                        ls_ts = succ_node.late_start.timestamp() if succ_node.late_start else 0
-                        heapq.heappush(pq, (succ_node.total_float_hours, ls_ts, succ_tv_id))
+                        heapq.heappush(pq, (self._build_priority_key(succ_node), succ_tv_id))
 
         # === ذخیره در لایه شبیه‌سازی (Simulation Layer) ===
 

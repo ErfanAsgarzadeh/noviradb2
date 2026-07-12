@@ -232,7 +232,7 @@ def can_assign_task_role(actor, task, target_user, role) -> bool:
 
     قواعد:
       - superuser / company_admin / company_pm → همیشه مجاز
-      - role == 'reviewer'  → actor باید can_edit_project داشته باشد، و target_user عضوِ یک واحد باشد
+      - role == 'reviewer'  → actor باید can_edit_project داشته باشد
       - role == 'executor'  → actor باید خودش reviewer این تسک باشد، و target_user هم‌واحدِ actor باشد
       - role == 'project manager' → فقط سطحِ شرکت
       - role == 'owner'    → فقط can_edit_project
@@ -248,8 +248,7 @@ def can_assign_task_role(actor, task, target_user, role) -> bool:
     if role == 'reviewer':
         if not can_edit_project(actor, task.project):
             return False
-        # target_user باید به یک واحد وصل باشد
-        return getattr(target_user, 'unit_id', None) is not None
+        return True
 
     if role == 'executor':
         # actor باید reviewer این تسک باشد

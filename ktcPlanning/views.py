@@ -6,10 +6,12 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.shortcuts import get_object_or_404
-from django.http import FileResponse
+from django.http import FileResponse, HttpResponse
+from django.conf import settings
 from django.utils import timezone
+from django.utils.dateparse import parse_date, parse_datetime
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import Q, Sum, Prefetch, F
 from django.core.exceptions import ValidationError as DjangoValidationError
 from datetime import date, timedelta, datetime
 from decimal import Decimal
@@ -17,40 +19,389 @@ from collections import defaultdict
 
 from rest_framework.views import APIView
 
-from .cpm import CPMEngine
+from .cpm import CPMCycleError, CPMEngine
 # ایمپورت تمامی مدل‌های مورد نیاز
-from .models import Project, Revision, WBSNodeVersion, TaskVersion, Dependency, TaskRole, Task, WBSNode, TaskReportLog, \
+from .models import Project, Revision, WBSNodeVersion, TaskVersion, Dependency, SubprojectDependency, TaskRole, Task, WBSNode, TaskReportLog, \
     TaskActual, TaskChatMessage, Assignment, Resource, ResourcePool, ResourceRole, ResourceSkill, ResourceSkillMapping, \
     ResourceException, ResourceRate, VarianceReport, Calendar, ProjectViewer, SystemSettings, UnitOfMeasure, \
-    ExpenseType, FundingSource, BudgetAllocation, CostTransaction, TaskReportAttachment, BudgetConsumption
+    ExpenseType, FundingSource, BudgetAllocation, BudgetBorrow, UnfundedForecastCost, CostTransaction, TaskReportAttachment, BudgetConsumption
 from .serializers import (
     ProjectSerializer,
     RevisionSerializer,
     WbsNodeSerializer,
     ActivityNodeSerializer,
     DependencySerializer,
+    SubprojectDependencySerializer,
+    subproject_virtual_id,
     TaskRoleSerializer, TaskReportLogSerializer, TaskChatMessageSerializer, ResourcePoolSerializer,
     ResourceRoleSerializer, ResourceSkillSerializer, ResourceSerializer, ResourceSkillMappingSerializer,
     ResourceExceptionSerializer, ResourceRateSerializer, AssignmentSerializer, VarianceReportSerializer,
     CalendarSerializer, ProjectViewerSerializer, SystemSettingsSerializer, UnitOfMeasureSerializer,
-    ExpenseTypeSerializer, FundingSourceSerializer, BudgetAllocationSerializer,
+    ExpenseTypeSerializer, FundingSourceSerializer, BudgetAllocationSerializer, BudgetBorrowSerializer, UnfundedForecastCostSerializer,
     CostTransactionSerializer, TaskDropdownSerializer
 )
+
+
+def parse_cpm_data_date(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, str) and value.lower() == "now":
+        return timezone.now()
+
+    text = str(value).strip()
+    parsed = parse_datetime(text)
+    if parsed is None:
+        parsed_date = parse_date(text)
+        if parsed_date is None:
+            raise ValueError("Invalid dataDate. Use ISO datetime, date, or 'now'.")
+        parsed = datetime.combine(parsed_date, datetime.min.time())
+
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+    return parsed
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from ktcPlanning.validators import validate_chat_file
 
 from .msp_importer import import_msp_xml
+from .msp_exporter import export_revision_to_msp_xml
 from django.db.models import Max
 
 from .variance_engine import EVMEngine
 from .permissions import (
     can_create_project, can_edit_project, require_can_create_project,
-    require_can_edit_project, is_company_level,
+    require_can_edit_project, is_company_level, is_system_admin,
     accessible_project_ids, accessible_projects, can_view_project,
     require_can_manage_viewers,
 )
+from auditlog.services import diff_dicts, log_event, model_to_dict_safe
 from django.contrib.auth import get_user_model
 User = get_user_model()
+
+
+def can_approve_budget(user):
+    role = getattr(user, 'org_role', '') or ''
+    return user.is_superuser or user.is_staff or role in {'company_admin', 'company_pm'}
+
+
+def clean_budget_object(obj):
+    try:
+        obj.full_clean()
+    except DjangoValidationError as exc:
+        raise ValidationError(exc.message_dict if hasattr(exc, 'message_dict') else exc.messages)
+
+
+def get_active_revision(project):
+    return (
+        Revision.objects.filter(project=project, is_deleted=False, approved_at__isnull=True).order_by('-number').first()
+        or Revision.objects.filter(project=project, is_deleted=False).order_by('-number').first()
+    )
+
+
+def format_gantt_datetime(value):
+    return value.strftime("%Y-%m-%d %H:%M:%S") if value else ""
+
+
+def parse_gantt_datetime(value):
+    if not value:
+        return None
+    text = str(value).replace('Z', '+00:00')
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+
+
+def rollup_gantt_wbs_nodes(nodes):
+    rolled_nodes = [dict(node) for node in nodes]
+    node_by_id = {str(node.get("id")): node for node in rolled_nodes}
+    child_ids_by_parent = defaultdict(list)
+
+    for node in rolled_nodes:
+        parent_id = node.get("parentId")
+        if parent_id is not None:
+            child_ids_by_parent[str(parent_id)].append(str(node.get("id")))
+
+    def rollup_node(node_id):
+        node = node_by_id.get(str(node_id))
+        if not node or node.get("type") != "wbs":
+            return
+
+        child_ids = child_ids_by_parent.get(str(node_id), [])
+        for child_id in child_ids:
+            rollup_node(child_id)
+
+        children = [node_by_id[child_id] for child_id in child_ids if child_id in node_by_id]
+        dated_children = [
+            child for child in children
+            if parse_gantt_datetime(child.get("startDate")) and parse_gantt_datetime(child.get("endDate"))
+        ]
+        if not dated_children:
+            node["startDate"] = ""
+            node["endDate"] = ""
+            node["duration"] = 0
+            node["progress"] = 0
+            return
+
+        min_start = min(parse_gantt_datetime(child.get("startDate")) for child in dated_children)
+        max_end = max(parse_gantt_datetime(child.get("endDate")) for child in dated_children)
+        total_duration = sum(float(child.get("duration") or 0) or 1 for child in dated_children)
+        weighted_progress = sum(
+            (float(child.get("progress") or 0) * (float(child.get("duration") or 0) or 1))
+            for child in dated_children
+        )
+
+        node["startDate"] = format_gantt_datetime(min_start)
+        node["endDate"] = format_gantt_datetime(max_end)
+        node["duration"] = round(max((max_end - min_start).total_seconds() / 3600, 0), 2)
+        node["progress"] = round(weighted_progress / total_duration) if total_duration else 0
+
+    for node in rolled_nodes:
+        if node.get("type") == "wbs":
+            rollup_node(node.get("id"))
+
+    return rolled_nodes
+
+
+def build_subproject_gantt_node(subproject, parent_id, sequence):
+    child_revision = get_active_revision(subproject)
+    start = None
+    finish = None
+    duration_hours = 0
+    weighted_progress = 0
+
+    if child_revision:
+        child_tasks = TaskVersion.objects.filter(
+            revision=child_revision,
+            is_deleted=False,
+        ).select_related('actual')
+        for task in child_tasks:
+            if task.planned_start and (start is None or task.planned_start < start):
+                start = task.planned_start
+            if task.planned_finish and (finish is None or task.planned_finish > finish):
+                finish = task.planned_finish
+            task_duration = float(task.duration_hours or 0)
+            duration_hours += task_duration
+            actual = getattr(task, 'actual', None)
+            weighted_progress += float(actual.progress if actual else 0) * (task_duration or 1)
+
+        if not start:
+            start = child_revision.project_start
+        if not finish:
+            finish = child_revision.project_end or child_revision.project_start
+
+    if not start:
+        start = subproject.start_date
+    if not finish:
+        finish = subproject.end_date or start
+
+    if duration_hours <= 0 and start and finish:
+        duration_hours = max((finish - start).total_seconds() / 3600, 0)
+
+    progress_denominator = duration_hours if duration_hours > 0 else 1
+    progress = round(weighted_progress / progress_denominator) if weighted_progress else 0
+
+    return {
+        "id": subproject_virtual_id(subproject.id),
+        "code": f"SP-{str(subproject.id)[:4].upper()}",
+        "name": subproject.name,
+        "parentId": parent_id,
+        "type": "activity",
+        "startDate": format_gantt_datetime(start),
+        "endDate": format_gantt_datetime(finish),
+        "duration": round(duration_hours, 2),
+        "progress": progress,
+        "resources": [],
+        "constraintType": "ASAP",
+        "constraintDate": None,
+        "notes": "",
+        "sequence": sequence,
+        "isSubproject": True,
+        "subprojectId": str(subproject.id),
+        "subprojectRevisionId": str(child_revision.id) if child_revision else None,
+    }
+
+
+def find_task_dependency_cycle(revision, extra_edge=None, exclude_dependency_id=None, exclude_subproject_dependency_id=None):
+    node_ids = set(str(task_id) for task_id in TaskVersion.objects.filter(
+        revision=revision,
+        is_deleted=False,
+    ).values_list('task_id', flat=True))
+    subproject_ids = {
+        subproject_virtual_id(project_id)
+        for project_id in Project.objects.filter(
+            parent_project=revision.project,
+            is_deleted=False,
+        ).values_list('id', flat=True)
+    }
+    node_ids.update(subproject_ids)
+    adjacency = defaultdict(list)
+
+    dependency_query = Dependency.objects.filter(revision=revision)
+    if exclude_dependency_id:
+        dependency_query = dependency_query.exclude(id=exclude_dependency_id)
+
+    for predecessor_id, successor_id in dependency_query.values_list('predecessor_id', 'successor_id'):
+        predecessor_id = str(predecessor_id)
+        successor_id = str(successor_id)
+        if predecessor_id in node_ids and successor_id in node_ids:
+            adjacency[predecessor_id].append(successor_id)
+
+    subproject_dependency_query = SubprojectDependency.objects.filter(
+        revision=revision,
+        subproject__parent_project=revision.project,
+    )
+    if exclude_subproject_dependency_id:
+        subproject_dependency_query = subproject_dependency_query.exclude(id=exclude_subproject_dependency_id)
+
+    for dep in subproject_dependency_query.values("task_id", "subproject_id", "direction"):
+        task_id = str(dep["task_id"])
+        subproject_id = subproject_virtual_id(dep["subproject_id"])
+        if dep["direction"] == SubprojectDependency.DIRECTION_TASK_TO_SUBPROJECT:
+            predecessor_id, successor_id = task_id, subproject_id
+        else:
+            predecessor_id, successor_id = subproject_id, task_id
+        if predecessor_id in node_ids and successor_id in node_ids:
+            adjacency[predecessor_id].append(successor_id)
+
+    if extra_edge:
+        predecessor_id, successor_id = map(str, extra_edge)
+        if predecessor_id == successor_id:
+            return [predecessor_id, successor_id]
+        if predecessor_id in node_ids and successor_id in node_ids:
+            adjacency[predecessor_id].append(successor_id)
+
+    visited = set()
+    visiting = set()
+    stack = []
+
+    def dfs(task_id):
+        visited.add(task_id)
+        visiting.add(task_id)
+        stack.append(task_id)
+
+        for next_id in adjacency.get(task_id, []):
+            if next_id not in visited:
+                found = dfs(next_id)
+                if found:
+                    return found
+            elif next_id in visiting:
+                start = stack.index(next_id)
+                return stack[start:] + [next_id]
+
+        stack.pop()
+        visiting.remove(task_id)
+        return None
+
+    for node_id in node_ids:
+        if node_id not in visited:
+            found = dfs(node_id)
+            if found:
+                return found
+    return []
+
+
+def serialize_dependency_cycle(revision, cycle_task_ids):
+    versions = {
+        str(task.task_id): task
+        for task in TaskVersion.objects.filter(revision=revision, task_id__in=cycle_task_ids)
+    }
+    subproject_ids = [
+        node_id.replace("subproject-", "")
+        for node_id in cycle_task_ids
+        if str(node_id).startswith("subproject-")
+    ]
+    subprojects = {
+        str(project.id): project
+        for project in Project.objects.filter(id__in=subproject_ids)
+    }
+
+    cycle = []
+    for task_id in cycle_task_ids:
+        if str(task_id).startswith("subproject-"):
+            project_id = str(task_id).replace("subproject-", "")
+            project = subprojects.get(project_id)
+            cycle.append({
+                "id": task_id,
+                "name": project.name if project else task_id,
+                "code": f"SP-{project_id[:4].upper()}",
+            })
+        else:
+            cycle.append({
+                "id": task_id,
+                "name": getattr(versions.get(task_id), 'title', task_id),
+                "code": f"ACT-{task_id[:4].upper()}",
+            })
+    return cycle
+
+
+def submit_budget_object(obj, user):
+    if obj.status not in {'DRAFT', 'REJECTED'}:
+        raise ValidationError({'status': 'Only draft or rejected budget records can be submitted.'})
+    obj.status = 'SUBMITTED'
+    obj.submitted_by = user
+    obj.submitted_at = timezone.now()
+    obj.approved_by = None
+    obj.approved_at = None
+    obj.rejected_by = None
+    obj.rejected_at = None
+    obj.rejection_reason = ''
+    clean_budget_object(obj)
+    obj.save(update_fields=[
+        'status', 'submitted_by', 'submitted_at',
+        'approved_by', 'approved_at', 'rejected_by', 'rejected_at',
+        'rejection_reason',
+    ])
+
+
+def approve_budget_object(obj, user):
+    if not can_approve_budget(user):
+        raise PermissionDenied('You do not have permission to approve budget records.')
+    if obj.status != 'SUBMITTED':
+        raise ValidationError({'status': 'Only submitted budget records can be approved.'})
+    obj.status = 'APPROVED'
+    obj.approved_by = user
+    obj.approved_at = timezone.now()
+    obj.rejected_by = None
+    obj.rejected_at = None
+    obj.rejection_reason = ''
+    clean_budget_object(obj)
+    obj.save(update_fields=[
+        'status', 'approved_by', 'approved_at',
+        'rejected_by', 'rejected_at', 'rejection_reason',
+    ])
+
+
+def reject_budget_object(obj, user, reason=''):
+    if not can_approve_budget(user):
+        raise PermissionDenied('You do not have permission to reject budget records.')
+    if obj.status != 'SUBMITTED':
+        raise ValidationError({'status': 'Only submitted budget records can be rejected.'})
+    obj.status = 'REJECTED'
+    obj.rejected_by = user
+    obj.rejected_at = timezone.now()
+    obj.rejection_reason = reason or ''
+    obj.approved_by = None
+    obj.approved_at = None
+    clean_budget_object(obj)
+    obj.save(update_fields=[
+        'status', 'rejected_by', 'rejected_at', 'rejection_reason',
+        'approved_by', 'approved_at',
+    ])
+
+
+def log_budget_audit(request, action, target, old=None, extra=None):
+    new = model_to_dict_safe(target)
+    log_event(
+        action,
+        target=target,
+        category='business',
+        changes=diff_dicts(old, new) if old is not None else None,
+        extra=extra,
+        request=request,
+    )
 
 
 def check_revision_is_open(revision, user=None):
@@ -88,9 +439,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         user = self.request.user
         require_can_create_project(user)
         # مدیر واحد → پروژه به واحد خودش گره می‌خورد
-        owner_unit = None
-        if not is_company_level(user) and getattr(user, 'org_role', '') == 'unit_manager':
-            owner_unit = getattr(user, 'unit', None)
+        owner_unit = getattr(user, 'unit', None)
         serializer.save(created_by=user, owner_unit=owner_unit)
 
     def perform_update(self, serializer):
@@ -186,19 +535,50 @@ class RevisionViewSet(viewsets.ModelViewSet):
     def get_gantt_data(self, request, pk=None):
         revision = self.get_object()
 
-        wbs_nodes = WBSNodeVersion.objects.filter(revision=revision, is_deleted=False)
+        wbs_nodes = WBSNodeVersion.objects.filter(
+            revision=revision,
+            is_deleted=False,
+        ).select_related('node', 'parent__node')
         wbs_serializer = WbsNodeSerializer(wbs_nodes, many=True)
 
-        tasks = TaskVersion.objects.filter(revision=revision, is_deleted=False).select_related('metrics')
+        assignments = Assignment.objects.filter(revision=revision).select_related('resource')
+        tasks = TaskVersion.objects.filter(
+            revision=revision,
+            is_deleted=False,
+        ).select_related(
+            'task',
+            'wbs_node__node',
+            'actual',
+            'metrics',
+        ).prefetch_related(
+            Prefetch('task__assignment_set', queryset=assignments, to_attr='revision_assignments')
+        )
         activity_serializer = ActivityNodeSerializer(tasks, many=True)
 
         nodes = wbs_serializer.data + activity_serializer.data
+        root_wbs = next((node for node in wbs_nodes if node.parent_id is None), None)
+        root_parent_id = root_wbs.node_id if root_wbs else None
+        subprojects = Project.objects.filter(
+            parent_project=revision.project,
+            is_deleted=False,
+        ).order_by('name')
+        subproject_nodes = [
+            build_subproject_gantt_node(subproject, root_parent_id, 900000 + index)
+            for index, subproject in enumerate(subprojects, start=1)
+        ]
+        nodes = rollup_gantt_wbs_nodes(nodes + subproject_nodes)
+
         dependencies = Dependency.objects.filter(revision=revision)
         dependency_serializer = DependencySerializer(dependencies, many=True)
+        subproject_dependencies = SubprojectDependency.objects.filter(
+            revision=revision,
+            subproject__parent_project=revision.project,
+        ).select_related('task', 'subproject')
+        subproject_dependency_serializer = SubprojectDependencySerializer(subproject_dependencies, many=True)
 
         return Response({
             "nodes": nodes,
-            "dependencies": dependency_serializer.data
+            "dependencies": list(dependency_serializer.data) + list(subproject_dependency_serializer.data)
         }, status=status.HTTP_200_OK)
 
     # --- ساخت پیش‌نویس (Draft) از یک نسخه ---
@@ -229,7 +609,7 @@ class RevisionViewSet(viewsets.ModelViewSet):
         # درون‌واحدی → پیش‌فرض = مدیرِ واحدِ صاحبِ پروژه
         # override دستی همیشه ممکن است (approverId / approver_id)
         from .permissions import get_planning_manager as _get_pm
-        approver_id = request.data.get('approverId') or request.data.get('approver_id')
+        approver_id = None
         if approver_id:
             approver = get_object_or_404(User, pk=approver_id)
         elif getattr(base_revision.project, 'scope', 'intra_unit') == 'company':
@@ -238,6 +618,8 @@ class RevisionViewSet(viewsets.ModelViewSet):
             # درون‌واحدی: مدیرِ واحدِ صاحبِ پروژه → fallback به سازنده
             ou = getattr(base_revision.project, 'owner_unit', None)
             approver = (ou.manager if ou and ou.manager else request.user)
+
+        approver = base_revision.project.get_default_approver()
 
         new_revision_number = Revision.objects.filter(project=base_revision.project).count() + 1
         new_revision = Revision.objects.create(
@@ -302,6 +684,21 @@ class RevisionViewSet(viewsets.ModelViewSet):
             )
         Dependency.objects.bulk_create(new_deps_to_create)
 
+        old_subproject_deps = SubprojectDependency.objects.filter(revision=base_revision)
+        new_subproject_deps_to_create = []
+        for dep in old_subproject_deps:
+            new_subproject_deps_to_create.append(
+                SubprojectDependency(
+                    revision=new_revision,
+                    task=dep.task,
+                    subproject=dep.subproject,
+                    direction=dep.direction,
+                    dependency_type=dep.dependency_type,
+                    lag_hours=dep.lag_hours
+                )
+            )
+        SubprojectDependency.objects.bulk_create(new_subproject_deps_to_create)
+
         serializer = self.get_serializer(new_revision)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -318,13 +715,42 @@ class RevisionViewSet(viewsets.ModelViewSet):
         try:
             # اجرای موتور CPM که Early/Late start و finish ها را حساب و ذخیره می‌کند
 
-            engine = CPMEngine(revision)
+            data_date = parse_cpm_data_date(request.data.get("dataDate"))
+            engine = CPMEngine(revision, data_date=data_date)
             cpm_result = engine.run()
 
             # پس از محاسبه، مستقیماً داده‌های آپدیت‌شده گانت‌چارت را استخراج کرده و برمی‌گردانیم
             # این کار باعث می‌شود فرانت‌اند نیاز به Request دوم نداشته باشد
-            return self.get_gantt_data(request, pk=pk)
+            response = self.get_gantt_data(request, pk=pk)
+            subproject_warnings = cpm_result.get("subproject_warnings", [])
+            warnings_by_node = {warning["nodeId"]: warning for warning in subproject_warnings}
+            for node in response.data.get("nodes", []):
+                warning = warnings_by_node.get(str(node.get("id")))
+                if warning:
+                    node["scheduleWarning"] = warning
+            response.data["cpm"] = {
+                "totalTasks": cpm_result.get("total_tasks", 0),
+                "externalSubprojects": cpm_result.get("external_subprojects", 0),
+                "criticalTasks": cpm_result.get("critical_tasks", 0),
+                "frozenTasks": cpm_result.get("frozen_tasks", 0),
+                "completedTasks": cpm_result.get("completed_tasks", 0),
+                "inProgressTasks": cpm_result.get("in_progress_tasks", 0),
+                "replannedTasks": cpm_result.get("replanned_tasks", 0),
+                "dataDate": cpm_result.get("data_date").isoformat() if cpm_result.get("data_date") else None,
+                "projectStart": cpm_result.get("project_start").isoformat() if cpm_result.get("project_start") else None,
+                "projectFinish": cpm_result.get("project_finish").isoformat() if cpm_result.get("project_finish") else None,
+                "subprojectWarnings": subproject_warnings,
+            }
+            return response
 
+        except CPMCycleError as e:
+            return Response(
+                {
+                    "detail": str(e),
+                    "cycle": serialize_dependency_cycle(revision, e.cycle_task_ids),
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
         except ValueError as e:
             # این خطا معمولاً به خاطر وجود حلقه (Cycle) در گراف وابستگی‌ها پرتاب می‌شود
             return Response(
@@ -407,7 +833,12 @@ class WbsNodeViewSet(viewsets.ModelViewSet):
             parent=parent_node
         ).aggregate(Max('sequence'))
 
-        current_max_seq = max_seq_dict.get('sequence__max') or 0
+        task_max_seq = 0
+        if parent_node is not None:
+            task_max_seq = TaskVersion.objects.filter(
+                revision=revision, wbs_node=parent_node, is_deleted=False
+            ).aggregate(Max('sequence')).get('sequence__max') or 0
+        current_max_seq = max(max_seq_dict.get('sequence__max') or 0, task_max_seq)
         next_sequence = current_max_seq + 1
         # ------------------------------------------
 
@@ -428,6 +859,8 @@ class WbsNodeViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         # بررسی قفل نبودن نسخه
         check_revision_is_open(instance.revision, self.request.user)
+        if instance.parent_id is None:
+            raise ValidationError({"detail": "The root WBS node cannot be deleted."})
 
         # ۱. گرفتن خود گره و تمامی زیرمجموعه‌های آن (فرزندان، نوه‌ها و...) به کمک MPTT
         descendants = instance.get_descendants(include_self=True)
@@ -488,6 +921,70 @@ class WbsNodeViewSet(viewsets.ModelViewSet):
 
         return Response({"detail": "ترتیب نودهای WBS به‌روزرسانی شد."}, status=status.HTTP_200_OK)
 
+
+    @action(detail=False, methods=['post'], url_path='reorder-mixed')
+    @transaction.atomic
+    def reorder_mixed(self, request):
+        revision_id = request.data.get('revisionId')
+        ordered_items = request.data.get('orderedItems', [])
+        if not revision_id or not ordered_items:
+            return Response(
+                {"detail": "revisionId and orderedItems are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        revision = get_object_or_404(Revision, id=revision_id)
+        check_revision_is_open(revision, request.user)
+
+        if any(
+            not isinstance(item, dict)
+            or item.get('type') not in {'wbs', 'activity'}
+            or not item.get('id')
+            for item in ordered_items
+        ):
+            raise ValidationError({"orderedItems": "Each row needs a valid id and type."})
+
+        wbs_ids = [item.get('id') for item in ordered_items if item.get('type') == 'wbs']
+        task_ids = [item.get('id') for item in ordered_items if item.get('type') == 'activity']
+        wbs_map = {
+            str(item.node_id): item
+            for item in WBSNodeVersion.objects.filter(
+                revision=revision, node_id__in=wbs_ids, is_deleted=False
+            )
+        }
+        task_map = {
+            str(item.task_id): item
+            for item in TaskVersion.objects.filter(
+                revision=revision, task_id__in=task_ids, is_deleted=False
+            )
+        }
+
+        if len(wbs_map) != len(wbs_ids) or len(task_map) != len(task_ids):
+            raise ValidationError({"orderedItems": "One or more rows do not belong to this revision."})
+
+        parent_ids = {
+            str(item.parent.node_id) if item.parent_id else None
+            for item in wbs_map.values()
+        } | {
+            str(item.wbs_node.node_id)
+            for item in task_map.values()
+        }
+        if len(parent_ids) != 1:
+            raise ValidationError({"orderedItems": "All rows must have the same WBS parent."})
+
+        # Move WBS values outside their unique range before assigning shared
+        # positions. Task sequences have no sibling uniqueness constraint.
+        for index, item in enumerate(wbs_map.values()):
+            WBSNodeVersion.objects.filter(pk=item.pk).update(sequence=100000 + index)
+
+        for sequence, row in enumerate(ordered_items, start=1):
+            row_id = str(row.get('id'))
+            if row.get('type') == 'wbs':
+                WBSNodeVersion.objects.filter(pk=wbs_map[row_id].pk).update(sequence=sequence)
+            else:
+                TaskVersion.objects.filter(pk=task_map[row_id].pk).update(sequence=sequence)
+
+        return Response({"detail": "Mixed WBS/task order updated."})
 
 class ActivityNodeViewSet(viewsets.ModelViewSet):
     queryset = TaskVersion.objects.filter(is_deleted=False).select_related('metrics','actual')
@@ -552,9 +1049,13 @@ class ActivityNodeViewSet(viewsets.ModelViewSet):
 
         # تخصیص sequence بر اساس ترتیب ساخت (آخرین + ۱) در همان گره WBS
         # تا ترتیب پیش‌فرض نمایش، ترتیب ایجاد تسک‌ها باشد
-        max_seq = TaskVersion.objects.filter(
+        max_task_seq = TaskVersion.objects.filter(
             revision=revision, wbs_node=wbs_node, is_deleted=False
         ).aggregate(Max('sequence'))['sequence__max'] or 0
+        max_wbs_seq = WBSNodeVersion.objects.filter(
+            revision=revision, parent=wbs_node, is_deleted=False
+        ).aggregate(Max('sequence'))['sequence__max'] or 0
+        max_seq = max(max_task_seq, max_wbs_seq)
 
         base_task = Task.objects.create(project=revision.project)
         serializer.save(task=base_task, revision=revision, wbs_node=wbs_node, sequence=max_seq + 1)
@@ -589,15 +1090,98 @@ class DependencyViewSet(viewsets.ModelViewSet):
             raise ValidationError({"revisionId": "آیدی نسخه الزامی است."})
         revision = get_object_or_404(Revision, id=revision_id)
         check_revision_is_open(revision, self.request.user)
+        predecessor_id = serializer.validated_data.get('predecessor_id')
+        successor_id = serializer.validated_data.get('successor_id')
+        cycle = find_task_dependency_cycle(revision, extra_edge=(predecessor_id, successor_id))
+        if cycle:
+            raise ValidationError({
+                "detail": "This dependency creates a cycle in the CPM graph.",
+                "cycle": serialize_dependency_cycle(revision, cycle),
+            })
         serializer.save(revision=revision)
 
     def perform_update(self, serializer):
         check_revision_is_open(serializer.instance.revision, self.request.user)
+        predecessor_id = serializer.validated_data.get('predecessor_id', serializer.instance.predecessor_id)
+        successor_id = serializer.validated_data.get('successor_id', serializer.instance.successor_id)
+        cycle = find_task_dependency_cycle(
+            serializer.instance.revision,
+            extra_edge=(predecessor_id, successor_id),
+            exclude_dependency_id=serializer.instance.id,
+        )
+        if cycle:
+            raise ValidationError({
+                "detail": "This dependency creates a cycle in the CPM graph.",
+                "cycle": serialize_dependency_cycle(serializer.instance.revision, cycle),
+            })
         serializer.save()
 
     def perform_destroy(self, instance):
         check_revision_is_open(instance.revision, self.request.user)
         instance.delete()  # وابستگی‌ها می‌توانند فیزیکی حذف شوند
+
+
+class SubprojectDependencyViewSet(viewsets.ModelViewSet):
+    queryset = SubprojectDependency.objects.all()
+    serializer_class = SubprojectDependencySerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        queryset = queryset.filter(revision__project_id__in=accessible_project_ids(self.request.user))
+        revision_id = self.request.query_params.get('revision_id')
+        if revision_id:
+            queryset = queryset.filter(revision_id=revision_id)
+        return queryset
+
+    def perform_create(self, serializer):
+        revision = serializer.validated_data.get('revision')
+        if not revision:
+            raise ValidationError({"revisionId": "Revision id is required."})
+        check_revision_is_open(revision, self.request.user)
+        task = serializer.validated_data.get('task')
+        subproject = serializer.validated_data.get('subproject')
+        direction = serializer.validated_data.get('direction')
+        subproject_node_id = subproject_virtual_id(subproject.id)
+        extra_edge = (
+            (str(task.id), subproject_node_id)
+            if direction == SubprojectDependency.DIRECTION_TASK_TO_SUBPROJECT
+            else (subproject_node_id, str(task.id))
+        )
+        cycle = find_task_dependency_cycle(revision, extra_edge=extra_edge)
+        if cycle:
+            raise ValidationError({
+                "detail": "This dependency creates a cycle in the CPM graph.",
+                "cycle": serialize_dependency_cycle(revision, cycle),
+            })
+        serializer.save()
+
+    def perform_update(self, serializer):
+        check_revision_is_open(serializer.instance.revision, self.request.user)
+        task = serializer.validated_data.get('task', serializer.instance.task)
+        subproject = serializer.validated_data.get('subproject', serializer.instance.subproject)
+        direction = serializer.validated_data.get('direction', serializer.instance.direction)
+        subproject_node_id = subproject_virtual_id(subproject.id)
+        extra_edge = (
+            (str(task.id), subproject_node_id)
+            if direction == SubprojectDependency.DIRECTION_TASK_TO_SUBPROJECT
+            else (subproject_node_id, str(task.id))
+        )
+        cycle = find_task_dependency_cycle(
+            serializer.instance.revision,
+            extra_edge=extra_edge,
+            exclude_subproject_dependency_id=serializer.instance.id,
+        )
+        if cycle:
+            raise ValidationError({
+                "detail": "This dependency creates a cycle in the CPM graph.",
+                "cycle": serialize_dependency_cycle(serializer.instance.revision, cycle),
+            })
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        check_revision_is_open(instance.revision, self.request.user)
+        instance.delete()
 
 
 class TaskReportLogViewSet(viewsets.ModelViewSet):
@@ -898,6 +1482,123 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
         require_can_assign_task_role(self.request.user, instance.task, instance.user, instance.role)
         instance.delete()
 
+    @action(detail=False, methods=['post'], url_path='bulk-assign-reviewer')
+    @transaction.atomic
+    def bulk_assign_reviewer(self, request):
+        revision_id = request.data.get('revisionId') or request.data.get('revision_id')
+        wbs_node_id = request.data.get('wbsNodeId') or request.data.get('wbs_node_id')
+        user_id = request.data.get('userId') or request.data.get('user_id')
+        replace_existing = request.data.get('replaceExisting', True)
+
+        if not revision_id or not wbs_node_id or not user_id:
+            return Response(
+                {"detail": "revisionId، wbsNodeId و userId الزامی هستند."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        revision = get_object_or_404(
+            Revision.objects.filter(project_id__in=accessible_project_ids(request.user)),
+            pk=revision_id,
+        )
+        check_revision_is_open(revision, request.user)
+
+        wbs_node = get_object_or_404(
+            WBSNodeVersion.objects.filter(revision=revision, is_deleted=False),
+            node_id=wbs_node_id,
+        )
+        target_user = get_object_or_404(User, pk=user_id)
+
+        wbs_scope = wbs_node.get_descendants(include_self=True).filter(is_deleted=False)
+        task_versions = list(
+            TaskVersion.objects.filter(
+                revision=revision,
+                is_deleted=False,
+                wbs_node__in=wbs_scope,
+            ).select_related('task', 'task__project')
+        )
+
+        if not task_versions:
+            return Response(
+                {"detail": "در این نود WBS تسکی برای تخصیص reviewer وجود ندارد."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from .permissions import require_can_assign_task_role
+        for task_version in task_versions:
+            require_can_assign_task_role(request.user, task_version.task, target_user, 'reviewer')
+
+        task_ids = [task_version.task_id for task_version in task_versions]
+        if replace_existing in (True, 'true', 'True', '1', 1):
+            TaskRole.objects.filter(
+                revision=revision,
+                task_id__in=task_ids,
+                role='reviewer',
+            ).exclude(user=target_user).delete()
+
+        created_count = 0
+        for task_version in task_versions:
+            _, created = TaskRole.objects.get_or_create(
+                revision=revision,
+                task=task_version.task,
+                user=target_user,
+                role='reviewer',
+            )
+            if created:
+                created_count += 1
+
+        roles = TaskRole.objects.filter(revision=revision, task_id__in=task_ids)
+        return Response(
+            {
+                "assignedTaskCount": len(task_versions),
+                "createdCount": created_count,
+                "roles": TaskRoleSerializer(roles, many=True).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=['post'], url_path='bulk-assign-executor')
+    @transaction.atomic
+    def bulk_assign_executor(self, request):
+        revision_id = request.data.get('revisionId')
+        project_id = request.data.get('projectId')
+        wbs_node_id = request.data.get('wbsNodeId')
+        user_id = request.data.get('userId')
+        if not user_id or not (revision_id or project_id):
+            return Response({'detail': 'userId and revisionId/projectId are required.'}, status=status.HTTP_400_BAD_REQUEST)
+        revision_qs = Revision.objects.filter(project_id__in=accessible_project_ids(request.user), project__is_deleted=False, is_deleted=False, approved_at__isnull=True)
+        revision = get_object_or_404(revision_qs, pk=revision_id) if revision_id else get_object_or_404(revision_qs, project_id=project_id)
+        check_revision_is_open(revision, request.user)
+        target = get_object_or_404(User, pk=user_id)
+        versions = TaskVersion.objects.filter(revision=revision, is_deleted=False, wbs_node__is_deleted=False).select_related('task')
+        if not is_system_admin(request.user):
+            versions = versions.filter(task__roles__user=request.user, task__roles__role__in=['reviewer', 'project manager'], task__roles__revision=revision).distinct()
+        if wbs_node_id:
+            node = get_object_or_404(WBSNodeVersion.objects.filter(revision=revision, is_deleted=False), node_id=wbs_node_id)
+            versions = versions.filter(wbs_node__in=node.get_descendants(include_self=True).filter(is_deleted=False))
+        versions = list(versions)
+        from .permissions import require_can_assign_task_role
+        for version in versions:
+            require_can_assign_task_role(request.user, version.task, target, 'executor')
+        created = 0
+        for version in versions:
+            _, was_created = TaskRole.objects.get_or_create(revision=revision, task=version.task, user=target, role='executor')
+            created += int(was_created)
+        return Response({'assignedTaskCount': len(versions), 'createdCount': created}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='assignment-filter-options')
+    def assignment_filter_options(self, request):
+        actor = request.user
+        versions = TaskVersion.objects.filter(is_deleted=False, wbs_node__is_deleted=False, revision__is_deleted=False, revision__project__is_deleted=False, revision__approved_at__isnull=True)
+        if not is_system_admin(actor):
+            versions = versions.filter(task__roles__user=actor, task__roles__role__in=['reviewer', 'project manager'], task__roles__revision=F('revision'))
+        versions = versions.select_related('revision__project', 'wbs_node').distinct()
+        projects, nodes = {}, {}
+        for version in versions:
+            project = version.revision.project
+            projects[str(project.id)] = {'id': str(project.id), 'name': project.name, 'revisionId': version.revision_id}
+            if version.wbs_node:
+                nodes[str(version.wbs_node.node_id)] = {'id': str(version.wbs_node.node_id), 'projectId': str(project.id), 'code': version.wbs_node.wbs_code, 'title': version.wbs_node.title, 'revisionId': version.revision_id}
+        return Response({'projects': list(projects.values()), 'nodes': list(nodes.values())})
     @action(detail=False, methods=['get'], url_path='assignable-users')
     def assignable_users(self, request):
         """
@@ -922,8 +1623,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
         if actor.is_superuser or get_role(actor) == 'company_admin':
             users = User.objects.all()
         elif role == 'reviewer' and can_edit_project(actor, task.project):
-            # Reviewer باید به یک واحد وصل باشد (تا بعداً Executor انتخاب کند)
-            users = User.objects.filter(unit__isnull=False)
+            users = User.objects.all()
         elif role == 'executor' and is_task_reviewer(actor, task) and getattr(actor, 'unit_id', None):
             # Executor فقط از واحد مستقیم خود Reviewer (= actor)
             users = User.objects.filter(unit_id=actor.unit_id)
@@ -943,19 +1643,50 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
         """
         actor = request.user
         unit_id = getattr(actor, 'unit_id', None)
+        is_system_admin_actor = is_system_admin(actor)
 
-        # تسک‌هایی که این کاربر روی آن‌ها reviewer / project manager است
-        # و نسخه‌اش هنوز قفل نشده
+        # System admins can assign executors on every open task. Other users
+        # only see tasks where they are reviewer/project manager in this revision.
         task_versions = TaskVersion.objects.filter(
             is_deleted=False,
+            wbs_node__is_deleted=False,
+            revision__is_deleted=False,
+            revision__project__is_deleted=False,
             revision__approved_at__isnull=True,
-            task__roles__user=actor,
-            task__roles__role__in=['reviewer', 'project manager'],
-        ).select_related(
+        )
+        if not is_system_admin_actor:
+            task_versions = task_versions.filter(
+                task__roles__user=actor,
+                task__roles__role__in=['reviewer', 'project manager'],
+                task__roles__revision=F('revision'),
+            )
+
+        project_id = request.query_params.get('projectId')
+        node_id = request.query_params.get('wbsNodeId')
+        search = (request.query_params.get('search') or '').strip()
+        if project_id:
+            task_versions = task_versions.filter(revision__project_id=project_id)
+        if node_id:
+            node = WBSNodeVersion.objects.filter(node_id=node_id, revision__approved_at__isnull=True, is_deleted=False).first()
+            if node:
+                task_versions = task_versions.filter(wbs_node__in=node.get_descendants(include_self=True).filter(is_deleted=False))
+        if search:
+            task_versions = task_versions.filter(Q(title__icontains=search) | Q(wbs_node__wbs_code__icontains=search) | Q(revision__project__name__icontains=search))
+
+        task_versions = task_versions.select_related(
             'task', 'wbs_node', 'revision', 'revision__project'
         ).distinct().order_by('revision__project__name', 'sequence')
 
-        # برای دریافتِ executor های فعلی، همهٔ TaskRole های executor مرتبط را با یک query می‌گیریم
+        # Return a bounded page so large task lists do not block the UI.
+        try:
+            page = max(int(request.query_params.get('page', 1)), 1)
+            page_size = min(max(int(request.query_params.get('pageSize', 25)), 1), 100)
+        except (TypeError, ValueError):
+            page, page_size = 1, 25
+        total_tasks = task_versions.count()
+        start = (page - 1) * page_size
+        task_versions = list(task_versions[start:start + page_size])
+
         task_ids = [tv.task_id for tv in task_versions]
         executor_roles = TaskRole.objects.filter(
             task_id__in=task_ids,
@@ -984,6 +1715,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
                 'projectName': project.name,
                 'title': tv.title,
                 'wbsCode': tv.wbs_node.wbs_code if tv.wbs_node else '',
+                'wbsNodeId': tv.wbs_node.node_id if tv.wbs_node else None,
                 'wbsTitle': tv.wbs_node.title if tv.wbs_node else '',
                 'plannedStart': tv.planned_start.strftime('%Y-%m-%d %H:%M') if tv.planned_start else None,
                 'plannedFinish': tv.planned_finish.strftime('%Y-%m-%d %H:%M') if tv.planned_finish else None,
@@ -993,7 +1725,9 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
             })
 
         # اعضای واحدِ کاربر — dropdown ها از این لیست پر می‌شوند
-        if unit_id:
+        if is_system_admin_actor:
+            unit_members_qs = User.objects.all().order_by('username')
+        elif unit_id:
             unit_members_qs = User.objects.filter(unit_id=unit_id).order_by('username')
         else:
             unit_members_qs = User.objects.none()
@@ -1012,6 +1746,11 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
             'tasks': tasks_data,
             'unitMembers': unit_members,
             'unitId': unit_id,
+            'canAssignAcrossUnits': is_system_admin_actor,
+            'page': page,
+            'pageSize': page_size,
+            'totalTasks': total_tasks,
+            'hasNext': start + len(tasks_data) < total_tasks,
         })
 
 
@@ -1297,9 +2036,57 @@ class ImportMSPView(APIView):
         if not xml_file.name.lower().endswith(".xml"):
             return Response({"error": "File must be a .xml export from MS Project."}, status=400)
 
+        max_upload_bytes = getattr(settings, 'MSP_IMPORT_MAX_UPLOAD_MB', 100) * 1024 * 1024
+        if xml_file.size and xml_file.size > max_upload_bytes:
+            return Response(
+                {
+                    "error": "File is too large.",
+                    "detail": f"MSP XML import limit is {getattr(settings, 'MSP_IMPORT_MAX_UPLOAD_MB', 100)} MB.",
+                },
+                status=413,
+            )
+
+        project = Project.objects.filter(pk=project_id, is_deleted=False).first()
+        if project is None:
+            return Response(
+                {"error": "Invalid project_id.", "detail": "Selected project was not found."},
+                status=400,
+            )
+
+        revision = Revision.objects.filter(pk=revision_id, project=project, is_deleted=False).first()
+        if revision is None:
+            return Response(
+                {
+                    "error": "Invalid revision_id.",
+                    "detail": "Selected revision was not found for this project.",
+                },
+                status=400,
+            )
+
+        if active_node_id:
+            try:
+                node_exists = WBSNodeVersion.objects.filter(
+                    node_id=active_node_id,
+                    revision=revision,
+                    is_deleted=False,
+                ).exists()
+            except (ValueError, DjangoValidationError):
+                node_exists = False
+
+            if not node_exists:
+                return Response(
+                    {
+                        "error": "Invalid active_node_id.",
+                        "detail": "Import target must be an existing WBS node in the selected revision.",
+                    },
+                    status=400,
+                )
+
         try:
             # فراخوانی تابع اصلاح شده در msp_importer.py
             result = import_msp_xml(xml_file, project_id, revision_id, active_node_id=active_node_id)
+            if result.get("error"):
+                return Response(result, status=400)
         except Exception as exc:
             return Response(
                 {"error": "Import failed.", "detail": str(exc)},
@@ -1307,6 +2094,39 @@ class ImportMSPView(APIView):
             )
 
         return Response(result, status=200)
+
+
+class ExportMSPView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, revision_id):
+        revision = get_object_or_404(
+            Revision.objects.select_related("project").filter(
+                project_id__in=accessible_project_ids(request.user),
+                is_deleted=False,
+                project__is_deleted=False,
+            ),
+            pk=revision_id,
+        )
+
+        try:
+            xml_bytes = export_revision_to_msp_xml(revision)
+        except Exception as exc:
+            return Response(
+                {"error": "Export failed.", "detail": str(exc)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        safe_project_name = "".join(
+            ch if ch.isascii() and (ch.isalnum() or ch in ("-", "_")) else "_"
+            for ch in revision.project.name
+        ).strip("_") or "project"
+        filename = f"{safe_project_name}_rev_{revision.number}_msp.xml"
+        response = HttpResponse(xml_bytes, content_type="application/xml; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+
 class ResourcePoolViewSet(viewsets.ModelViewSet):
     queryset = ResourcePool.objects.all()
     serializer_class = ResourcePoolSerializer
@@ -1637,15 +2457,54 @@ class FundingSourceViewSet(viewsets.ModelViewSet):
         source_type = self.request.query_params.get('source_type')
         if source_type:
             queryset = queryset.filter(source_type=source_type)
+        status = self.request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
         return queryset
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        funding_source = serializer.save(created_by=self.request.user)
+        log_budget_audit(self.request, 'funding_source_created', funding_source)
+
+    def perform_update(self, serializer):
+        old = model_to_dict_safe(serializer.instance)
+        funding_source = serializer.save()
+        log_budget_audit(self.request, 'funding_source_updated', funding_source, old=old)
+
+    def perform_destroy(self, instance):
+        old = model_to_dict_safe(instance)
+        log_budget_audit(self.request, 'funding_source_deleted', instance, old=old, extra={'deleted': old})
+        instance.delete()
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        funding_source = self.get_object()
+        old = model_to_dict_safe(funding_source)
+        submit_budget_object(funding_source, request.user)
+        log_budget_audit(request, 'funding_source_submitted', funding_source, old=old)
+        return Response(self.get_serializer(funding_source).data)
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        funding_source = self.get_object()
+        old = model_to_dict_safe(funding_source)
+        approve_budget_object(funding_source, request.user)
+        log_budget_audit(request, 'funding_source_approved', funding_source, old=old)
+        return Response(self.get_serializer(funding_source).data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        funding_source = self.get_object()
+        old = model_to_dict_safe(funding_source)
+        reason = request.data.get('reason', '')
+        reject_budget_object(funding_source, request.user, reason)
+        log_budget_audit(request, 'funding_source_rejected', funding_source, old=old, extra={'reason': reason})
+        return Response(self.get_serializer(funding_source).data)
 
 
 class BudgetAllocationViewSet(viewsets.ModelViewSet):
     queryset = BudgetAllocation.objects.select_related(
-        'funding_source', 'project', 'revision', 'wbs_node', 'task', 'org_unit'
+        'funding_source', 'parent_allocation', 'project', 'revision', 'wbs_node', 'task', 'org_unit'
     ).all()
     serializer_class = BudgetAllocationSerializer
     permission_classes = [IsAuthenticated]
@@ -1663,19 +2522,256 @@ class BudgetAllocationViewSet(viewsets.ModelViewSet):
         funding_source_id = self.request.query_params.get('funding_source_id')
         if funding_source_id:
             queryset = queryset.filter(funding_source_id=funding_source_id)
+        parent_allocation_id = self.request.query_params.get('parent_allocation_id')
+        if parent_allocation_id:
+            queryset = queryset.filter(parent_allocation_id=parent_allocation_id)
         scope_type = self.request.query_params.get('scope_type')
         if scope_type:
             queryset = queryset.filter(scope_type=scope_type)
         cost_type = self.request.query_params.get('cost_type')
         if cost_type:
             queryset = queryset.filter(cost_type=cost_type)
+        status = self.request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
         task_id = self.request.query_params.get('task_id')
         if task_id:
             queryset = queryset.filter(task_id=task_id)
         return queryset
 
     def perform_create(self, serializer):
-        serializer.save(created_by=self.request.user)
+        allocation = serializer.save(created_by=self.request.user)
+        log_budget_audit(self.request, 'budget_allocation_created', allocation)
+
+    def perform_update(self, serializer):
+        old = model_to_dict_safe(serializer.instance)
+        allocation = serializer.save()
+        log_budget_audit(self.request, 'budget_allocation_updated', allocation, old=old)
+
+    def perform_destroy(self, instance):
+        old = model_to_dict_safe(instance)
+        log_budget_audit(self.request, 'budget_allocation_deleted', instance, old=old, extra={'deleted': old})
+        instance.delete()
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        allocation = self.get_object()
+        old = model_to_dict_safe(allocation)
+        submit_budget_object(allocation, request.user)
+        log_budget_audit(request, 'budget_allocation_submitted', allocation, old=old)
+        return Response(self.get_serializer(allocation).data)
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        allocation = self.get_object()
+        old = model_to_dict_safe(allocation)
+        approve_budget_object(allocation, request.user)
+        log_budget_audit(request, 'budget_allocation_approved', allocation, old=old)
+        return Response(self.get_serializer(allocation).data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        allocation = self.get_object()
+        old = model_to_dict_safe(allocation)
+        reason = request.data.get('reason', '')
+        reject_budget_object(allocation, request.user, reason)
+        log_budget_audit(request, 'budget_allocation_rejected', allocation, old=old, extra={'reason': reason})
+        return Response(self.get_serializer(allocation).data)
+
+
+class BudgetBorrowViewSet(viewsets.ModelViewSet):
+    queryset = BudgetBorrow.objects.select_related(
+        'from_allocation',
+        'from_allocation__project',
+        'from_allocation__wbs_node',
+        'from_allocation__task',
+        'from_allocation__org_unit',
+        'to_allocation',
+        'to_allocation__project',
+        'to_allocation__wbs_node',
+        'to_allocation__task',
+        'to_allocation__org_unit',
+        'destination_project',
+        'destination_revision',
+        'destination_wbs_node',
+        'destination_task',
+        'destination_org_unit',
+    ).all()
+    serializer_class = BudgetBorrowSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        accessible_ids = accessible_project_ids(self.request.user)
+        queryset = super().get_queryset().filter(
+            Q(from_allocation__project_id__in=accessible_ids) |
+            Q(to_allocation__project_id__in=accessible_ids) |
+            Q(destination_project_id__in=accessible_ids) |
+            Q(from_allocation__project__isnull=True) |
+            Q(to_allocation__project__isnull=True) |
+            Q(destination_project__isnull=True)
+        ).distinct()
+
+        status_value = self.request.query_params.get('status')
+        if status_value:
+            queryset = queryset.filter(status=status_value)
+        from_allocation_id = self.request.query_params.get('from_allocation_id')
+        if from_allocation_id:
+            queryset = queryset.filter(from_allocation_id=from_allocation_id)
+        to_allocation_id = self.request.query_params.get('to_allocation_id')
+        if to_allocation_id:
+            queryset = queryset.filter(to_allocation_id=to_allocation_id)
+        return queryset
+
+    def perform_create(self, serializer):
+        budget_borrow = serializer.save(requested_by=self.request.user)
+        log_budget_audit(self.request, 'budget_borrow_created', budget_borrow)
+
+    def perform_update(self, serializer):
+        old = model_to_dict_safe(serializer.instance)
+        budget_borrow = serializer.save()
+        log_budget_audit(self.request, 'budget_borrow_updated', budget_borrow, old=old)
+
+    def perform_destroy(self, instance):
+        old = model_to_dict_safe(instance)
+        log_budget_audit(self.request, 'budget_borrow_deleted', instance, old=old, extra={'deleted': old})
+        instance.delete()
+
+    def _create_destination_allocation(self, budget_borrow, user):
+        destination = BudgetAllocation(
+            funding_source=budget_borrow.from_allocation.funding_source,
+            project=budget_borrow.destination_project,
+            revision=budget_borrow.destination_revision,
+            scope_type=budget_borrow.destination_scope_type,
+            wbs_node=budget_borrow.destination_wbs_node,
+            task=budget_borrow.destination_task,
+            org_unit=budget_borrow.destination_org_unit,
+            cost_type=budget_borrow.destination_cost_type,
+            allocated_amount=Decimal('0.00'),
+            is_borrow_sink=True,
+            status='APPROVED',
+            description=budget_borrow.destination_description or budget_borrow.reason,
+            created_by=user,
+            approved_by=user,
+            approved_at=timezone.now(),
+        )
+        clean_budget_object(destination)
+        destination.save()
+        budget_borrow.to_allocation = destination
+        budget_borrow.save(update_fields=['to_allocation'])
+        return destination
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        budget_borrow = self.get_object()
+        old = model_to_dict_safe(budget_borrow)
+        submit_budget_object(budget_borrow, request.user)
+        log_budget_audit(request, 'budget_borrow_submitted', budget_borrow, old=old)
+        return Response(self.get_serializer(budget_borrow).data)
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        budget_borrow = self.get_object()
+        old = model_to_dict_safe(budget_borrow)
+        created_destination = None
+        with transaction.atomic():
+            approve_budget_object(budget_borrow, request.user)
+            if not budget_borrow.to_allocation_id:
+                created_destination = self._create_destination_allocation(budget_borrow, request.user)
+        log_budget_audit(
+            request,
+            'budget_borrow_approved',
+            budget_borrow,
+            old=old,
+            extra={'created_destination_allocation_id': getattr(created_destination, 'id', None)},
+        )
+        if created_destination:
+            log_budget_audit(
+                request,
+                'budget_allocation_created_from_borrow',
+                created_destination,
+                extra={'borrow_id': budget_borrow.id, 'from_allocation_id': budget_borrow.from_allocation_id},
+            )
+        return Response(self.get_serializer(budget_borrow).data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        budget_borrow = self.get_object()
+        old = model_to_dict_safe(budget_borrow)
+        reason = request.data.get('reason', '')
+        reject_budget_object(budget_borrow, request.user, reason)
+        log_budget_audit(request, 'budget_borrow_rejected', budget_borrow, old=old, extra={'reason': reason})
+        return Response(self.get_serializer(budget_borrow).data)
+
+    @action(detail=True, methods=['post'])
+    def settle(self, request, pk=None):
+        budget_borrow = self.get_object()
+        if not can_approve_budget(request.user):
+            raise PermissionDenied('You do not have permission to settle budget borrows.')
+        if budget_borrow.status != 'APPROVED':
+            raise ValidationError({'status': 'Only approved budget borrows can be settled.'})
+        old = model_to_dict_safe(budget_borrow)
+        budget_borrow.status = 'SETTLED'
+        budget_borrow.settled_by = request.user
+        budget_borrow.settled_at = timezone.now()
+        clean_budget_object(budget_borrow)
+        budget_borrow.save(update_fields=['status', 'settled_by', 'settled_at'])
+        log_budget_audit(request, 'budget_borrow_settled', budget_borrow, old=old)
+        return Response(self.get_serializer(budget_borrow).data)
+
+
+class UnfundedForecastCostViewSet(viewsets.ModelViewSet):
+    queryset = UnfundedForecastCost.objects.select_related(
+        'project',
+        'revision',
+        'wbs_node',
+        'task',
+        'org_unit',
+        'linked_allocation',
+        'linked_allocation__funding_source',
+    ).all()
+    serializer_class = UnfundedForecastCostSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        accessible_ids = accessible_project_ids(self.request.user)
+        queryset = super().get_queryset().filter(
+            Q(project_id__in=accessible_ids) |
+            Q(project__isnull=True)
+        ).distinct()
+
+        project_id = self.request.query_params.get('project_id')
+        if project_id:
+            queryset = queryset.filter(project_id=project_id)
+        scope_type = self.request.query_params.get('scope_type')
+        if scope_type:
+            queryset = queryset.filter(scope_type=scope_type)
+        cost_type = self.request.query_params.get('cost_type')
+        if cost_type:
+            queryset = queryset.filter(cost_type=cost_type)
+        status_value = self.request.query_params.get('status')
+        if status_value:
+            queryset = queryset.filter(status=status_value)
+        date_from = self.request.query_params.get('date_from')
+        if date_from:
+            queryset = queryset.filter(forecast_date__gte=date_from)
+        date_to = self.request.query_params.get('date_to')
+        if date_to:
+            queryset = queryset.filter(forecast_date__lte=date_to)
+        return queryset
+
+    def perform_create(self, serializer):
+        forecast = serializer.save(created_by=self.request.user)
+        log_budget_audit(self.request, 'unfunded_forecast_created', forecast)
+
+    def perform_update(self, serializer):
+        old = model_to_dict_safe(serializer.instance)
+        forecast = serializer.save()
+        log_budget_audit(self.request, 'unfunded_forecast_updated', forecast, old=old)
+
+    def perform_destroy(self, instance):
+        old = model_to_dict_safe(instance)
+        log_budget_audit(self.request, 'unfunded_forecast_deleted', instance, old=old, extra={'deleted': old})
+        instance.delete()
 
 
 class CostTransactionViewSet(viewsets.ModelViewSet):
@@ -1705,7 +2801,24 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
         legacy_direct = allocation.transactions.filter(budget_consumptions__isnull=True).aggregate(
             total=Sum('amount')
         )['total'] or Decimal('0')
-        return allocation.allocated_amount - consumed - legacy_direct
+        child_allocated = allocation.child_allocations.aggregate(total=Sum('allocated_amount'))['total'] or Decimal('0')
+        borrowed_in = allocation.borrowed_in_records.filter(status='APPROVED').aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        borrowed_out = allocation.borrowed_out_records.filter(status='APPROVED').aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        return allocation.allocated_amount + borrowed_in - consumed - legacy_direct - child_allocated - borrowed_out
+
+    def _budget_consumption_audit_payload(self, cost_transaction):
+        return [
+            {
+                'budget_consumption_id': consumption.id,
+                'budget_allocation_id': consumption.budget_allocation_id,
+                'funding_source_id': consumption.budget_allocation.funding_source_id,
+                'amount': str(consumption.amount),
+            }
+            for consumption in cost_transaction.budget_consumptions.select_related(
+                'budget_allocation',
+                'budget_allocation__funding_source',
+            ).order_by('id')
+        ]
 
     def _task_wbs_chain(self, cost_transaction):
         if not cost_transaction.task_id:
@@ -1722,19 +2835,33 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
         if not task_version:
             return []
 
-        return list(reversed(list(task_version.wbs_node.get_ancestors(include_self=True))))
+        return list(task_version.wbs_node.get_ancestors(include_self=True).order_by('-level'))
+
+    def _allocation_tree_depth(self, allocation):
+        depth = 0
+        current = allocation.parent_allocation
+        while current:
+            depth += 1
+            current = current.parent_allocation
+        return depth
 
     def _eligible_budget_allocations(self, cost_transaction):
-        base = BudgetAllocation.objects.select_for_update().filter(
+        base = BudgetAllocation.objects.select_for_update().select_related('parent_allocation').filter(
             project=cost_transaction.project,
             cost_type=cost_transaction.transaction_type,
+            status='APPROVED',
+            funding_source__status='APPROVED',
         )
 
         ordered_allocations = []
         seen = set()
 
         def append_scope(queryset):
-            for allocation in queryset.order_by('created_at', 'id'):
+            scoped_allocations = sorted(
+                list(queryset.order_by('created_at', 'id')),
+                key=lambda allocation: (-self._allocation_tree_depth(allocation), allocation.created_at, allocation.id),
+            )
+            for allocation in scoped_allocations:
                 if allocation.id in seen:
                     continue
                 seen.add(allocation.id)
@@ -1787,13 +2914,44 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         cost_transaction = serializer.save(created_by=self.request.user, budget_allocation=None)
         self._allocate_budget_for_transaction(cost_transaction)
+        log_budget_audit(
+            self.request,
+            'cost_transaction_created',
+            cost_transaction,
+            extra={'budget_consumptions': self._budget_consumption_audit_payload(cost_transaction)},
+        )
 
     @transaction.atomic
     def perform_update(self, serializer):
         cost_transaction = serializer.instance
+        old = model_to_dict_safe(cost_transaction)
+        old_consumptions = self._budget_consumption_audit_payload(cost_transaction)
         cost_transaction.budget_consumptions.all().delete()
         cost_transaction = serializer.save(budget_allocation=None)
         self._allocate_budget_for_transaction(cost_transaction)
+        log_budget_audit(
+            self.request,
+            'cost_transaction_updated',
+            cost_transaction,
+            old=old,
+            extra={
+                'old_budget_consumptions': old_consumptions,
+                'budget_consumptions': self._budget_consumption_audit_payload(cost_transaction),
+            },
+        )
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        old = model_to_dict_safe(instance)
+        old_consumptions = self._budget_consumption_audit_payload(instance)
+        log_budget_audit(
+            self.request,
+            'cost_transaction_deleted',
+            instance,
+            old=old,
+            extra={'deleted': old, 'budget_consumptions': old_consumptions},
+        )
+        instance.delete()
 
 
 class TaskViewSet(viewsets.ReadOnlyModelViewSet):

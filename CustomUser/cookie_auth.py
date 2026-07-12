@@ -24,6 +24,7 @@ from rest_framework_simplejwt.serializers import (
     TokenRefreshSerializer,
 )
 from rest_framework_simplejwt.tokens import RefreshToken
+from auditlog.services import log_event
 
 
 # ── تنظیمات Cookie ──────────────────────────────────────────────────────────
@@ -82,10 +83,29 @@ class CookieTokenObtainPairView(APIView):
 
     def post(self, request):
         serializer = TokenObtainPairSerializer(data=request.data)
+        username_attempted = request.data.get("username", "")
         try:
             serializer.is_valid(raise_exception=True)
         except TokenError as e:
+            log_event(
+                "login_failed",
+                category="auth",
+                success=False,
+                error_message=str(e),
+                extra={"username_attempted": username_attempted},
+                request=request,
+            )
             raise InvalidToken(e.args[0])
+        except Exception as e:
+            log_event(
+                "login_failed",
+                category="auth",
+                success=False,
+                error_message=str(e),
+                extra={"username_attempted": username_attempted},
+                request=request,
+            )
+            raise
 
         access  = serializer.validated_data["access"]
         refresh = serializer.validated_data["refresh"]
@@ -106,6 +126,7 @@ class CookieTokenObtainPairView(APIView):
         )
         _set_auth_cookies(response, access, refresh)
         response["X-CSRFToken"] = get_token(request)
+        log_event("login", target=user, category="auth", request=request)
         return response
 
 
@@ -170,4 +191,5 @@ class CookieLogoutView(APIView):
                 # حتی اگر blacklist ناموفق بود، Cookie را پاک می‌کنیم
                 pass
 
+        log_event("logout", target=request.user, category="auth", request=request)
         return response

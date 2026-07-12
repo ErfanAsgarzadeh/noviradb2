@@ -5,11 +5,11 @@ from .views import (
     RevisionViewSet,
     WbsNodeViewSet,
     ActivityNodeViewSet,
-    DependencyViewSet, TaskReportLogViewSet, TaskChatMessageViewSet, TaskRoleViewSet, ResourceHistogramView,
-    ImportMSPView, ResourcePoolViewSet, AssignmentViewSet, ResourceRateViewSet, ResourceExceptionViewSet,
+    DependencyViewSet, SubprojectDependencyViewSet, TaskReportLogViewSet, TaskChatMessageViewSet, TaskRoleViewSet, ResourceHistogramView,
+    ImportMSPView, ExportMSPView, ResourcePoolViewSet, AssignmentViewSet, ResourceRateViewSet, ResourceExceptionViewSet,
     ResourceSkillMappingViewSet, ResourceViewSet, ResourceSkillViewSet, ResourceRoleViewSet, PersonalTaskViewSet,
     VarianceReportViewSet, CalendarViewSet, ProjectViewerViewSet, SystemSettingsView, ExpenseTypeViewSet,
-    UnitOfMeasureViewSet, FundingSourceViewSet, BudgetAllocationViewSet,
+    UnitOfMeasureViewSet, FundingSourceViewSet, BudgetAllocationViewSet, BudgetBorrowViewSet, UnfundedForecastCostViewSet,
     CostTransactionViewSet, TaskViewSet
 )
 
@@ -24,6 +24,7 @@ router.register(r'revisions', RevisionViewSet, basename='revision')
 router.register(r'wbs-nodes', WbsNodeViewSet, basename='wbs-node')
 router.register(r'activities', ActivityNodeViewSet, basename='activity')
 router.register(r'dependencies', DependencyViewSet, basename='dependency')
+router.register(r'subproject-dependencies', SubprojectDependencyViewSet, basename='subproject-dependency')
 router.register(r'task-reports', TaskReportLogViewSet, basename='task-report')
 router.register(r'task-chats', TaskChatMessageViewSet, basename='task-chat')
 router.register(r'task-roles', TaskRoleViewSet, basename='task-role')
@@ -42,11 +43,14 @@ router.register(r'expense-types', ExpenseTypeViewSet, basename='expense-type')
 router.register(r'units-of-measure', UnitOfMeasureViewSet, basename='unit-of-measure')
 router.register(r'funding-sources', FundingSourceViewSet, basename='funding-source')
 router.register(r'budget-allocations', BudgetAllocationViewSet, basename='budget-allocation')
+router.register(r'budget-borrows', BudgetBorrowViewSet, basename='budget-borrow')
+router.register(r'unfunded-forecast-costs', UnfundedForecastCostViewSet, basename='unfunded-forecast-cost')
 router.register(r'cost-transactions', CostTransactionViewSet, basename='cost-transaction')
 router.register(r'tasks', TaskViewSet, basename='task')
 # مسیرهای نهایی اپلیکیشن
 urlpatterns = [
     path('', include(router.urls)),
     path("import-msp/", ImportMSPView.as_view(), name="import-msp"),
+    path("export-msp/<int:revision_id>/", ExportMSPView.as_view(), name="export-msp"),
     path("system-settings/", SystemSettingsView.as_view(), name="system-settings"),
 ]
