@@ -69,6 +69,13 @@ class Project(models.Model):
         help_text="برای ساخت ساختار پروژه/زیرپروژه شبیه Primavera استفاده می‌شود."
     )
 
+    parent_schedule_warning = models.JSONField(
+        default=dict,
+        blank=True,
+        verbose_name="هشدار زمان‌بندی پروژه مادر",
+        help_text="آخرین تعارض تاریخ این پروژه با شبکه CPM پروژه مادر. با اجرای CPM مادر به‌روزرسانی می‌شود.",
+    )
+    parent_schedule_warning_updated_at = models.DateTimeField(null=True, blank=True)
     # اولویت پروژه در رقابت سراسری بر سر منابع (عدد کمتر = اولویت بالاتر، هم‌راستا با Resource.priority)
     priority = models.IntegerField(
         default=100,
@@ -486,13 +493,6 @@ class Resource(models.Model):
         default=100
     )
 
-    parent_schedule_warning = models.JSONField(
-        default=dict,
-        blank=True,
-        verbose_name="هشدار زمان‌بندی پروژه مادر",
-        help_text="آخرین تعارض تاریخ این پروژه با شبکه CPM پروژه مادر. با اجرای CPM مادر به‌روزرسانی می‌شود.",
-    )
-    parent_schedule_warning_updated_at = models.DateTimeField(null=True, blank=True)
     priority = models.IntegerField(
         default=100
     )
@@ -706,10 +706,28 @@ class GlobalLevelingRun(models.Model):
         {"criterion": PRIORITY_LATE_START, "direction": "asc"},
     ]
 
+    STATUS_DRAFT = "draft"
+    STATUS_CALCULATED = "calculated"
+    STATUS_PUBLISHED = "published"
+    STATUS_ARCHIVED = "archived"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_CALCULATED, "Calculated"),
+        (STATUS_PUBLISHED, "Published"),
+        (STATUS_ARCHIVED, "Archived"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=160, default="Untitled Leveling Plan")
     executed_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     executed_by = models.ForeignKey(User, on_delete=models.PROTECT)
     description = models.TextField(blank=True)
+    data_date = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    settings = models.JSONField(default=dict, blank=True)
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    published_at = models.DateTimeField(null=True, blank=True)
     # پروژه‌هایی که در این اجرای سراسری شرکت داده شده‌اند
     participating_projects = models.ManyToManyField(Project, related_name="leveling_runs")
     # وضعیت لولینگ: در حد پیش‌نویس/شبیه‌سازی است یا روی برنامه‌ها اعمال نهایی شده؟
@@ -745,7 +763,28 @@ class GlobalLevelingRun(models.Model):
         return rules or list(self.DEFAULT_PRIORITY_RULES)
 
     def __str__(self):
-        return f"Run {self.id} - {self.executed_at.date()}"
+        return f"{self.name} - {self.executed_at.date()}"
+
+
+class LevelingPlanProject(models.Model):
+    leveling_run = models.ForeignKey(
+        GlobalLevelingRun, on_delete=models.CASCADE, related_name="plan_projects"
+    )
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, related_name="leveling_plan_entries"
+    )
+    revision = models.ForeignKey(
+        Revision, on_delete=models.PROTECT, related_name="leveling_plan_entries"
+    )
+    priority = models.PositiveIntegerField(default=100)
+
+    class Meta:
+        unique_together = [("leveling_run", "project")]
+        ordering = ["priority", "project__name"]
+
+    def clean(self):
+        if self.revision_id and self.project_id and self.revision.project_id != self.project_id:
+            raise ValidationError("Selected revision must belong to the selected project.")
 
 
 class TaskLevelingMetrics(models.Model):
@@ -758,8 +797,11 @@ class TaskLevelingMetrics(models.Model):
     )
 
     # تاریخ‌های پیشنهادی موتور تسطیح (تداخل‌ها در این تاریخ‌ها حل شده‌اند)
+    original_start = models.DateTimeField(null=True, blank=True)
+    original_finish = models.DateTimeField(null=True, blank=True)
     leveled_start = models.DateTimeField()
     leveled_finish = models.DateTimeField()
+    decision_reason = models.CharField(max_length=255, blank=True)
 
     # میزان تاخیری که لولینگ به خاطر کمبود منبع به تسک تحمیل کرده است (بر حسب ساعت)
     leveling_delay_hours = models.DecimalField(max_digits=10, decimal_places=2, default=0)
@@ -775,6 +817,8 @@ class ResourceUsage(models.Model):
     )
     revision = models.ForeignKey(
         Revision,
+        null=True,
+        blank=True,
         on_delete=models.CASCADE
     )
 
@@ -797,6 +841,12 @@ class ResourceUsage(models.Model):
         default=0
     )
 
+    capacity_hours = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0
+    )
+
     remaining_capacity = models.DecimalField(
         max_digits=10,
         decimal_places=2,
@@ -806,7 +856,7 @@ class ResourceUsage(models.Model):
     class Meta:
         unique_together = [
             (
-                "revision",
+                "leveling_run",
                 "resource",
                 "usage_date"
             )

@@ -1,17 +1,18 @@
-"""
-سرویسِ مرکزیِ ثبتِ لاگ.
+﻿"""
+ط³ط±ظˆغŒط³ظگ ظ…ط±ع©ط²غŒظگ ط«ط¨طھظگ ظ„ط§ع¯.
 
-استفاده در ویوها:
+ط§ط³طھظپط§ط¯ظ‡ ط¯ط± ظˆغŒظˆظ‡ط§:
     from auditlog.services import log_event
     log_event('approve_report', target=report, category='business',
               extra={'progress': 75}, request=request)
 
-نکات:
-- request اختیاری است؛ اگر داده نشود، از thread-local گرفته می‌شود (که middleware
-  می‌گذارد).
-- این تابع هرگز exception پرتاب نمی‌کند — اگر نوشتن در دیتابیس fail شود،
-  حداقل در فایلِ log می‌نویسد.
+ظ†ع©ط§طھ:
+- request ط§ط®طھغŒط§ط±غŒ ط§ط³طھط› ط§ع¯ط± ط¯ط§ط¯ظ‡ ظ†ط´ظˆط¯طŒ ط§ط² thread-local ع¯ط±ظپطھظ‡ ظ…غŒâ€Œط´ظˆط¯ (ع©ظ‡ middleware
+  ظ…غŒâ€Œع¯ط°ط§ط±ط¯).
+- ط§غŒظ† طھط§ط¨ط¹ ظ‡ط±ع¯ط² exception ظ¾ط±طھط§ط¨ ظ†ظ…غŒâ€Œع©ظ†ط¯ â€” ط§ع¯ط± ظ†ظˆط´طھظ† ط¯ط± ط¯غŒطھط§ط¨غŒط³ fail ط´ظˆط¯طŒ
+  ط­ط¯ط§ظ‚ظ„ ط¯ط± ظپط§غŒظ„ظگ log ظ…غŒâ€Œظ†ظˆغŒط³ط¯.
 """
+import ipaddress
 import logging
 import threading
 
@@ -84,7 +85,7 @@ def log_event(
     status_code=None,
     request=None,
 ):
-    """ثبتِ یک رویداد. هرگز exception پرتاب نمی‌کند."""
+    """ط«ط¨طھظگ غŒع© ط±ظˆغŒط¯ط§ط¯. ظ‡ط±ع¯ط² exception ظ¾ط±طھط§ط¨ ظ†ظ…غŒâ€Œع©ظ†ط¯."""
     from .models import AuditEvent
 
     request = request or get_current_request()
@@ -103,14 +104,14 @@ def log_event(
         **ctx,
     )
 
-    # تلاش برای نوشتن در DB
+    # طھظ„ط§ط´ ط¨ط±ط§غŒ ظ†ظˆط´طھظ† ط¯ط± DB
     try:
         AuditEvent.objects.create(**fields)
     except Exception as e:
-        # اگر migrate نشده یا DB در دسترس نیست، فقط در فایل بنویس
+        # ط§ع¯ط± migrate ظ†ط´ط¯ظ‡ غŒط§ DB ط¯ط± ط¯ط³طھط±ط³ ظ†غŒط³طھطŒ ظپظ‚ط· ط¯ط± ظپط§غŒظ„ ط¨ظ†ظˆغŒط³
         logger.warning('audit DB write failed: %s', e)
 
-    # همیشه در فایلِ log هم می‌نویسیم — لایهٔ دوم برای resilience
+    # ظ‡ظ…غŒط´ظ‡ ط¯ط± ظپط§غŒظ„ظگ log ظ‡ظ… ظ…غŒâ€Œظ†ظˆغŒط³غŒظ… â€” ظ„ط§غŒظ‡ظ” ط¯ظˆظ… ط¨ط±ط§غŒ resilience
     logger.info(
         'audit | actor=%s | action=%s | target=%s:%s (%s) | category=%s | '
         'success=%s | path=%s | ip=%s',
@@ -127,7 +128,7 @@ def log_event(
 
 
 def diff_dicts(old, new, fields=None):
-    """تفاوتِ دو dict را به فرمتِ {field: {old, new}} برمی‌گرداند."""
+    """طھظپط§ظˆطھظگ ط¯ظˆ dict ط±ط§ ط¨ظ‡ ظپط±ظ…طھظگ {field: {old, new}} ط¨ط±ظ…غŒâ€Œع¯ط±ط¯ط§ظ†ط¯."""
     if old is None and new is None:
         return None
     old = old or {}
@@ -138,7 +139,7 @@ def diff_dicts(old, new, fields=None):
         a = old.get(k)
         b = new.get(k)
         if a != b:
-            # سعی می‌کنیم مقادیر را به حالتِ JSON-serializable در بیاوریم
+            # ط³ط¹غŒ ظ…غŒâ€Œع©ظ†غŒظ… ظ…ظ‚ط§ط¯غŒط± ط±ط§ ط¨ظ‡ ط­ط§ظ„طھظگ JSON-serializable ط¯ط± ط¨غŒط§ظˆط±غŒظ…
             out[k] = {'old': _safe(a), 'new': _safe(b)}
     return out or None
 
@@ -153,7 +154,7 @@ def _safe(v):
 
 
 def model_to_dict_safe(instance, fields=None):
-    """نسخهٔ ساده‌ی model_to_dict که FKها را به ID تبدیل می‌کند."""
+    """ظ†ط³ط®ظ‡ظ” ط³ط§ط¯ظ‡â€ŒغŒ model_to_dict ع©ظ‡ FKظ‡ط§ ط±ط§ ط¨ظ‡ ID طھط¨ط¯غŒظ„ ظ…غŒâ€Œع©ظ†ط¯."""
     if instance is None:
         return None
     out = {}
@@ -166,3 +167,5 @@ def model_to_dict_safe(instance, fields=None):
         except Exception:
             out[f.name] = None
     return out
+
+

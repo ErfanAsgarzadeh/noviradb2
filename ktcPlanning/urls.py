@@ -10,7 +10,7 @@ from .views import (
     ResourceSkillMappingViewSet, ResourceViewSet, ResourceSkillViewSet, ResourceRoleViewSet, PersonalTaskViewSet,
     VarianceReportViewSet, CalendarViewSet, ProjectViewerViewSet, SystemSettingsView, ExpenseTypeViewSet,
     UnitOfMeasureViewSet, FundingSourceViewSet, BudgetAllocationViewSet, BudgetBorrowViewSet, UnfundedForecastCostViewSet,
-    CostTransactionViewSet, TaskViewSet
+    CostTransactionViewSet, TaskViewSet, ResourceLevelingPlanViewSet
 )
 
 # ایجاد یک نمونه از روتور پیش‌فرض DRF
@@ -47,8 +47,10 @@ router.register(r'budget-borrows', BudgetBorrowViewSet, basename='budget-borrow'
 router.register(r'unfunded-forecast-costs', UnfundedForecastCostViewSet, basename='unfunded-forecast-cost')
 router.register(r'cost-transactions', CostTransactionViewSet, basename='cost-transaction')
 router.register(r'tasks', TaskViewSet, basename='task')
+router.register(r'resource-leveling-plans', ResourceLevelingPlanViewSet, basename='resource-leveling-plan')
 # مسیرهای نهایی اپلیکیشن
 urlpatterns = [
+    path('revisions/<int:revision_id>/resource-histogram/', ResourceHistogramView.as_view(), name='resource-histogram'),
     path('', include(router.urls)),
     path("import-msp/", ImportMSPView.as_view(), name="import-msp"),
     path("export-msp/<int:revision_id>/", ExportMSPView.as_view(), name="export-msp"),

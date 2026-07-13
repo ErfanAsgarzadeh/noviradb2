@@ -78,6 +78,22 @@ else:
     ALLOWED_HOSTS = ["*"] if DEBUG else []
 
 
+# ALLOWED_IP_RANGES: comma-separated list of IPs/CIDR ranges (e.g. company
+# network) that are allowed to reach the whole site. Enforced by
+# KTCProject.middleware.IPWhitelistMiddleware (see MIDDLEWARE below).
+# Example in .env:
+#   ALLOWED_IP_RANGES=203.0.113.0/24,198.51.100.5,2001:db8::/32
+# Leave empty to disable the restriction (e.g. local development).
+_allowed_ip_ranges_env = os.environ.get('ALLOWED_IP_RANGES', '').strip()
+ALLOWED_IP_RANGES = [r.strip() for r in _allowed_ip_ranges_env.split(',') if r.strip()]
+
+# Set to True if the app sits behind a reverse proxy (nginx, etc.) that sets
+# X-Forwarded-For, so IPWhitelistMiddleware reads the real client IP instead
+# of the proxy's IP. Make sure your proxy is trusted/configured correctly
+# before enabling this, otherwise clients could spoof the header.
+TRUST_X_FORWARDED_FOR = os.environ.get('TRUST_X_FORWARDED_FOR', '0').lower() in ('1', 'true', 'yes')
+
+
 # Application definition
 
 INSTALLED_APPS = [
@@ -103,6 +119,7 @@ if os.environ.get('USE_S3_STORAGE', '0').lower() in ('1', 'true', 'yes'):
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'KTCProject.middleware.IPWhitelistMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -262,6 +279,8 @@ else:
         "http://127.0.0.1:3000",
         "http://localhost:5000",
         "http://127.0.0.1:5000",
+        "http://192.168.50.78:5000",
+
     ]
 
 # اجازه دادن به ارسال cookie در cross-origin requests (لازم برای httpOnly Cookie auth)
@@ -276,7 +295,10 @@ else:
         "http://127.0.0.1:3000",
         "http://localhost:5000",
         "http://127.0.0.1:5000",
+        "http://192.168.50.78:5000",
+
     ]
+CORS_ALLOW_CREDENTIALS = True
 
 # تنظیمات امنیتی Cookie
 SESSION_COOKIE_HTTPONLY = True

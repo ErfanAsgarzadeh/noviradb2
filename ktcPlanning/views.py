@@ -24,7 +24,8 @@ from .cpm import CPMCycleError, CPMEngine
 from .models import Project, Revision, WBSNodeVersion, TaskVersion, Dependency, SubprojectDependency, TaskRole, Task, WBSNode, TaskReportLog, \
     TaskActual, TaskChatMessage, Assignment, Resource, ResourcePool, ResourceRole, ResourceSkill, ResourceSkillMapping, \
     ResourceException, ResourceRate, VarianceReport, Calendar, ProjectViewer, SystemSettings, UnitOfMeasure, \
-    ExpenseType, FundingSource, BudgetAllocation, BudgetBorrow, UnfundedForecastCost, CostTransaction, TaskReportAttachment, BudgetConsumption
+    ExpenseType, FundingSource, BudgetAllocation, BudgetBorrow, UnfundedForecastCost, CostTransaction, TaskReportAttachment, BudgetConsumption, \
+    GlobalLevelingRun, LevelingPlanProject, TaskLevelingMetrics, ResourceUsage
 from .serializers import (
     ProjectSerializer,
     RevisionSerializer,
@@ -38,7 +39,7 @@ from .serializers import (
     ResourceExceptionSerializer, ResourceRateSerializer, AssignmentSerializer, VarianceReportSerializer,
     CalendarSerializer, ProjectViewerSerializer, SystemSettingsSerializer, UnitOfMeasureSerializer,
     ExpenseTypeSerializer, FundingSourceSerializer, BudgetAllocationSerializer, BudgetBorrowSerializer, UnfundedForecastCostSerializer,
-    CostTransactionSerializer, TaskDropdownSerializer
+    CostTransactionSerializer, TaskDropdownSerializer, ResourceLevelingPlanSerializer
 )
 
 
@@ -718,6 +719,27 @@ class RevisionViewSet(viewsets.ModelViewSet):
             data_date = parse_cpm_data_date(request.data.get("dataDate"))
             engine = CPMEngine(revision, data_date=data_date)
             cpm_result = engine.run()
+
+            # Persist the latest parent-network warning on each child project so
+            # its manager can see the conflict without access to the parent.
+            warning_time = timezone.now()
+            child_projects = Project.objects.filter(parent_project=revision.project, is_deleted=False)
+            child_projects.update(parent_schedule_warning={}, parent_schedule_warning_updated_at=warning_time)
+            enriched_warnings = []
+            for warning in cpm_result.get("subproject_warnings", []):
+                enriched = {
+                    **warning,
+                    "parentProjectId": str(revision.project_id),
+                    "parentProjectName": revision.project.name,
+                    "parentRevisionId": revision.id,
+                    "generatedAt": warning_time.isoformat(),
+                }
+                enriched_warnings.append(enriched)
+                child_projects.filter(pk=warning.get("subprojectId")).update(
+                    parent_schedule_warning=enriched,
+                    parent_schedule_warning_updated_at=warning_time,
+                )
+            cpm_result["subproject_warnings"] = enriched_warnings
 
             # پس از محاسبه، مستقیماً داده‌های آپدیت‌شده گانت‌چارت را استخراج کرده و برمی‌گردانیم
             # این کار باعث می‌شود فرانت‌اند نیاز به Request دوم نداشته باشد
@@ -1917,7 +1939,7 @@ class ResourceHistogramView(APIView):
             resource = asgn.resource
             resources_seen[resource.id] = resource
 
-            cap_per_day = resource.capacity_hours_per_day      # Decimal
+            cap_per_day = Decimal("8") * (resource.max_units / Decimal("100"))
             units_frac  = asgn.units_percent / Decimal("100")  # e.g. 0.5 for 50 %
 
             # Daily allocated hours from this assignment
@@ -1960,14 +1982,14 @@ class ResourceHistogramView(APIView):
 
         # ── 8. Assemble response ──────────────────────────────────────────
         result_resources = []
-
-        # Also include resources that have NO assignments (capacity still useful)
-        all_resources = Resource.objects.filter(project=revision.project)
+        # Resources are global master data (Resource has no project FK). Include
+        # active resources so planners can also see idle/available capacity.
+        all_resources = Resource.objects.filter(is_active=True)
         for res in all_resources:
             resources_seen.setdefault(res.id, res)
 
         for res in resources_seen.values():
-            cap_per_day = float(res.capacity_hours_per_day)
+            cap_per_day = 8.0 * float(res.max_units) / 100.0
             load_buckets = []
 
             for bk in ordered_buckets:
@@ -1999,7 +2021,7 @@ class ResourceHistogramView(APIView):
                 "id":                    res.id,
                 "name":                  res.name,
                 "capacity_hours_per_day": cap_per_day,
-                "user_id":               res.user_id,
+                "user_id":               getattr(res, "user_id", None),
                 "load":                  load_buckets,
             })
 
@@ -2978,3 +3000,388 @@ class TaskViewSet(viewsets.ReadOnlyModelViewSet):
             ).distinct()
 
         return queryset
+
+
+class ResourceLevelingPlanViewSet(viewsets.ModelViewSet):
+    serializer_class = ResourceLevelingPlanSerializer
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def get_queryset(self):
+        allowed = accessible_project_ids(self.request.user)
+        return (
+            GlobalLevelingRun.objects
+            .filter(Q(executed_by=self.request.user) | Q(plan_projects__project_id__in=allowed))
+            .select_related("executed_by")
+            .prefetch_related("plan_projects__project", "plan_projects__revision")
+            .distinct()
+            .order_by("-updated_at")
+        )
+
+    @staticmethod
+    def _validate_priority_rules(rules):
+        valid = {item[0] for item in GlobalLevelingRun.PRIORITY_CRITERIA_CHOICES}
+        normalized = []
+        seen = set()
+        for rule in rules or GlobalLevelingRun.DEFAULT_PRIORITY_RULES:
+            criterion = rule.get("criterion")
+            direction = rule.get("direction", "asc")
+            if criterion not in valid:
+                raise ValidationError({"priorityRules": f"Unknown criterion: {criterion}"})
+            if criterion in seen:
+                raise ValidationError({"priorityRules": f"Duplicate criterion: {criterion}"})
+            if direction not in ("asc", "desc"):
+                raise ValidationError({"priorityRules": "Direction must be asc or desc."})
+            seen.add(criterion)
+            normalized.append({"criterion": criterion, "direction": direction})
+        return normalized
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        selections = request.data.get("projects") or []
+        if not selections:
+            raise ValidationError({"projects": "Select at least one project revision."})
+
+        rules = self._validate_priority_rules(request.data.get("priorityRules"))
+        parsed_data_date = parse_cpm_data_date(request.data.get("dataDate"))
+        plan = GlobalLevelingRun.objects.create(
+            name=(request.data.get("name") or "Untitled Leveling Plan").strip(),
+            description=request.data.get("description") or "",
+            executed_by=request.user,
+            data_date=parsed_data_date,
+            priority_rules=rules,
+            settings=request.data.get("settings") or {},
+            status=GlobalLevelingRun.STATUS_DRAFT,
+        )
+
+        selected_projects = []
+        seen_projects = set()
+        allowed = set(accessible_project_ids(request.user))
+        for index, selection in enumerate(selections):
+            project_id = str(selection.get("projectId") or "")
+            revision_id = str(selection.get("revisionId") or "")
+            if project_id in seen_projects:
+                raise ValidationError({"projects": "A project can only be selected once."})
+            if project_id not in {str(value) for value in allowed}:
+                raise PermissionDenied("You do not have access to one of the selected projects.")
+            revision = get_object_or_404(
+                Revision.objects.select_related("project"),
+                pk=revision_id,
+                project_id=project_id,
+                is_deleted=False,
+            )
+            entry = LevelingPlanProject(
+                leveling_run=plan,
+                project=revision.project,
+                revision=revision,
+                priority=int(selection.get("priority") or index + 1),
+            )
+            entry.full_clean()
+            entry.save()
+            selected_projects.append(revision.project)
+            seen_projects.add(project_id)
+
+        plan.participating_projects.set(selected_projects)
+        return Response(
+            self.get_serializer(plan).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @transaction.atomic
+    def partial_update(self, request, *args, **kwargs):
+        plan = self.get_object()
+        if plan.status not in (
+            GlobalLevelingRun.STATUS_DRAFT,
+            GlobalLevelingRun.STATUS_CALCULATED,
+        ):
+            raise ValidationError({"detail": "Only draft or calculated plans can be edited."})
+
+        for current_entry in plan.plan_projects.select_related("project"):
+            require_can_edit_project(request.user, current_entry.project)
+
+        selections = request.data.get("projects")
+        if not selections:
+            raise ValidationError({"projects": "Select at least one project revision."})
+
+        rules = self._validate_priority_rules(request.data.get("priorityRules"))
+        allowed = {str(value) for value in accessible_project_ids(request.user)}
+        selected_entries = []
+        selected_projects = []
+        seen_projects = set()
+
+        for index, selection in enumerate(selections):
+            project_id = str(selection.get("projectId") or "")
+            revision_id = str(selection.get("revisionId") or "")
+            if project_id in seen_projects:
+                raise ValidationError({"projects": "A project can only be selected once."})
+            if project_id not in allowed:
+                raise PermissionDenied("You do not have access to one of the selected projects.")
+
+            revision = get_object_or_404(
+                Revision.objects.select_related("project"),
+                pk=revision_id,
+                project_id=project_id,
+                is_deleted=False,
+            )
+            require_can_edit_project(request.user, revision.project)
+            entry = LevelingPlanProject(
+                leveling_run=plan,
+                project=revision.project,
+                revision=revision,
+                priority=int(selection.get("priority") or index + 1),
+            )
+            entry.full_clean(validate_unique=False)
+            selected_entries.append(entry)
+            selected_projects.append(revision.project)
+            seen_projects.add(project_id)
+
+        plan.name = (request.data.get("name") or plan.name).strip()
+        if not plan.name:
+            raise ValidationError({"name": "Plan name cannot be empty."})
+        plan.description = request.data.get("description") or ""
+        plan.data_date = parse_cpm_data_date(request.data.get("dataDate"))
+        plan.priority_rules = rules
+        plan.settings = request.data.get("settings") or {}
+        plan.status = GlobalLevelingRun.STATUS_DRAFT
+        plan.is_committed = False
+        plan.last_run_at = None
+        plan.published_at = None
+        plan.save(update_fields=[
+            "name", "description", "data_date", "priority_rules", "settings",
+            "status", "is_committed", "last_run_at", "published_at", "updated_at",
+        ])
+
+        plan.plan_projects.all().delete()
+        LevelingPlanProject.objects.bulk_create(selected_entries)
+        plan.participating_projects.set(selected_projects)
+        TaskLevelingMetrics.objects.filter(leveling_run=plan).delete()
+        ResourceUsage.objects.filter(leveling_run=plan).delete()
+
+        plan.refresh_from_db()
+        return Response(self.get_serializer(plan).data)
+    def destroy(self, request, *args, **kwargs):
+        plan = self.get_object()
+        if plan.status == GlobalLevelingRun.STATUS_PUBLISHED:
+            raise ValidationError({"detail": "Archive a published plan instead of deleting it."})
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=False, methods=["get"], url_path="priority-criteria")
+    def priority_criteria(self, request):
+        return Response([
+            {"value": value, "label": label}
+            for value, label in GlobalLevelingRun.PRIORITY_CRITERIA_CHOICES
+        ])
+
+    @action(detail=True, methods=["post"])
+    def simulate(self, request, pk=None):
+        plan = self.get_object()
+        if plan.status == GlobalLevelingRun.STATUS_PUBLISHED:
+            raise ValidationError({"detail": "Published plans are immutable."})
+        for entry in plan.plan_projects.select_related("project"):
+            require_can_edit_project(request.user, entry.project)
+
+        from .cpmLeveling import MultiProjectLevelingEngine
+        result = MultiProjectLevelingEngine(plan).run()
+        plan.refresh_from_db()
+        return Response({
+            "run": result,
+            "plan": self.get_serializer(plan).data,
+            "result": self._result_payload(plan),
+        })
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def publish(self, request, pk=None):
+        plan = self.get_object()
+        if plan.status != GlobalLevelingRun.STATUS_CALCULATED:
+            raise ValidationError({"detail": "Calculate the plan before publishing it."})
+        entries = list(plan.plan_projects.select_related("project"))
+        for entry in entries:
+            require_can_edit_project(request.user, entry.project)
+
+        project_ids = [entry.project_id for entry in entries]
+        GlobalLevelingRun.objects.filter(
+            status=GlobalLevelingRun.STATUS_PUBLISHED,
+            plan_projects__project_id__in=project_ids,
+        ).exclude(pk=plan.pk).update(
+            status=GlobalLevelingRun.STATUS_ARCHIVED,
+            is_committed=False,
+        )
+        plan.status = GlobalLevelingRun.STATUS_PUBLISHED
+        plan.is_committed = True
+        plan.published_at = timezone.now()
+        plan.save(update_fields=["status", "is_committed", "published_at", "updated_at"])
+        return Response(self.get_serializer(plan).data)
+
+    @action(detail=True, methods=["post"])
+    def archive(self, request, pk=None):
+        plan = self.get_object()
+        plan.status = GlobalLevelingRun.STATUS_ARCHIVED
+        plan.is_committed = False
+        plan.save(update_fields=["status", "is_committed", "updated_at"])
+        return Response(self.get_serializer(plan).data)
+
+    @action(detail=False, methods=["get"], url_path="published-schedule")
+    def published_schedule(self, request):
+        role_pairs = set(
+            TaskRole.objects.filter(user=request.user, role="executor")
+            .values_list("revision_id", "task_id")
+        )
+        if not role_pairs:
+            return Response([])
+
+        revision_ids = {pair[0] for pair in role_pairs}
+        task_ids = {pair[1] for pair in role_pairs}
+        metrics = (
+            TaskLevelingMetrics.objects
+            .filter(
+                leveling_run__status=GlobalLevelingRun.STATUS_PUBLISHED,
+                task_version__revision_id__in=revision_ids,
+                task_version__task_id__in=task_ids,
+            )
+            .select_related(
+                "leveling_run",
+                "task_version__task",
+                "task_version__revision__project",
+            )
+            .order_by("-leveling_run__published_at")
+        )
+
+        schedule = []
+        seen = set()
+        for metric in metrics:
+            version = metric.task_version
+            key = (version.revision_id, version.task_id)
+            if key not in role_pairs or key in seen:
+                continue
+            seen.add(key)
+            schedule.append({
+                "planId": str(metric.leveling_run_id),
+                "planName": metric.leveling_run.name,
+                "publishedAt": metric.leveling_run.published_at,
+                "projectId": str(version.revision.project_id),
+                "projectName": version.revision.project.name,
+                "revisionId": str(version.revision_id),
+                "taskId": str(version.task_id),
+                "taskVersionId": version.id,
+                "originalStart": metric.original_start,
+                "originalFinish": metric.original_finish,
+                "executionStart": metric.leveled_start,
+                "executionFinish": metric.leveled_finish,
+                "delayHours": float(metric.leveling_delay_hours),
+            })
+        return Response(schedule)
+    @action(detail=True, methods=["get"])
+    def result(self, request, pk=None):
+        return Response(self._result_payload(self.get_object()))
+
+    def _result_payload(self, plan):
+        metrics = list(
+            plan.task_metrics
+            .select_related(
+                "task_version__task",
+                "task_version__revision__project",
+            )
+            .order_by("leveled_start", "task_version__sequence")
+        )
+        revision_ids = [entry.revision_id for entry in plan.plan_projects.all()]
+        assignments = list(
+            Assignment.objects.filter(revision_id__in=revision_ids)
+            .select_related("resource")
+        )
+        assignment_map = defaultdict(list)
+        for assignment in assignments:
+            assignment_map[(assignment.revision_id, str(assignment.task_id))].append(assignment)
+
+        resource_map = {}
+        tasks = []
+        project_summary = {}
+        for metric in metrics:
+            version = metric.task_version
+            project = version.revision.project
+            assigned = assignment_map.get((version.revision_id, str(version.task_id)), [])
+            resources = [{
+                "id": assignment.resource_id,
+                "name": assignment.resource.name,
+                "unitsPercent": float(assignment.units_percent),
+                "plannedHours": float(assignment.planned_hours),
+            } for assignment in assigned]
+            task_payload = {
+                "id": metric.id,
+                "taskVersionId": version.id,
+                "taskId": str(version.task_id),
+                "title": version.title,
+                "projectId": project.id,
+                "projectName": project.name,
+                "revisionId": version.revision_id,
+                "revisionNumber": version.revision.number,
+                "originalStart": metric.original_start,
+                "originalFinish": metric.original_finish,
+                "leveledStart": metric.leveled_start,
+                "leveledFinish": metric.leveled_finish,
+                "delayHours": float(metric.leveling_delay_hours),
+                "decisionReason": metric.decision_reason,
+                "resources": resources,
+            }
+            tasks.append(task_payload)
+            summary = project_summary.setdefault(project.id, {
+                "projectId": project.id,
+                "projectName": project.name,
+                "originalFinish": None,
+                "leveledFinish": None,
+                "delayedTasks": 0,
+            })
+            if metric.original_finish and (
+                summary["originalFinish"] is None or metric.original_finish > summary["originalFinish"]
+            ):
+                summary["originalFinish"] = metric.original_finish
+            if summary["leveledFinish"] is None or metric.leveled_finish > summary["leveledFinish"]:
+                summary["leveledFinish"] = metric.leveled_finish
+            if metric.leveling_delay_hours > 0:
+                summary["delayedTasks"] += 1
+
+            for resource in resources:
+                row = resource_map.setdefault(resource["id"], {
+                    "id": resource["id"],
+                    "name": resource["name"],
+                    "tasks": [],
+                    "usage": [],
+                })
+                row["tasks"].append({
+                    **task_payload,
+                    "unitsPercent": resource["unitsPercent"],
+                    "plannedHours": resource["plannedHours"],
+                })
+
+        for usage in plan.resource_usages.select_related("resource").order_by("usage_date"):
+            row = resource_map.setdefault(usage.resource_id, {
+                "id": usage.resource_id,
+                "name": usage.resource.name,
+                "tasks": [],
+                "usage": [],
+            })
+            row["usage"].append({
+                "date": usage.usage_date,
+                "plannedHours": float(usage.planned_hours),
+                "capacityHours": float(usage.capacity_hours),
+                "remainingCapacity": float(usage.remaining_capacity),
+                "loadPercent": (
+                    float(usage.planned_hours) / float(usage.capacity_hours) * 100
+                    if usage.capacity_hours else 0
+                ),
+            })
+
+        delayed = [task for task in tasks if task["delayHours"] > 0]
+        return {
+            "planId": str(plan.id),
+            "status": plan.status,
+            "summary": {
+                "taskCount": len(tasks),
+                "resourceCount": len(resource_map),
+                "delayedTaskCount": len(delayed),
+                "maxDelayHours": max((task["delayHours"] for task in delayed), default=0),
+            },
+            "projects": list(project_summary.values()),
+            "tasks": tasks,
+            "resources": sorted(resource_map.values(), key=lambda row: row["name"]),
+        }

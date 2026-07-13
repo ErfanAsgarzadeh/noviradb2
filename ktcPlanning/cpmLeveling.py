@@ -14,7 +14,7 @@ import datetime
 import heapq
 import logging
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from django.db import transaction
 
@@ -73,72 +73,78 @@ class MultiProjectLevelingEngine:
         self.daily_planned_usage: Dict[Tuple[int, datetime.date], float] = defaultdict(float)
 
     def _load_and_prepare_data(self) -> None:
-        """بارگذاری داده‌های تمام پروژه‌ها، اجرای CPM اولیه و آماده‌سازی منابع."""
-
-        # ۱. پیدا کردن ریویژن‌های فعال (یا آخرین ریویژن تایید نشده) برای پروژه‌های انتخاب شده
-        active_revisions = Revision.objects.filter(
-            project__in=self.leveling_run.participating_projects.all(),
-            approved_at__isnull=True  # یا هر منطقی که برای انتخاب ریویژن جاری دارید
+        """Load the exact revision snapshots selected by this independent plan."""
+        entries = list(
+            self.leveling_run.plan_projects.select_related("project", "revision")
         )
+        active_revisions = [entry.revision for entry in entries]
+        if not active_revisions:
+            raise ValueError("Select at least one project revision before running leveling.")
 
-        if not active_revisions.exists():
-             raise ValueError("هیچ ریویژن فعالی برای پروژه‌های انتخاب شده یافت نشد.")
+        plan_priority = {entry.project_id: entry.priority for entry in entries}
 
-        # ۲. اجرای CPM برای هر پروژه به صورت مجزا تا گراف و Floatها محاسبه شوند
-        for rev in active_revisions:
-            engine = CPMEngine(rev)
-            engine.run()  # این متد نودها را می‌سازد و Floatها را حساب می‌کند
-            self.cpm_engines[rev.id] = engine
-            # ادغام نودهای این پروژه در دیکشنری سراسری
-            for tid, node in engine.nodes.items():
-                # برای اطمینان از یکتا بودن آیدی در کل پایگاه داده، از tv_id استفاده می‌کنیم
-                self.global_nodes[str(node.tv_id)] = node
+        # Run CPM entirely in memory. Calling CPMEngine.run() would persist dates
+        # into TaskVersion, which is forbidden for an independent leveling plan.
+        for revision in active_revisions:
+            engine = CPMEngine(revision, data_date=self.leveling_run.data_date)
+            engine._load()
+            if engine.nodes:
+                engine._normalize_data_date()
+                order = engine._topological_sort()
+                engine._forward_pass(order)
+                engine._backward_pass(order)
+                engine._compute_floats()
+            self.cpm_engines[revision.id] = engine
+            for node in engine.nodes.values():
+                if not node.is_external:
+                    self.global_nodes[str(node.tv_id)] = node
 
-        # ۲.۱ پیش‌بارگذاری TaskVersion و اولویت پروژه‌ی مربوطه، برای معیارهای اولویت‌بندی
-        # (planned_start, weight, sequence, project_priority) بدون نیاز به کوئری تکراری در حلقه اصلی
-        tv_ids = [int(tid) for tid in self.global_nodes.keys()]
-        task_versions_qs = TaskVersion.objects.filter(id__in=tv_ids).select_related(
+        tv_ids = [int(tv_id) for tv_id in self.global_nodes]
+        for task_version in TaskVersion.objects.filter(id__in=tv_ids).select_related(
             "revision", "revision__project"
-        )
-        for tv in task_versions_qs:
-            tv_id_str = str(tv.id)
-            self.task_versions[tv_id_str] = tv
-            self.project_priority[tv_id_str] = tv.revision.project.priority
+        ):
+            key = str(task_version.id)
+            self.task_versions[key] = task_version
+            self.project_priority[key] = plan_priority.get(
+                task_version.revision.project_id,
+                task_version.revision.project.priority,
+            )
 
-        # ۳. بارگذاری تمام منابعی که متعلق به این پروژه‌ها هستند
+        assignments = list(
+            Assignment.objects.filter(revision__in=active_revisions)
+            .select_related("resource", "resource__calendar")
+        )
+        resource_ids = {assignment.resource_id for assignment in assignments}
         resources = Resource.objects.filter(
-            pool__project__in=self.leveling_run.participating_projects.all(),
-            is_active=True
+            id__in=resource_ids, is_active=True
         ).select_related("calendar")
 
-        for res in resources:
-            self.resources[res.id] = res
-            self.resource_cal_engines[res.id] = CalendarEngine(res.calendar)
+        for resource in resources:
+            self.resources[resource.id] = resource
+            self.resource_cal_engines[resource.id] = (
+                CalendarEngine(resource.calendar) if resource.calendar_id else None
+            )
 
-        # ۴. بارگذاری تخصیص‌ها (Assignments) برای همه ریویژن‌های فعال
-        assignments = Assignment.objects.filter(revision__in=active_revisions)
-        for asgn in assignments:
-            # اینجا هم کلید را tv_id در نظر می‌گیریم تا با global_nodes مچ شود
-            # نکته: در مدل شما Assignment به Task وصل است. باید TaskVersion متناظر را پیدا کنیم.
-            # چون global_nodes را بر اساس tv_id ساختیم، یک مپینگ کمکی نیاز داریم
-
-            # مپینگ کمکی: task_id -> tv_id
-            tv_mapping = {str(n.task_id): str(n.tv_id) for n in self.global_nodes.values()}
-
-            t_id_str = str(asgn.task_id)
-            if t_id_str in tv_mapping:
-                tv_id_str = tv_mapping[t_id_str]
-                self.task_assignments[tv_id_str].append({
-                    "resource_id": asgn.resource_id,
-                    "units_percent": float(asgn.units_percent) / 100.0,
+        task_to_version = {
+            str(node.task_id): str(node.tv_id)
+            for node in self.global_nodes.values()
+        }
+        for assignment in assignments:
+            version_id = task_to_version.get(str(assignment.task_id))
+            if version_id and assignment.resource_id in self.resources:
+                self.task_assignments[version_id].append({
+                    "resource_id": assignment.resource_id,
+                    "units_percent": float(assignment.units_percent) / 100.0,
                 })
 
     def _get_resource_capacity(self, resource_id: int, date: datetime.date) -> float:
         if date not in self.remaining_capacity[resource_id]:
             res = self.resources[resource_id]
-            cal_engine = self.resource_cal_engines[resource_id]
-            sched = cal_engine.get_day_schedule(date)
-            base_hours = sched.total_hours
+            cal_engine = self.resource_cal_engines.get(resource_id)
+            if cal_engine is None:
+                base_hours = 8.0 if date.weekday() < 5 else 0.0
+            else:
+                base_hours = cal_engine.get_day_schedule(date).total_hours
             max_units_factor = float(res.max_units) / 100.0
             self.remaining_capacity[resource_id][date] = base_hours * max_units_factor
         return self.remaining_capacity[resource_id][date]
@@ -214,7 +220,12 @@ class MultiProjectLevelingEngine:
         key_parts.append(str(node.tv_id))
         return tuple(key_parts)
 
-    def _distribute_task_hours(self, start_dt: datetime.datetime, duration: float, cal_engine: CalendarEngine) -> Dict[datetime.date, float]:
+    def _distribute_task_hours(
+        self,
+        start_dt: datetime.datetime,
+        duration: float,
+        cal_engine: Optional[CalendarEngine],
+    ) -> Dict[datetime.date, float]:
         dist = {}
         current = start_dt
         remaining = duration
@@ -222,13 +233,27 @@ class MultiProjectLevelingEngine:
 
         while remaining > 0 and limit > 0:
             limit -= 1
-            sched = cal_engine.get_day_schedule(current.date())
+            if cal_engine:
+                sched = cal_engine.get_day_schedule(current.date())
+                if not sched.is_working():
+                    current = current.replace(hour=0, minute=0) + datetime.timedelta(days=1)
+                    continue
+                available_today = sched.hours_from(current.time())
+            else:
+                # A resource without an explicit calendar uses the standard
+                # 08:00-16:00, Monday-Friday working pattern.
+                if current.weekday() >= 5:
+                    current = current.replace(hour=8, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+                    continue
+                day_start = current.replace(hour=8, minute=0, second=0, microsecond=0)
+                day_end = current.replace(hour=16, minute=0, second=0, microsecond=0)
+                if current < day_start:
+                    current = day_start
+                if current >= day_end:
+                    current = day_start + datetime.timedelta(days=1)
+                    continue
+                available_today = (day_end - current).total_seconds() / 3600
 
-            if not sched.is_working():
-                current = current.replace(hour=0, minute=0) + datetime.timedelta(days=1)
-                continue
-
-            available_today = sched.hours_from(current.time())
             if available_today <= 0:
                 current = current.replace(hour=0, minute=0) + datetime.timedelta(days=1)
                 continue
@@ -236,15 +261,16 @@ class MultiProjectLevelingEngine:
             take = min(remaining, available_today)
             dist[current.date()] = dist.get(current.date(), 0.0) + take
             remaining -= take
-
             if remaining > 0:
                 current = current.replace(hour=0, minute=0) + datetime.timedelta(days=1)
 
         return dist
-
     def _earliest_start_from_predecessors(self, node: TaskNode) -> datetime.datetime:
         cpm = self._get_cpm_engine_for_node(node)
-        min_start = cpm.revision.project_start
+        min_start = max(
+            cpm.revision.project_start,
+            node.early_start or cpm.revision.project_start,
+        )
         candidates = []
 
         for edge in node.predecessors:
@@ -257,14 +283,14 @@ class MultiProjectLevelingEngine:
                 pred_finish = self.leveled_finishes[pred_tv_id]
 
                 if edge.dep_type == "FS":
-                    candidates.append(cpm._add_lag(node, pred_finish, edge.lag_hours))
+                    candidates.append(cpm._add_hours(node, pred_finish, edge.lag_hours))
                 elif edge.dep_type == "SS":
-                    candidates.append(cpm._add_lag(node, pred_start, edge.lag_hours))
+                    candidates.append(cpm._add_hours(node, pred_start, edge.lag_hours))
                 elif edge.dep_type == "FF":
-                    ef_lagged = cpm._add_lag(node, pred_finish, edge.lag_hours)
+                    ef_lagged = cpm._add_hours(node, pred_finish, edge.lag_hours)
                     candidates.append(cpm._subtract_hours(node, ef_lagged, node.duration_hours))
                 elif edge.dep_type == "SF":
-                    es_lagged = cpm._add_lag(node, pred_start, edge.lag_hours)
+                    es_lagged = cpm._add_hours(node, pred_start, edge.lag_hours)
                     candidates.append(cpm._subtract_hours(node, es_lagged, node.duration_hours))
 
         if candidates:
@@ -383,15 +409,25 @@ class MultiProjectLevelingEngine:
 
             # محاسبه تاخیر (Delay) تحمیل شده توسط لولینگ نسبت به برنامه اصلی (early_start)
             cpm = self._get_cpm_engine_for_node(node)
-            delay_hours = cpm._working_hours_between(node, node.early_start, leveled_start)
+            cal_engine = cpm._get_engine(node) or cpm._default_cal_engine
+            delay_hours = (
+                cal_engine.working_hours_between(node.early_start, leveled_start)
+                if cal_engine
+                else max(0.0, (leveled_start - node.early_start).total_seconds() / 3600)
+            )
 
             metrics_to_create.append(
                 TaskLevelingMetrics(
                     leveling_run=self.leveling_run,
                     task_version_id=int(tv_id),
+                    original_start=node.early_start,
+                    original_finish=node.early_finish,
                     leveled_start=leveled_start,
                     leveled_finish=leveled_finish,
-                    leveling_delay_hours=delay_hours
+                    leveling_delay_hours=delay_hours,
+                    decision_reason=(
+                        "Resource capacity delay" if delay_hours > 0 else "No resource delay"
+                    ),
                 )
             )
         TaskLevelingMetrics.objects.bulk_create(metrics_to_create, batch_size=1000)
@@ -406,6 +442,7 @@ class MultiProjectLevelingEngine:
                     resource_id=res_id,
                     usage_date=date,
                     planned_hours=planned_hrs,
+                    capacity_hours=planned_hrs + remaining,
                     remaining_capacity=remaining,
                     # مقدار default
                     revision=None
@@ -413,5 +450,11 @@ class MultiProjectLevelingEngine:
             )
         ResourceUsage.objects.bulk_create(usages_to_create, batch_size=1000)
 
-        logger.info(f"Global Resource Leveling Run {self.leveling_run.id} completed.")
+        self.leveling_run.status = GlobalLevelingRun.STATUS_CALCULATED
+        self.leveling_run.last_run_at = datetime.datetime.now(datetime.timezone.utc)
+        self.leveling_run.is_committed = False
+        self.leveling_run.save(update_fields=[
+            "status", "last_run_at", "is_committed", "updated_at"
+        ])
+        logger.info(f"Resource Leveling Plan {self.leveling_run.id} calculated.")
         return {"status": "Success", "tasks_evaluated": len(self.global_nodes)}

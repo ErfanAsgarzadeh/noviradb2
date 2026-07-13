@@ -1357,3 +1357,45 @@ class TaskDropdownSerializer(serializers.ModelSerializer):
         if not active_version:
             active_version = obj.versions.filter(is_deleted=False).last()
         return active_version.wbs_node_id if active_version and active_version.wbs_node else None
+
+
+class LevelingPlanProjectSerializer(serializers.ModelSerializer):
+    projectId = serializers.CharField(source="project_id", read_only=True)
+    projectName = serializers.CharField(source="project.name", read_only=True)
+    revisionId = serializers.CharField(source="revision_id", read_only=True)
+    revisionNumber = serializers.IntegerField(source="revision.number", read_only=True)
+
+    class Meta:
+        model = LevelingPlanProject
+        fields = [
+            "id", "projectId", "projectName", "revisionId",
+            "revisionNumber", "priority",
+        ]
+
+
+class ResourceLevelingPlanSerializer(serializers.ModelSerializer):
+    projects = LevelingPlanProjectSerializer(source="plan_projects", many=True, read_only=True)
+    createdByName = serializers.CharField(source="executed_by.username", read_only=True)
+    createdAt = serializers.DateTimeField(source="executed_at", read_only=True)
+    updatedAt = serializers.DateTimeField(source="updated_at", read_only=True)
+    dataDate = serializers.DateTimeField(source="data_date", read_only=True)
+    lastRunAt = serializers.DateTimeField(source="last_run_at", read_only=True)
+    publishedAt = serializers.DateTimeField(source="published_at", read_only=True)
+    priorityRules = serializers.JSONField(source="priority_rules", read_only=True)
+    taskCount = serializers.SerializerMethodField()
+    resourceCount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = GlobalLevelingRun
+        fields = [
+            "id", "name", "description", "status", "settings",
+            "createdByName", "createdAt", "updatedAt", "dataDate",
+            "lastRunAt", "publishedAt", "priorityRules", "projects",
+            "taskCount", "resourceCount",
+        ]
+
+    def get_taskCount(self, obj):
+        return obj.task_metrics.count()
+
+    def get_resourceCount(self, obj):
+        return obj.resource_usages.values("resource_id").distinct().count()
