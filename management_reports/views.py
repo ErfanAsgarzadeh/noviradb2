@@ -1,4 +1,4 @@
-from rest_framework.views import APIView
+﻿from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from django.db.models import Sum, F, FloatField, ExpressionWrapper
@@ -20,16 +20,19 @@ class PreparePlannerReportAPI(APIView):
 
     def get(self, request, project_id):
         project = get_object_or_404(Project, id=project_id, is_deleted=False)
-        latest_revision = project.revisions.filter(is_deleted=False).order_by('-number').first()
+        official_execution_revision = project.current_execution_revision
 
         auto_progress = 0
         active_task_versions_dict = {}
+        governance_issues = []
+        if not official_execution_revision:
+            governance_issues.append("missing_current_execution_revision")
 
-        if latest_revision:
+        if official_execution_revision:
             # ۱. استخراج تسک‌های فعال در این ریویژن
             active_task_versions = TaskVersion.objects.filter(
                 task__project=project,
-                revision=latest_revision,
+                revision=official_execution_revision,
                 is_deleted=False
             ).select_related('wbs_node')
 
@@ -61,10 +64,17 @@ class PreparePlannerReportAPI(APIView):
         available_highlights = []
 
         # ۴. دریافت بلاکرهای انسانی از کارگاه
+        official_task_ids = set(active_task_versions_dict.keys())
+
         problematic_logs = TaskReportLog.objects.filter(
             task__project=project,
             status__in=['blocked', 'at-risk']
-        ).order_by('task', '-timestamp').distinct('task')
+        )
+        if official_execution_revision:
+            problematic_logs = problematic_logs.filter(task_id__in=official_task_ids)
+        else:
+            problematic_logs = problematic_logs.none()
+        problematic_logs = problematic_logs.order_by('task', '-timestamp').distinct('task')
 
         for log in problematic_logs:
             tv_info = active_task_versions_dict.get(log.task_id, {})
@@ -83,7 +93,12 @@ class PreparePlannerReportAPI(APIView):
         normal_logs = TaskReportLog.objects.filter(
             task__project=project,
             status__in=['on-track', 'completed']
-        ).order_by('task', '-timestamp').distinct('task')
+        )
+        if official_execution_revision:
+            normal_logs = normal_logs.filter(task_id__in=official_task_ids)
+        else:
+            normal_logs = normal_logs.none()
+        normal_logs = normal_logs.order_by('task', '-timestamp').distinct('task')
 
         for log in normal_logs:
             tv_info = active_task_versions_dict.get(log.task_id, {})
@@ -99,10 +114,10 @@ class PreparePlannerReportAPI(APIView):
             })
 
         # ۶. دریافت انحرافات EVM سیستمی
-        if latest_revision:
+        if official_execution_revision:
             critical_variances = VarianceReport.objects.filter(
                 task__project=project,
-                revision=latest_revision,
+                revision=official_execution_revision,
                 action_required=True
             )
             for var in critical_variances:
@@ -121,6 +136,9 @@ class PreparePlannerReportAPI(APIView):
         return Response({
             "project_id": project.id,
             "project_name": project.name,
+            "official_revision_id": str(official_execution_revision.id) if official_execution_revision else None,
+            "official_revision_number": official_execution_revision.number if official_execution_revision else None,
+            "schedule_governance_issues": governance_issues,
             "suggested_overall_progress": auto_progress,
             "suggested_bottlenecks": suggested_bottlenecks,
             "available_highlights": available_highlights

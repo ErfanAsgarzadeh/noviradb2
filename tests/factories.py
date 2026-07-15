@@ -2,7 +2,7 @@
 factories.py  —  ابزارهای کمکی برای ساختن داده‌های تست
 """
 import uuid
-from datetime import timedelta
+from datetime import time, timedelta
 from django.utils import timezone
 from django.contrib.auth import get_user_model
 
@@ -10,7 +10,7 @@ from CustomUser.models import OrgUnit
 from ktcPlanning.models import (
     Project, Revision, WBSNode, WBSNodeVersion,
     Task, TaskVersion, TaskRole, TaskReportLog,
-    TaskActual, Calendar, SystemSettings,
+    TaskActual, Calendar, WorkingInterval, SystemSettings,
 )
 
 User = get_user_model()
@@ -66,11 +66,14 @@ def make_member(unit=None):
 def make_calendar(project=None, is_default=True):
     cal = Calendar.objects.create(
         project=project,
-        name="تقویم پیش‌فرض",
+        name="Default test calendar",
         is_default=is_default,
     )
+    WorkingInterval.objects.bulk_create([
+        WorkingInterval(calendar=cal, weekday=weekday, start_time=time(0, 0), end_time=time(23, 59))
+        for weekday in range(7)
+    ])
     return cal
-
 
 def make_project(creator=None, scope="intra_unit", name=None):
     if creator is None:
@@ -89,15 +92,15 @@ def make_project(creator=None, scope="intra_unit", name=None):
 
 def make_revision(project, creator=None, is_baseline=False, approved=False):
     creator = creator or project.created_by
-    rev_count = Revision.objects.filter(project=project).count()
-    approver = creator
+    latest_number = Revision.objects.filter(project=project).order_by('-number').values_list('number', flat=True).first()
+    next_number = (latest_number if latest_number is not None else -1) + 1
     rev = Revision.objects.create(
         project=project,
-        number=rev_count + 1,
-        description="ریویژن تست",
+        number=next_number,
+        description="Test revision",
         is_baseline=is_baseline,
         created_by=creator,
-        designated_approver=approver,
+        designated_approver=creator,
         project_start=timezone.now(),
         project_end=timezone.now() + timedelta(days=60),
     )
@@ -105,18 +108,29 @@ def make_revision(project, creator=None, is_baseline=False, approved=False):
         rev.approved_by = creator
         rev.approved_at = timezone.now()
         rev.save()
+        project.current_execution_revision = rev
+        project.current_forecast_revision = rev
+        if is_baseline:
+            project.active_baseline_revision = rev
+        if project.working_revision_id == rev.pk:
+            project.working_revision = None
+    else:
+        project.working_revision = rev
+        if is_baseline:
+            project.active_baseline_revision = rev
+            project.current_execution_revision = rev
+            project.current_forecast_revision = rev
+    project.current_data_date = project.current_data_date or timezone.now()
+    project.save()
     return rev
 
 
-# ──────────────────────────────────────────────
-#  WBS و تسک
-# ──────────────────────────────────────────────
+# WBS and task
 
 def make_wbs_node(project, revision, title="گره WBS"):
     node = WBSNode.objects.create(project=project)
     node_version = WBSNodeVersion.objects.create(
         node=node,
-        project=project,
         revision=revision,
         title=title,
         is_deleted=False,

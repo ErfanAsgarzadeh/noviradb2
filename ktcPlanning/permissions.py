@@ -222,7 +222,7 @@ def is_task_reviewer(user, task) -> bool:
         task=task,
         user=user,
         role__in=['reviewer', 'project manager'],
-        revision__approved_at__isnull=True,
+        revision_id=task.project.working_revision_id,
     ).exists()
 
 

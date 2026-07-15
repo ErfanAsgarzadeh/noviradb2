@@ -69,6 +69,7 @@ SECRET_KEY = _secret_key_env
 
 # DEBUG: defaults to True for local dev. Set DJANGO_DEBUG=0 in production.
 DEBUG = os.environ.get('DJANGO_DEBUG', '1').lower() not in ('0', 'false', 'no')
+AUTH_COOKIE_SECURE = os.environ.get('AUTH_COOKIE_SECURE', '0' if DEBUG else '1').lower() not in ('0', 'false', 'no')
 
 # ALLOWED_HOSTS: comma-separated list via env. Falls back to permissive in dev.
 _allowed_hosts_env = os.environ.get('DJANGO_ALLOWED_HOSTS', '').strip()

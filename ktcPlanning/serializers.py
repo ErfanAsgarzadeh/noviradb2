@@ -66,24 +66,39 @@ class CalendarSerializer(serializers.ModelSerializer):
 class ProjectSerializer(serializers.ModelSerializer):
     createdAt = serializers.DateTimeField(source='created_at', format="%Y-%m-%dT%H:%M:%S", read_only=True)
     description = serializers.SerializerMethodField()
-    start_date = serializers.DateTimeField( format="%Y-%m-%d", required=False, allow_null=True)
-    end_date = serializers.DateTimeField( format="%Y-%m-%d", required=False, allow_null=True)
-    # الصاق/خواندن تقویم پروژه
+    start_date = serializers.DateTimeField(format="%Y-%m-%d", required=False, allow_null=True)
+    end_date = serializers.DateTimeField(format="%Y-%m-%d", required=False, allow_null=True)
     calendarId = serializers.PrimaryKeyRelatedField(
-        source='calendar', queryset=Calendar.objects.all(),
-        required=False, allow_null=True
+        source='calendar', queryset=Calendar.objects.all(), required=False, allow_null=True
     )
     calendarName = serializers.CharField(source='calendar.name', read_only=True, default=None)
     parentProjectId = serializers.PrimaryKeyRelatedField(
-        source='parent_project',
-        queryset=Project.objects.filter(is_deleted=False),
-        required=False,
-        allow_null=True,
+        source='parent_project', queryset=Project.objects.filter(is_deleted=False),
+        required=False, allow_null=True,
     )
     parentProjectName = serializers.CharField(source='parent_project.name', read_only=True, default=None)
     childProjectCount = serializers.SerializerMethodField()
     parentScheduleWarning = serializers.JSONField(source='parent_schedule_warning', read_only=True)
     parentScheduleWarningUpdatedAt = serializers.DateTimeField(source='parent_schedule_warning_updated_at', read_only=True)
+    lifecycleStatus = serializers.ChoiceField(source='lifecycle_status', choices=Project.LIFECYCLE_CHOICES, required=False)
+    currentDataDate = serializers.DateTimeField(source='current_data_date', required=False, allow_null=True)
+    activeBaselineRevisionId = serializers.PrimaryKeyRelatedField(
+        source='active_baseline_revision', queryset=Revision.objects.filter(is_deleted=False),
+        required=False, allow_null=True,
+    )
+    currentExecutionRevisionId = serializers.PrimaryKeyRelatedField(
+        source='current_execution_revision', queryset=Revision.objects.filter(is_deleted=False),
+        required=False, allow_null=True,
+    )
+    currentForecastRevisionId = serializers.PrimaryKeyRelatedField(
+        source='current_forecast_revision', queryset=Revision.objects.filter(is_deleted=False),
+        required=False, allow_null=True,
+    )
+    workingRevisionId = serializers.PrimaryKeyRelatedField(
+        source='working_revision', queryset=Revision.objects.filter(is_deleted=False),
+        required=False, allow_null=True,
+    )
+    scheduleGovernance = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
@@ -91,7 +106,9 @@ class ProjectSerializer(serializers.ModelSerializer):
             'id', 'name', 'description', 'createdAt', 'start_date', 'end_date',
             'calendarId', 'calendarName', 'scope', 'parentProjectId',
             'parentProjectName', 'childProjectCount', 'parentScheduleWarning',
-            'parentScheduleWarningUpdatedAt',
+            'parentScheduleWarningUpdatedAt', 'lifecycleStatus', 'currentDataDate',
+            'activeBaselineRevisionId', 'currentExecutionRevisionId',
+            'currentForecastRevisionId', 'workingRevisionId', 'scheduleGovernance',
         ]
 
     def get_description(self, obj):
@@ -100,29 +117,77 @@ class ProjectSerializer(serializers.ModelSerializer):
     def get_childProjectCount(self, obj):
         return obj.subprojects.filter(is_deleted=False).count()
 
+    def get_scheduleGovernance(self, obj):
+        issues = []
+        if not obj.active_baseline_revision_id:
+            issues.append('missing_active_baseline')
+        if not obj.current_execution_revision_id:
+            issues.append('missing_execution_revision')
+        if not obj.current_forecast_revision_id:
+            issues.append('missing_forecast_revision')
+        if not obj.current_data_date:
+            issues.append('missing_data_date')
+        return {
+            'ready': not issues,
+            'issues': issues,
+            'hasWorkingRevision': bool(obj.working_revision_id),
+        }
+
     def validate(self, attrs):
         attrs = super().validate(attrs)
-        parent_project = attrs.get('parent_project')
         instance = self.instance
+        project_id = instance.pk if instance else None
+        parent_project = attrs.get('parent_project', instance.parent_project if instance else None)
 
-        if parent_project is None:
-            return attrs
+        if parent_project is not None:
+            if instance and parent_project.pk == instance.pk:
+                raise serializers.ValidationError({'parentProjectId': 'Project cannot be its own parent.'})
+            ancestor = parent_project
+            while ancestor is not None:
+                if instance and ancestor.pk == instance.pk:
+                    raise serializers.ValidationError({'parentProjectId': 'Subproject hierarchy cannot contain a cycle.'})
+                ancestor = ancestor.parent_project
 
-        if instance and parent_project.pk == instance.pk:
-            raise serializers.ValidationError({
-                'parentProjectId': 'Project cannot be its own parent.'
-            })
+        revision_fields = {
+            'active_baseline_revision': 'activeBaselineRevisionId',
+            'current_execution_revision': 'currentExecutionRevisionId',
+            'current_forecast_revision': 'currentForecastRevisionId',
+            'working_revision': 'workingRevisionId',
+        }
+        for source, api_name in revision_fields.items():
+            revision = attrs.get(source, getattr(instance, source, None) if instance else None)
+            if revision and (project_id is None or revision.project_id != project_id or revision.is_deleted):
+                raise serializers.ValidationError({api_name: 'Revision must belong to this project and be active.'})
 
-        ancestor = parent_project
-        while ancestor is not None:
-            if instance and ancestor.pk == instance.pk:
-                raise serializers.ValidationError({
-                    'parentProjectId': 'Subproject hierarchy cannot contain a cycle.'
-                })
-            ancestor = ancestor.parent_project
+        if 'active_baseline_revision' in attrs and attrs['active_baseline_revision']:
+            baseline = attrs['active_baseline_revision']
+            if not baseline.is_baseline or baseline.approved_at is None:
+                raise serializers.ValidationError({'activeBaselineRevisionId': 'Official baseline must be approved and marked as baseline.'})
+        for source, api_name in (
+            ('current_execution_revision', 'currentExecutionRevisionId'),
+            ('current_forecast_revision', 'currentForecastRevisionId'),
+        ):
+            if source in attrs and attrs[source] and attrs[source].approved_at is None:
+                raise serializers.ValidationError({api_name: 'Official revision must be approved.'})
+        if 'working_revision' in attrs and attrs['working_revision'] and attrs['working_revision'].approved_at is not None:
+            raise serializers.ValidationError({'workingRevisionId': 'Working revision must be open.'})
+        if instance and 'working_revision' in attrs:
+            old = instance.working_revision
+            new = attrs['working_revision']
+            if old and new and old.pk != new.pk and not old.is_deleted and old.approved_at is None:
+                raise serializers.ValidationError({'workingRevisionId': 'Close or clear the current working revision first.'})
 
+        lifecycle = attrs.get('lifecycle_status', instance.lifecycle_status if instance else Project.LIFECYCLE_DRAFT)
+        if lifecycle == Project.LIFECYCLE_ACTIVE:
+            required = {
+                'activeBaselineRevisionId': attrs.get('active_baseline_revision', getattr(instance, 'active_baseline_revision', None)),
+                'currentExecutionRevisionId': attrs.get('current_execution_revision', getattr(instance, 'current_execution_revision', None)),
+                'currentDataDate': attrs.get('current_data_date', getattr(instance, 'current_data_date', None)),
+            }
+            missing = [name for name, value in required.items() if not value]
+            if missing:
+                raise serializers.ValidationError({name: 'Required for an active project.' for name in missing})
         return attrs
-
 
 class ProjectViewerSerializer(serializers.ModelSerializer):
     projectId = serializers.PrimaryKeyRelatedField(source='project', queryset=Project.objects.all())
@@ -499,12 +564,22 @@ class TaskReportAttachmentSerializer(serializers.ModelSerializer):
 
 class TaskReportLogSerializer(serializers.ModelSerializer):
     attachments = TaskReportAttachmentSerializer(many=True, read_only=True)
+    task_name = serializers.SerializerMethodField()
+    task_code = serializers.SerializerMethodField()
+    project_id = serializers.SerializerMethodField()
+    project_name = serializers.SerializerMethodField()
+    revision_id = serializers.SerializerMethodField()
 
     class Meta:
         model = TaskReportLog
         fields = [
             'id',
             'task',
+            'task_name',
+            'task_code',
+            'project_id',
+            'project_name',
+            'revision_id',
             'user',
             'status',
             'progress_percent',
@@ -539,6 +614,41 @@ class TaskReportLogSerializer(serializers.ModelSerializer):
             'attachments',
         ]
 
+    def _display_task_version(self, obj):
+        project = obj.task.project
+        candidate_revision_ids = [
+            getattr(obj, 'revision_id', None),
+            project.current_execution_revision_id,
+            project.working_revision_id,
+            project.current_forecast_revision_id,
+            project.active_baseline_revision_id,
+        ]
+        for revision_id in candidate_revision_ids:
+            if not revision_id:
+                continue
+            version = obj.task.versions.filter(revision_id=revision_id, is_deleted=False).select_related('wbs_node', 'revision').first()
+            if version:
+                return version
+        return None
+
+    def get_task_name(self, obj):
+        version = self._display_task_version(obj)
+        return version.title if version else ''
+
+    def get_task_code(self, obj):
+        version = self._display_task_version(obj)
+        return version.wbs_node.wbs_code if version and version.wbs_node else f"ACT-{str(obj.task_id)[:4].upper()}"
+
+    def get_project_id(self, obj):
+        return str(obj.task.project_id)
+
+    def get_project_name(self, obj):
+        return obj.task.project.name
+
+    def get_revision_id(self, obj):
+        version = self._display_task_version(obj)
+        return str(version.revision_id) if version else None
+
 class TaskChatMessageSerializer(serializers.ModelSerializer):
     file_url = serializers.SerializerMethodField()
 
@@ -547,6 +657,11 @@ class TaskChatMessageSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'task',
+            'task_name',
+            'task_code',
+            'project_id',
+            'project_name',
+            'revision_id',
             'user',
             'text',
             'file',
@@ -910,7 +1025,8 @@ class BudgetAllocationSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({'wbs_node': 'Child WBS allocation must be inside the parent WBS.'})
                 if scope_type == 'TASK':
                     versions = task.versions.filter(is_deleted=False) if task else TaskVersion.objects.none()
-                    task_version = versions.filter(revision=revision or parent_allocation.revision).first() if (revision or parent_allocation.revision) else versions.order_by('-revision__number').first()
+                    target_revision = revision or parent_allocation.revision or (project.current_execution_revision if project else None)
+                    task_version = versions.filter(revision=target_revision).first() if target_revision else None
                     if not task_version or not task_version.wbs_node.is_descendant_of(parent_allocation.wbs_node, include_self=True):
                         raise serializers.ValidationError({'task': 'Child task allocation must be inside the parent WBS.'})
             if parent_allocation.scope_type == 'TASK' and (scope_type != 'TASK' or not task or parent_allocation.task_id != task.id):
@@ -1329,35 +1445,32 @@ class TaskDropdownSerializer(serializers.ModelSerializer):
         model = Task
         fields = ['id', 'name', 'code', 'wbsNodeId', 'wbsVersionId']
 
+    @staticmethod
+    def _execution_version(obj):
+        revision_id = obj.project.current_execution_revision_id
+        if not revision_id:
+            return None
+        return obj.versions.filter(
+            revision_id=revision_id, is_deleted=False
+        ).select_related('wbs_node').first()
+
     def get_name(self, obj):
-        # گرفتن عنوان از نسخه فعال (ریویژنِ باز و قفل‌نشده)
-        active_version = obj.versions.filter(revision__approved_at__isnull=True, is_deleted=False).first()
-        if not active_version:
-            # در غیر این صورت، آخرین نسخه موجود
-            active_version = obj.versions.filter(is_deleted=False).last()
-        return active_version.title if active_version else "تسک بدون عنوان"
+        version = self._execution_version(obj)
+        return version.title if version else "Task without an official execution version"
 
     def get_code(self, obj):
-        active_version = obj.versions.filter(revision__approved_at__isnull=True, is_deleted=False).first()
-        if not active_version:
-            active_version = obj.versions.filter(is_deleted=False).last()
-
-        if active_version and active_version.wbs_node:
-            return active_version.wbs_node.wbs_code,active_version.wbs_node.title
+        version = self._execution_version(obj)
+        if version and version.wbs_node:
+            return version.wbs_node.wbs_code, version.wbs_node.title
         return ""
 
     def get_wbsNodeId(self, obj):
-        active_version = obj.versions.filter(revision__approved_at__isnull=True, is_deleted=False).first()
-        if not active_version:
-            active_version = obj.versions.filter(is_deleted=False).last()
-        return str(active_version.wbs_node.node_id) if active_version and active_version.wbs_node else None
+        version = self._execution_version(obj)
+        return str(version.wbs_node.node_id) if version and version.wbs_node else None
 
     def get_wbsVersionId(self, obj):
-        active_version = obj.versions.filter(revision__approved_at__isnull=True, is_deleted=False).first()
-        if not active_version:
-            active_version = obj.versions.filter(is_deleted=False).last()
-        return active_version.wbs_node_id if active_version and active_version.wbs_node else None
-
+        version = self._execution_version(obj)
+        return version.wbs_node_id if version and version.wbs_node else None
 
 class LevelingPlanProjectSerializer(serializers.ModelSerializer):
     projectId = serializers.CharField(source="project_id", read_only=True)

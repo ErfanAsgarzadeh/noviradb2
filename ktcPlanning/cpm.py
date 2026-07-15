@@ -206,13 +206,8 @@ class CPMEngine:
         self.nodes[succ].predecessors.append(edge)
 
     def _get_active_revision(self, project):
-        from .models import Revision
-
-        return (
-            Revision.objects.filter(project=project, is_deleted=False, approved_at__isnull=True).order_by('-number').first()
-            or Revision.objects.filter(project=project, is_deleted=False).order_by('-number').first()
-        )
-
+        from .revision_policy import ROLE_FORECAST, get_official_revision
+        return get_official_revision(project, ROLE_FORECAST, required=False)
     def _get_subproject_node_id(self, project_id) -> str:
         return f"subproject-{project_id}"
 

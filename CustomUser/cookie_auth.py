@@ -34,7 +34,8 @@ def _cookie_settings(max_age: int) -> dict:
     return {
         "max_age": max_age,
         "httponly": True,
-        "secure": not settings.DEBUG,   # در production حتماً True (HTTPS)
+        # Stable داخلی فعلاً روی HTTP سرو می‌شود؛ در HTTPS باید این مقدار True باشد.
+        "secure": getattr(settings, "AUTH_COOKIE_SECURE", not settings.DEBUG),
         "samesite": "Lax",
         "path": "/",
     }

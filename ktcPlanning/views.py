@@ -11,7 +11,7 @@ from django.conf import settings
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from django.db import transaction
-from django.db.models import Q, Sum, Prefetch, F
+from django.db.models import Q, Sum, Prefetch, F, OuterRef, Subquery
 from django.core.exceptions import ValidationError as DjangoValidationError
 from datetime import date, timedelta, datetime
 from decimal import Decimal
@@ -75,6 +75,12 @@ from .permissions import (
     require_can_manage_viewers,
 )
 from auditlog.services import diff_dicts, log_event, model_to_dict_safe
+from .revision_policy import (
+    ROLE_EXECUTION, ROLE_FORECAST, ROLE_WORKING,
+    assign_working_revision, get_official_revision,
+    official_revision_ids, promote_approved_revision,
+    resolve_designated_approver,
+)
 from django.contrib.auth import get_user_model
 User = get_user_model()
 
@@ -92,10 +98,8 @@ def clean_budget_object(obj):
 
 
 def get_active_revision(project):
-    return (
-        Revision.objects.filter(project=project, is_deleted=False, approved_at__isnull=True).order_by('-number').first()
-        or Revision.objects.filter(project=project, is_deleted=False).order_by('-number').first()
-    )
+    """Compatibility name; selection is now explicit and never falls back."""
+    return get_official_revision(project, ROLE_FORECAST, required=False)
 
 
 def format_gantt_datetime(value):
@@ -450,7 +454,32 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         require_can_edit_project(self.request.user, instance)
         instance.is_deleted = True
-        instance.save()
+        instance.lifecycle_status = Project.LIFECYCLE_ARCHIVED
+        instance.save(update_fields=['is_deleted', 'lifecycle_status'])
+
+    @action(detail=True, methods=['get', 'patch'], url_path='official-schedule')
+    @transaction.atomic
+    def official_schedule(self, request, pk=None):
+        project = Project.objects.select_for_update().get(pk=self.get_object().pk)
+        if request.method.lower() == 'patch':
+            require_can_edit_project(request.user, project)
+            allowed = {
+                'activeBaselineRevisionId', 'currentExecutionRevisionId',
+                'currentForecastRevisionId', 'workingRevisionId',
+                'currentDataDate', 'lifecycleStatus',
+            }
+            unknown = set(request.data.keys()) - allowed
+            if unknown:
+                raise ValidationError({'detail': f"Unsupported fields: {', '.join(sorted(unknown))}"})
+            old = model_to_dict_safe(project)
+            serializer = self.get_serializer(project, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            log_event(
+                'official_schedule_changed', target=project, category='business',
+                changes=diff_dicts(old, model_to_dict_safe(project)), request=request,
+            )
+        return Response(self.get_serializer(project).data)
 
 
 class ProjectViewerViewSet(viewsets.ModelViewSet):
@@ -511,8 +540,20 @@ class RevisionViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_destroy(self, instance):
+        project = instance.project
+        official_fields = {
+            'active_baseline_revision': project.active_baseline_revision_id,
+            'current_execution_revision': project.current_execution_revision_id,
+            'current_forecast_revision': project.current_forecast_revision_id,
+            'working_revision': project.working_revision_id,
+        }
+        used_as = [name for name, revision_id in official_fields.items() if revision_id == instance.pk]
+        if used_as:
+            raise ValidationError({
+                'revision': f"Official revision cannot be deleted ({', '.join(used_as)})."
+            })
         instance.is_deleted = True
-        instance.save()
+        instance.save(update_fields=['is_deleted'])
     # --- متد قفل کردن نسخه ---
     @action(detail=True, methods=['post'], url_path='approve')
     def approve_revision(self, request, pk=None):
@@ -528,6 +569,7 @@ class RevisionViewSet(viewsets.ModelViewSet):
         revision.approved_by = request.user
         revision.approved_at = timezone.now()
         revision.save()
+        promote_approved_revision(revision, data_date=revision.project.current_data_date)
 
         return Response({"detail": "نسخه با موفقیت قفل شد."}, status=status.HTTP_200_OK)
 
@@ -590,6 +632,17 @@ class RevisionViewSet(viewsets.ModelViewSet):
 
         # فقط کسی که اجازه ویرایش پروژه را دارد می‌تواند پیش‌نویس بسازد
         require_can_edit_project(request.user, base_revision.project)
+        existing_working = base_revision.project.working_revision
+        if (
+            existing_working
+            and existing_working.pk != base_revision.pk
+            and not existing_working.is_deleted
+            and existing_working.approved_at is None
+        ):
+            return Response(
+                {"detail": f"Revision {existing_working.number} is already the official working revision."},
+                status=status.HTTP_409_CONFLICT,
+            )
 
         if not base_revision.approved_at:
             return Response(
@@ -609,28 +662,28 @@ class RevisionViewSet(viewsets.ModelViewSet):
         # شرکتی → پیش‌فرض = مدیرِ برنامه‌ریزی
         # درون‌واحدی → پیش‌فرض = مدیرِ واحدِ صاحبِ پروژه
         # override دستی همیشه ممکن است (approverId / approver_id)
-        from .permissions import get_planning_manager as _get_pm
-        approver_id = None
-        if approver_id:
-            approver = get_object_or_404(User, pk=approver_id)
-        elif getattr(base_revision.project, 'scope', 'intra_unit') == 'company':
-            approver = _get_pm() or request.user
-        else:
-            # درون‌واحدی: مدیرِ واحدِ صاحبِ پروژه → fallback به سازنده
-            ou = getattr(base_revision.project, 'owner_unit', None)
-            approver = (ou.manager if ou and ou.manager else request.user)
+        approver_id = request.data.get('approverId') or request.data.get('approver_id')
+        requested_approver = get_object_or_404(User, pk=approver_id) if approver_id else None
+        try:
+            approver = resolve_designated_approver(base_revision.project, requested_approver)
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.message_dict if hasattr(exc, 'message_dict') else exc.messages)
 
-        approver = base_revision.project.get_default_approver()
-
-        new_revision_number = Revision.objects.filter(project=base_revision.project).count() + 1
+        locked_project = Project.objects.select_for_update().get(pk=base_revision.project_id)
+        new_revision_number = (
+            Revision.objects.filter(project=locked_project).aggregate(max_number=Max('number'))['max_number'] or 0
+        ) + 1
         new_revision = Revision.objects.create(
-            project=base_revision.project,
+            project=locked_project,
             number=new_revision_number,
             description=description,
             project_start=base_revision.project_start,
+            project_end=base_revision.project_end,
             created_by=request.user,
             designated_approver=approver,
         )
+
+        assign_working_revision(locked_project, new_revision)
 
         old_to_new_wbs_map = {}
         old_wbs_nodes = WBSNodeVersion.objects.filter(
@@ -709,6 +762,12 @@ class RevisionViewSet(viewsets.ModelViewSet):
         اجرای موتور محاسباتی زمان‌بندی (CPM) روی یک نسخه خاص
         """
         revision = self.get_object()
+        official_working = get_official_revision(revision.project, ROLE_WORKING, required=False)
+        if official_working is None or official_working.pk != revision.pk:
+            return Response(
+                {"detail": "CPM can only run on the official working revision."},
+                status=status.HTTP_409_CONFLICT,
+            )
 
         # بررسی اینکه آیا نسخه باز است و قابلیت ویرایش دارد یا خیر
         check_revision_is_open(revision, request.user)
@@ -719,6 +778,9 @@ class RevisionViewSet(viewsets.ModelViewSet):
             data_date = parse_cpm_data_date(request.data.get("dataDate"))
             engine = CPMEngine(revision, data_date=data_date)
             cpm_result = engine.run()
+            Project.objects.filter(pk=revision.project_id).update(
+                current_data_date=cpm_result.get("data_date")
+            )
 
             # Persist the latest parent-network warning on each child project so
             # its manager can see the conflict without access to the parent.
@@ -802,7 +864,7 @@ class WbsNodeViewSet(viewsets.ModelViewSet):
             filter_kwargs['revision_id'] = revision_id
         else:
             # پیدا کردن ردیف در نسخه‌ای که هنوز تایید و قفل نشده است
-            filter_kwargs['revision__approved_at__isnull'] = True
+            filter_kwargs['revision_id'] = F('node__project__working_revision_id')
 
         # استفاده از first() برای جلوگیری از ارور تعدد ردیف
         obj = queryset.filter(**filter_kwargs).first()
@@ -820,17 +882,19 @@ class WbsNodeViewSet(viewsets.ModelViewSet):
         if project_id:
             queryset = queryset.filter(revision__project_id=project_id)
         revision_id = self.request.query_params.get('revision_id')
+        revision_role = self.request.query_params.get('revision_role')
         if revision_id:
             queryset = queryset.filter(revision_id=revision_id)
         elif project_id:
-            revision = (
-                Revision.objects.filter(project_id=project_id, approved_at__isnull=True).order_by('-number').first()
-                or Revision.objects.filter(project_id=project_id).order_by('-number').first()
-            )
-            if revision:
-                queryset = queryset.filter(revision=revision)
+            project = get_object_or_404(Project, pk=project_id, is_deleted=False)
+            if revision_role == 'execution':
+                queryset = queryset.filter(revision_id=project.current_execution_revision_id) if project.current_execution_revision_id else queryset.none()
+            else:
+                queryset = queryset.filter(revision_id=project.working_revision_id) if project.working_revision_id else queryset.none()
+        elif revision_role == 'execution':
+            queryset = queryset.filter(revision_id=F('node__project__current_execution_revision_id'))
         else:
-            queryset = queryset.filter(revision__approved_at__isnull=True)
+            queryset = queryset.filter(revision_id=F('node__project__working_revision_id'))
         return queryset
 
     # --- هندل کردن ساخت صحیح گره WBS ---
@@ -1024,7 +1088,7 @@ class ActivityNodeViewSet(viewsets.ModelViewSet):
         if revision_id:
             filter_kwargs['revision_id'] = revision_id
         else:
-            filter_kwargs['revision__approved_at__isnull'] = True
+            filter_kwargs['revision_id'] = F('task__project__working_revision_id')
 
         # انتخاب دقیق همان ردیفی که متعلق به نسخه باز است
         obj = queryset.filter(**filter_kwargs).first()
@@ -1038,18 +1102,50 @@ class ActivityNodeViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        queryset = queryset.filter(revision__project_id__in=accessible_project_ids(self.request.user))
+        project_ids = accessible_project_ids(self.request.user)
+        queryset = queryset.filter(revision__project_id__in=project_ids)
         revision_id = self.request.query_params.get('revision_id')
         user_id = self.request.query_params.get('user_id')  # <--- فیلتر جدید
+        search = (self.request.query_params.get('search') or '').strip()
 
         if revision_id:
             queryset = queryset.filter(revision_id=revision_id)
+        else:
+            queryset = queryset.filter(revision_id__in=official_revision_ids(project_ids, ROLE_WORKING))
 
         # فیلتر کردن تسک‌هایی که این کاربر در آن‌ها نقش دارد
         if user_id:
             queryset = queryset.filter(task__roles__user_id=user_id).distinct()
+        if search:
+            queryset = queryset.filter(Q(title__icontains=search) | Q(wbs_node__wbs_code__icontains=search)).distinct()
 
-        return queryset
+        return queryset.order_by('sequence')
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        series = self._series(queryset)
+        include_history = (request.query_params.get('history') or '').lower() in {'1', 'true', 'yes'}
+        display_queryset = queryset if include_history else self._latest_task_queryset(queryset)
+        page_param = request.query_params.get('page')
+        page_size_param = request.query_params.get('pageSize') or request.query_params.get('page_size')
+        if not page_param and not page_size_param:
+            serializer = self.get_serializer(display_queryset, many=True)
+            return Response(serializer.data)
+        try:
+            page = max(int(page_param or 1), 1)
+            page_size = min(max(int(page_size_param or 50), 1), 100)
+        except (TypeError, ValueError):
+            page, page_size = 1, 50
+        total = queryset.count()
+        start = (page - 1) * page_size
+        serializer = self.get_serializer(queryset[start:start + page_size], many=True)
+        return Response({
+            'results': serializer.data,
+            'page': page,
+            'pageSize': page_size,
+            'total': total,
+            'hasNext': start + len(serializer.data) < total,
+        })
 
     # --- هندل کردن ساخت صحیح تسک (گرفتن والد از ریکوئست) ---
     def perform_create(self, serializer):
@@ -1217,6 +1313,7 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
         queryset = queryset.filter(task__project_id__in=accessible_project_ids(self.request.user))
         task_id = self.request.query_params.get('task_id')
         for_approval = self.request.query_params.get('for_approval')
+        official_working_ids = official_revision_ids(accessible_project_ids(self.request.user), ROLE_WORKING)
 
         if task_id:
             queryset = queryset.filter(task_id=task_id)
@@ -1231,6 +1328,7 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
             reviewer_q = Q(
                 approval_status='pending',
                 task__roles__user=user,
+                task__roles__revision_id__in=official_working_ids,
                 task__roles__role__in=['reviewer', 'project manager'],
             )
             # صف مدیر برنامه‌ریزی: گزارش‌های reviewer_approved از پروژه‌های شرکتی
@@ -1241,7 +1339,7 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
 
             queryset = queryset.filter(reviewer_q | planning_q).distinct()
 
-        return queryset
+        return queryset.select_related('task', 'task__project', 'user').prefetch_related('attachments')
 
     def perform_create(self, serializer):
         uploaded_files = self.request.FILES.getlist('attachments')
@@ -1416,15 +1514,18 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
     # ────────── Helper: ثبتِ پیشرفت در TaskActual ──────────
     def _commit_progress(self, report, user):
         """ثبتِ پیشرفت فقط هنگامِ final_approved — فراخوانی خارج از این حالت مجاز نیست."""
+        execution_revision = get_official_revision(
+            report.task.project, ROLE_EXECUTION, required=True
+        )
         active_task_version = TaskVersion.objects.filter(
             task=report.task,
-            revision__approved_at__isnull=True,
-            is_deleted=False
+            revision=execution_revision,
+            is_deleted=False,
         ).first()
-
         if not active_task_version:
-            return
-
+            raise ValidationError({
+                "task": "Task does not exist in the project's official execution revision."
+            })
         task_actual, _ = TaskActual.objects.get_or_create(
             task_version=active_task_version,
             defaults={'updated_by': user}
@@ -1474,7 +1575,8 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        queryset = queryset.filter(revision__project_id__in=accessible_project_ids(self.request.user))
+        project_ids = accessible_project_ids(self.request.user)
+        queryset = queryset.filter(revision__project_id__in=project_ids)
 
         # امکان فیلتر کردن دیتای برگشتی
         revision_id = self.request.query_params.get('revision_id')
@@ -1483,6 +1585,8 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
 
         if revision_id:
             queryset = queryset.filter(revision_id=revision_id)
+        else:
+            queryset = queryset.filter(revision_id__in=official_revision_ids(project_ids, ROLE_WORKING))
         if task_id:
             queryset = queryset.filter(task_id=task_id)
         if user_id:
@@ -1587,7 +1691,10 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
         user_id = request.data.get('userId')
         if not user_id or not (revision_id or project_id):
             return Response({'detail': 'userId and revisionId/projectId are required.'}, status=status.HTTP_400_BAD_REQUEST)
-        revision_qs = Revision.objects.filter(project_id__in=accessible_project_ids(request.user), project__is_deleted=False, is_deleted=False, approved_at__isnull=True)
+        revision_qs = Revision.objects.filter(
+            pk__in=official_revision_ids(accessible_project_ids(request.user), ROLE_WORKING),
+            project__is_deleted=False, is_deleted=False,
+        )
         revision = get_object_or_404(revision_qs, pk=revision_id) if revision_id else get_object_or_404(revision_qs, project_id=project_id)
         check_revision_is_open(revision, request.user)
         target = get_object_or_404(User, pk=user_id)
@@ -1610,7 +1717,11 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='assignment-filter-options')
     def assignment_filter_options(self, request):
         actor = request.user
-        versions = TaskVersion.objects.filter(is_deleted=False, wbs_node__is_deleted=False, revision__is_deleted=False, revision__project__is_deleted=False, revision__approved_at__isnull=True)
+        versions = TaskVersion.objects.filter(
+            is_deleted=False, wbs_node__is_deleted=False, revision__is_deleted=False,
+            revision__project__is_deleted=False,
+            revision_id__in=official_revision_ids(accessible_project_ids(actor), ROLE_WORKING),
+        )
         if not is_system_admin(actor):
             versions = versions.filter(task__roles__user=actor, task__roles__role__in=['reviewer', 'project manager'], task__roles__revision=F('revision'))
         versions = versions.select_related('revision__project', 'wbs_node').distinct()
@@ -1674,7 +1785,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
             wbs_node__is_deleted=False,
             revision__is_deleted=False,
             revision__project__is_deleted=False,
-            revision__approved_at__isnull=True,
+            revision_id__in=official_revision_ids(accessible_project_ids(actor), ROLE_WORKING),
         )
         if not is_system_admin_actor:
             task_versions = task_versions.filter(
@@ -1689,7 +1800,9 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
         if project_id:
             task_versions = task_versions.filter(revision__project_id=project_id)
         if node_id:
-            node = WBSNodeVersion.objects.filter(node_id=node_id, revision__approved_at__isnull=True, is_deleted=False).first()
+            node = WBSNodeVersion.objects.filter(
+                node_id=node_id, revision_id=F('node__project__working_revision_id'), is_deleted=False,
+            ).first()
             if node:
                 task_versions = task_versions.filter(wbs_node__in=node.get_descendants(include_self=True).filter(is_deleted=False))
         if search:
@@ -2208,18 +2321,24 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        queryset = queryset.filter(revision__project_id__in=accessible_project_ids(self.request.user))
+        accessible_ids = accessible_project_ids(self.request.user)
+        queryset = queryset.filter(revision__project_id__in=accessible_ids)
 
         revision_id = self.request.query_params.get('revision_id')
         task_id = self.request.query_params.get('task_id')
 
         if revision_id:
             queryset = queryset.filter(revision_id=revision_id)
+        elif task_id:
+            task = Task.objects.filter(pk=task_id, project_id__in=accessible_ids).select_related('project').first()
+            if task and task.project.current_execution_revision_id:
+                queryset = queryset.filter(revision_id=task.project.current_execution_revision_id)
+            else:
+                queryset = queryset.none()
         if task_id:
             queryset = queryset.filter(task_id=task_id)
 
         return queryset
-
 
 from django.contrib.auth import get_user_model
 User = get_user_model()
@@ -2237,7 +2356,7 @@ class PersonalTaskViewSet(viewsets.ViewSet):
             return Response([], status=status.HTTP_200_OK)
 
         # پیدا کردن ریویژن فعال و تمام تسک‌هایی که حذف نشده‌اند
-        revision = Revision.objects.filter(project=sys_project).latest('created_at')
+        revision = get_official_revision(sys_project, ROLE_WORKING, required=True)
         tasks = TaskVersion.objects.filter(revision=revision, is_deleted=False)
 
         # استفاده از سریالایزر گانت‌چارت برای همخوانی ساختار دیتا با فرانت‌اند
@@ -2266,7 +2385,7 @@ class PersonalTaskViewSet(viewsets.ViewSet):
         )
 
         # ۲. دریافت ریویژن (طبق مدل‌های شما، ریویژن صفر خودکار با ساخت پروژه ایجاد می‌شود)
-        revision = Revision.objects.filter(project=sys_project).latest('created_at')
+        revision = get_official_revision(sys_project, ROLE_WORKING, required=True)
 
         # ۳. مدیریت ساختار WBS برای تسک‌های شخصی
         # مدل WBSNode فیلد نام ندارد، نام در WBSNodeVersion ذخیره می‌شود
@@ -2400,7 +2519,92 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
         revision_id = self.request.query_params.get('revision_id')
         if revision_id:
             queryset = queryset.filter(revision_id=revision_id)
-        return queryset
+        search = (self.request.query_params.get('search') or '').strip()
+        if search:
+            queryset = queryset.filter(
+                Q(task__versions__title__icontains=search, task__versions__revision_id=F('revision_id')) |
+                Q(task__versions__wbs_node__wbs_code__icontains=search, task__versions__revision_id=F('revision_id'))
+            ).distinct()
+        return queryset.select_related('task', 'revision').order_by('-report_date', 'id')
+
+    def _latest_task_queryset(self, queryset):
+        latest_date = VarianceReport.objects.filter(
+            task_id=OuterRef('task_id'),
+            revision_id=OuterRef('revision_id'),
+        ).order_by('-report_date').values('report_date')[:1]
+        return queryset.filter(report_date=Subquery(latest_date))
+
+    def _series(self, queryset):
+        rows = queryset.order_by('report_date').values('report_date').annotate(
+            total_pv=Sum('planned_value'),
+            total_ev=Sum('earned_value'),
+            total_ac=Sum('actual_cost'),
+        )
+        return [
+            {
+                'date': item['report_date'].isoformat() if item['report_date'] else None,
+                'plannedValue': float(item['total_pv'] or Decimal('0')),
+                'earnedValue': float(item['total_ev'] or Decimal('0')),
+                'actualCost': float(item['total_ac'] or Decimal('0')),
+            }
+            for item in rows
+        ]
+    def _summary(self, queryset):
+        totals = queryset.aggregate(
+            total_bac=Sum('budget_at_completion'),
+            total_pv=Sum('planned_value'),
+            total_ev=Sum('earned_value'),
+            total_ac=Sum('actual_cost'),
+        )
+        total_bac = totals.get('total_bac') or Decimal('0')
+        total_pv = totals.get('total_pv') or Decimal('0')
+        total_ev = totals.get('total_ev') or Decimal('0')
+        total_ac = totals.get('total_ac') or Decimal('0')
+        total_sv = total_ev - total_pv
+        total_cv = total_ev - total_ac
+        return {
+            'totalBAC': float(total_bac),
+            'totalPV': float(total_pv),
+            'totalEV': float(total_ev),
+            'totalAC': float(total_ac),
+            'overallSPI': float((total_ev / total_pv).quantize(Decimal('0.01'))) if total_pv else 1.0,
+            'overallCPI': float((total_ev / total_ac).quantize(Decimal('0.01'))) if total_ac else 1.0,
+            'totalSV': float(total_sv),
+            'totalCV': float(total_cv),
+            'criticalCount': queryset.filter(action_required=True).count(),
+        }
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        series = self._series(queryset)
+        include_history = (request.query_params.get('history') or '').lower() in {'1', 'true', 'yes'}
+        display_queryset = queryset if include_history else self._latest_task_queryset(queryset)
+        page_param = request.query_params.get('page')
+        page_size_param = request.query_params.get('pageSize') or request.query_params.get('page_size')
+
+        if not page_param and not page_size_param:
+            serializer = self.get_serializer(display_queryset, many=True)
+            return Response(serializer.data)
+
+        try:
+            page = max(int(page_param or 1), 1)
+            page_size = min(max(int(page_size_param or 100), 1), 250)
+        except (TypeError, ValueError):
+            page, page_size = 1, 100
+
+        total = display_queryset.count()
+        start = (page - 1) * page_size
+        page_queryset = display_queryset[start:start + page_size]
+        serializer = self.get_serializer(page_queryset, many=True)
+        return Response({
+            'results': serializer.data,
+            'summary': self._summary(display_queryset),
+            'series': series,
+            'page': page,
+            'pageSize': page_size,
+            'total': total,
+            'hasNext': start + len(serializer.data) < total,
+        })
 
     @action(detail=False, methods=['post'], url_path='calculate')
     def trigger_calculation(self, request):
@@ -2410,14 +2614,19 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
             return Response({"error": "project_id الزامی است."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            # اجرای انجین
-            engine = EVMEngine(project_id=project_id)
-            engine.run_task_level_variances()
-            return Response({"status": "محاسبات با موفقیت انجام شد و دیتابیس به‌روزرسانی گردید."},
-                            status=status.HTTP_200_OK)
+            data_datetime = parse_cpm_data_date(request.data.get('dataDate'))
+            engine = EVMEngine(project_id=project_id, data_datetime=data_datetime)
+            result = engine.run_historical_task_level_variances()
+            return Response({
+                "status": "محاسبات با موفقیت انجام شد و دیتابیس به‌روزرسانی گردید.",
+                "dataDate": engine.data_datetime.isoformat() if engine.data_datetime else None,
+                "historyDates": result.get("dates", []),
+                "snapshots": result.get("snapshots", 0),
+            }, status=status.HTTP_200_OK)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
 
 
 # ─── SystemSettings endpoint (singleton) ──────────────────────────────────────
@@ -2850,10 +3059,9 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
         if cost_transaction.revision_id:
             task_version = versions.filter(revision_id=cost_transaction.revision_id).first()
         else:
-            task_version = versions.filter(revision__approved_at__isnull=True).order_by('-revision__number').first()
-            if not task_version:
-                task_version = versions.order_by('-revision__number').first()
-
+            task_version = versions.filter(
+                revision_id=cost_transaction.task.project.current_execution_revision_id
+            ).first()
         if not task_version:
             return []
 
@@ -2977,30 +3185,37 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
 
 
 class TaskViewSet(viewsets.ReadOnlyModelViewSet):
-    """ویوست فقط‌خواندنی برای تغذیهٔ دراپ‌داونِ تسک‌ها در فرانت‌اند"""
+    """Read-only dropdown tasks scoped to the project's official execution revision."""
     queryset = Task.objects.all()
     serializer_class = TaskDropdownSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        accessible_ids = accessible_project_ids(self.request.user)
+        queryset = super().get_queryset().filter(project_id__in=accessible_ids)
 
-        # فیلتر امنیتی: فقط پروژه‌هایی که کاربر به آن‌ها دسترسی دارد
-        queryset = queryset.filter(project_id__in=accessible_project_ids(self.request.user))
-
-        # فیلتر بر اساس پروژه انتخابی در فرانت‌اند
         project_id = self.request.query_params.get('project_id')
         if project_id:
             queryset = queryset.filter(project_id=project_id)
+
+        execution_revision_ids = Project.objects.filter(
+            id__in=accessible_ids,
+            current_execution_revision_id__isnull=False,
+        ).values_list('current_execution_revision_id', flat=True)
+        queryset = queryset.filter(
+            versions__revision_id__in=execution_revision_ids,
+            versions__is_deleted=False,
+        )
+
         wbs_node_id = self.request.query_params.get('wbs_node_id')
         if wbs_node_id:
             queryset = queryset.filter(
                 versions__wbs_node__node_id=wbs_node_id,
+                versions__revision_id__in=execution_revision_ids,
                 versions__is_deleted=False,
-            ).distinct()
+            )
 
-        return queryset
-
+        return queryset.distinct()
 
 class ResourceLevelingPlanViewSet(viewsets.ModelViewSet):
     serializer_class = ResourceLevelingPlanSerializer

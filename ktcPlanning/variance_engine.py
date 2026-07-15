@@ -1,14 +1,17 @@
 import logging
 from decimal import Decimal
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 from django.db import transaction
 
 from ktcPlanning.models import (
-    Project, Revision, TaskVersion, VarianceReport, Calendar, CostTransaction
+    Project, Revision, TaskVersion, VarianceReport, Calendar, Assignment, TaskReportLog
 )
 # فرض می‌کنیم CalendarEngine در مسیر زیر قرار دارد
 from ktcPlanning.calendar import CalendarEngine
+from ktcPlanning.revision_policy import (
+    ROLE_BASELINE, ROLE_EXECUTION, get_official_revision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,25 +19,19 @@ logger = logging.getLogger(__name__)
 class EVMEngine:
     def __init__(self, project_id, data_datetime=None):
         self.project_id = project_id
-        # برای محاسبات ساعتی، حتماً به datetime نیاز داریم نه فقط date
-        self.data_datetime = data_datetime or timezone.now()
-
-        self.baseline_rev = Revision.objects.filter(
-            project_id=self.project_id,
-            is_baseline=True,
-            is_deleted=False
-        ).order_by('-created_at').first()
-
-        self.current_rev = Revision.objects.filter(
-            project_id=self.project_id,
-            is_deleted=False
-        ).latest('created_at')
-
-        # کش کردن موتورهای تقویم برای پرفورمنس بالا
+        self.project = Project.objects.select_related(
+            'active_baseline_revision', 'current_execution_revision'
+        ).get(pk=project_id, is_deleted=False)
+        self.data_datetime = data_datetime or self.project.current_data_date or timezone.now()
+        self.baseline_rev = get_official_revision(
+            self.project, ROLE_BASELINE, required=False
+        )
+        self.current_rev = get_official_revision(
+            self.project, ROLE_EXECUTION, required=True
+        )
         self._cal_engines = {}
         self._default_cal_engine = None
         self._load_calendars()
-
     def _load_calendars(self):
         """لود کردن تقویم پیش‌فرض و تمامی تقویم‌های اختصاصی تسک‌ها در حافظه"""
         default_cal = Calendar.objects.filter(
@@ -100,14 +97,137 @@ class EVMEngine:
 
         return round(pv, 2), bac
 
+    def _approved_report_filter(self, queryset):
+        """Only reports accepted into project history should affect EVM."""
+        return queryset.filter(
+            Q(approval_status__in=['reviewer_approved', 'final_approved'])
+            | Q(is_approved=True)
+        )
+
+    def _progress_as_of(self, active_task_ids):
+        """
+        Latest approved progress for every task up to the current data date.
+
+        This prevents historical EVM snapshots from using today's TaskActual
+        progress for older report dates.
+        """
+        latest_progress = {}
+        reports = self._approved_report_filter(
+            TaskReportLog.objects.filter(
+                task_id__in=active_task_ids,
+                timestamp__lte=self.data_datetime,
+            )
+        ).order_by('task_id', '-timestamp')
+
+        for report in reports:
+            if report.task_id not in latest_progress:
+                latest_progress[report.task_id] = (
+                    Decimal(report.progress_percent or 0) / Decimal('100.0')
+                )
+        return latest_progress
+
+    def _actual_hours_from_dates(self, task_version):
+        """Fallback AC(H): derive consumed hours from actual dates and task calendar."""
+        actual = getattr(task_version, 'actual', None)
+        if not actual or not actual.actual_start:
+            return Decimal('0.00')
+        if actual.actual_start > self.data_datetime:
+            return Decimal('0.00')
+
+        actual_end = actual.actual_finish if actual.actual_finish and actual.actual_finish <= self.data_datetime else self.data_datetime
+        if actual_end <= actual.actual_start:
+            return Decimal('0.00')
+
+        cal_engine = self._get_engine(task_version.calendar_id)
+        if cal_engine:
+            hours = cal_engine.working_hours_between(actual.actual_start, actual_end)
+        else:
+            hours = (actual_end - actual.actual_start).total_seconds() / 3600.0
+        return Decimal(str(hours))
+    def collect_evm_data_dates(self):
+        """
+        Build the daily timeline that should be recalculated for EVM charts:
+        approved report dates, actual dates, selected data date, and today.
+        """
+        dates = {self.data_datetime}
+        task_ids = list(TaskVersion.objects.filter(
+            revision=self.current_rev,
+            is_deleted=False
+        ).values_list('task_id', flat=True))
+
+        def add_history_date(value):
+            if not value:
+                return
+            if timezone.is_naive(value):
+                value = timezone.make_aware(value, timezone.get_current_timezone())
+            if value <= self.data_datetime:
+                dates.add(value)
+
+        report_dates = self._approved_report_filter(
+            TaskReportLog.objects.filter(task_id__in=task_ids)
+        ).values_list('timestamp', flat=True)
+        for value in report_dates:
+            add_history_date(value)
+
+        actual_dates = TaskVersion.objects.filter(
+            revision=self.current_rev,
+            is_deleted=False,
+            actual__isnull=False,
+        ).values_list(
+            'actual__actual_start',
+            'actual__actual_finish',
+        )
+        for actual_start, actual_finish in actual_dates:
+            add_history_date(actual_start)
+            add_history_date(actual_finish)
+
+        aware_dates = []
+        for value in dates:
+            if timezone.is_naive(value):
+                value = timezone.make_aware(value, timezone.get_current_timezone())
+            aware_dates.append(value)
+
+        normalized = []
+        seen_days = set()
+        for value in sorted(aware_dates):
+            day = value.date()
+            if day in seen_days:
+                continue
+            seen_days.add(day)
+            normalized.append(value)
+        return normalized
+
+    def run_historical_task_level_variances(self):
+        """
+        Recalculate EVM snapshots for all known actual/report dates and today.
+        """
+        original_data_datetime = self.data_datetime
+        data_dates = self.collect_evm_data_dates()
+        target_report_dates = [value.date() for value in data_dates]
+        VarianceReport.objects.filter(
+            task__project_id=self.project_id,
+            revision=self.current_rev,
+        ).exclude(report_date__in=target_report_dates).delete()
+
+        total_snapshots = 0
+        try:
+            for data_datetime in data_dates:
+                self.data_datetime = data_datetime
+                total_snapshots += self.run_task_level_variances() or 0
+        finally:
+            self.data_datetime = original_data_datetime
+
+        return {
+            'dates': [value.date().isoformat() for value in data_dates],
+            'snapshots': total_snapshots,
+        }
     @transaction.atomic
     def run_task_level_variances(self):
         """اجرای محاسبات EVM برای تک‌تک تسک‌های پروژه (نسخه بهینه‌شده)"""
 
         if not self.baseline_rev:
             logger.error("No Baseline found for project. EVM requires a baseline.")
-            return
-
+            return 0
         # استخراج تسک‌های فعال در نسخه جاری
         active_tvs = TaskVersion.objects.filter(
             revision=self.current_rev,
@@ -122,17 +242,27 @@ class EVMEngine:
             )
         }
 
-        # AC is the sum of posted cost transactions up to the engine data date.
+        # AC(H) is actual consumed hours up to the engine data date.
+        # Prefer approved task report logs because they represent accepted actual work.
+        # Fall back to assignment.actual_hours when no report-log hours exist yet.
         active_task_ids = [tv.task_id for tv in active_tvs]
-        ac_aggregates = CostTransaction.objects.filter(
-            project_id=self.project_id,
+        progress_dict = self._progress_as_of(active_task_ids)
+        approved_logs = self._approved_report_filter(
+            TaskReportLog.objects.filter(
+                task_id__in=active_task_ids,
+                timestamp__lte=self.data_datetime,
+            )
+        ).values('task_id').annotate(total_ac=Sum('time_spent_hours'))
+        ac_dict = {item['task_id']: (item['total_ac'] or Decimal('0.00')) for item in approved_logs}
+
+        assignment_hours = Assignment.objects.filter(
+            revision=self.current_rev,
             task_id__in=active_task_ids,
-            transaction_date__lte=self.data_datetime.date(),
-        ).values('task_id').annotate(total_ac=Sum('amount'))
-
-        # تبدیل به دیکشنری برای دسترسی سریع: {task_id: total_ac}
-        ac_dict = {item['task_id']: (item['total_ac'] or Decimal('0.00')) for item in ac_aggregates}
-
+        ).values('task_id').annotate(total_ac=Sum('actual_hours'))
+        for item in assignment_hours:
+            task_id = item['task_id']
+            if ac_dict.get(task_id, Decimal('0.00')) == Decimal('0.00'):
+                ac_dict[task_id] = item['total_ac'] or Decimal('0.00')
         # واکشی اسنپ‌شات‌های موجود در این تاریخ برای آپدیت یا ایجاد (Upsert)
         existing_snapshots = {
             snap.task_id: snap for snap in VarianceReport.objects.filter(
@@ -150,7 +280,8 @@ class EVMEngine:
 
             # --- 1. Actual Cost (AC) (بدون کوئری اضافه) ---
             ac = ac_dict.get(task.id, Decimal('0.00'))
-
+            if ac == Decimal('0.00'):
+                ac = self._actual_hours_from_dates(current_tv)
             # --- 2. Planned Value (PV) & Budget At Completion (BAC) ---
             baseline_tv = baseline_tvs.get(task.id)
             if not baseline_tv:
@@ -159,11 +290,13 @@ class EVMEngine:
             pv, bac = self._calculate_task_pv(baseline_tv)
 
             # --- 3. Earned Value (EV) ---
-            actual_progress = Decimal('0.00')
-            if hasattr(current_tv, 'actual') and current_tv.actual:
-                actual_progress = Decimal(current_tv.actual.progress) / Decimal('100.0')
+            actual_progress = progress_dict.get(task.id, Decimal('0.00'))
+            if actual_progress == Decimal('0.00') and hasattr(current_tv, 'actual') and current_tv.actual:
+                actual_finish = current_tv.actual.actual_finish
+                if actual_finish and actual_finish <= self.data_datetime:
+                    actual_progress = Decimal(current_tv.actual.progress or 0) / Decimal('100.0')
 
-            ev = bac * actual_progress
+            ev = bac * min(actual_progress, Decimal('1.00'))
 
             # --- 4. Performance Indices (SPI & CPI) ---
             spi = ev / pv if pv > Decimal('0.00') else Decimal('1.00')
@@ -223,4 +356,6 @@ class EVMEngine:
                 'action_required'
             ])
 
-        logger.info(f"EVM Engine: Calculated variance for {len(snapshots_to_create) + len(snapshots_to_update)} tasks.")
+        calculated_count = len(snapshots_to_create) + len(snapshots_to_update)
+        logger.info(f"EVM Engine: Calculated variance for {calculated_count} tasks.")
+        return calculated_count

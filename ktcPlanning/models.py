@@ -1,6 +1,7 @@
 import uuid
 import uuid
 from django.db import models
+from django.utils import timezone
 from decimal import Decimal, ROUND_HALF_UP
 from django.core.exceptions import ValidationError
 from django.contrib.auth import get_user_model
@@ -28,6 +29,22 @@ BUDGET_STATUS_CHOICES = [
 # =========================================================
 
 class Project(models.Model):
+    LIFECYCLE_DRAFT = 'draft'
+    LIFECYCLE_PLANNING = 'planning'
+    LIFECYCLE_ACTIVE = 'active'
+    LIFECYCLE_ON_HOLD = 'on_hold'
+    LIFECYCLE_COMPLETED = 'completed'
+    LIFECYCLE_CANCELLED = 'cancelled'
+    LIFECYCLE_ARCHIVED = 'archived'
+    LIFECYCLE_CHOICES = [
+        (LIFECYCLE_DRAFT, 'Draft'),
+        (LIFECYCLE_PLANNING, 'Planning'),
+        (LIFECYCLE_ACTIVE, 'Active'),
+        (LIFECYCLE_ON_HOLD, 'On hold'),
+        (LIFECYCLE_COMPLETED, 'Completed'),
+        (LIFECYCLE_CANCELLED, 'Cancelled'),
+        (LIFECYCLE_ARCHIVED, 'Archived'),
+    ]
     SCOPE_CHOICES = [
         ('intra_unit', 'پروژهٔ درون‌واحدی'),
         ('company', 'پروژهٔ شرکتی'),
@@ -39,7 +56,29 @@ class Project(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     start_date = models.DateTimeField(null=True, blank=True)
     end_date = models.DateTimeField(null=True, blank=True)
+
     is_deleted = models.BooleanField(default=False)
+    lifecycle_status = models.CharField(
+        max_length=16, choices=LIFECYCLE_CHOICES, default=LIFECYCLE_DRAFT,
+    )
+    current_data_date = models.DateTimeField(null=True, blank=True)
+    active_baseline_revision = models.ForeignKey(
+        'Revision', null=True, blank=True, on_delete=models.PROTECT,
+        related_name='baseline_for_projects',
+    )
+    current_execution_revision = models.ForeignKey(
+        'Revision', null=True, blank=True, on_delete=models.PROTECT,
+        related_name='execution_for_projects',
+    )
+    current_forecast_revision = models.ForeignKey(
+        'Revision', null=True, blank=True, on_delete=models.PROTECT,
+        related_name='forecast_for_projects',
+    )
+    working_revision = models.ForeignKey(
+        'Revision', null=True, blank=True, on_delete=models.PROTECT,
+        related_name='working_for_projects',
+    )
+
 
     # دامنهٔ پروژه: شرکتی (تاییدِ نهایی با مدیر برنامه‌ریزی) یا درون‌واحدی
     scope = models.CharField(
@@ -88,6 +127,30 @@ class Project(models.Model):
 
     def clean(self):
         super().clean()
+        errors = {}
+        revision_fields = (
+            'active_baseline_revision',
+            'current_execution_revision',
+            'current_forecast_revision',
+            'working_revision',
+        )
+        for field_name in revision_fields:
+            revision = getattr(self, field_name, None)
+            if revision and (revision.project_id != self.pk or revision.is_deleted):
+                errors[field_name] = 'Revision must be an active revision of this project.'
+        if self.active_baseline_revision and not self.active_baseline_revision.is_baseline:
+            errors['active_baseline_revision'] = 'Active baseline must be marked as baseline.'
+        if self.working_revision and self.working_revision.approved_at is not None:
+            errors['working_revision'] = 'Working revision must be open.'
+        if self.lifecycle_status == self.LIFECYCLE_ACTIVE:
+            if not self.active_baseline_revision_id:
+                errors['active_baseline_revision'] = 'Active projects require an active baseline.'
+            if not self.current_execution_revision_id:
+                errors['current_execution_revision'] = 'Active projects require an execution revision.'
+            if not self.current_data_date:
+                errors['current_data_date'] = 'Active projects require a data date.'
+        if errors:
+            raise ValidationError(errors)
         if not self.parent_project_id:
             return
         if self.pk and self.parent_project_id == self.pk:
@@ -100,8 +163,11 @@ class Project(models.Model):
             ancestor = ancestor.parent_project
 
     def get_default_approver(self):
-        creator_unit = getattr(self.created_by, 'unit', None)
-        return getattr(creator_unit, 'manager', None) if creator_unit else None
+        if self.scope == 'company':
+            from .permissions import get_planning_manager
+            return get_planning_manager()
+        owner_unit = self.owner_unit or getattr(self.created_by, 'unit', None)
+        return getattr(owner_unit, 'manager', None) if owner_unit else None
 
 class UnitOfMeasure(models.Model):
     code = models.CharField(max_length=20, unique=True)   # HOUR, DAY, LITER
@@ -193,7 +259,9 @@ class Revision(models.Model):
 
     project_start=models.DateTimeField()
     project_end = models.DateTimeField(null=True, blank=True)
+
     is_deleted = models.BooleanField(default=False)
+
     class Meta:
         unique_together = [("project", "number")]
 
@@ -220,7 +288,9 @@ class WBSNodeVersion(MPTTModel):
     parent = TreeForeignKey("self",null=True,blank=True, on_delete=models.CASCADE,related_name="children")
     title = models.CharField(max_length=255)
     sequence = models.PositiveIntegerField(default=1)
+
     is_deleted = models.BooleanField(default=False)
+
     planned_start = models.DateTimeField(null=True, blank=True, verbose_name="Planned Start Date")
     planned_finish = models.DateTimeField(null=True, blank=True, verbose_name="Planned Finish Date")
     class MPTTMeta:
@@ -275,6 +345,15 @@ def create_revision_zero(sender, instance, created, **kwargs):
         )
 
         # ۲. ایجاد گره پایه WBS
+        Project.objects.filter(pk=instance.pk).update(
+            active_baseline_revision=revision,
+            current_execution_revision=revision,
+            current_forecast_revision=revision,
+            working_revision=revision,
+            current_data_date=instance.start_date or instance.created_at,
+            lifecycle_status=Project.LIFECYCLE_PLANNING,
+        )
+
         base_wbs_node = WBSNode.objects.create(project=instance)
 
         # ۳. ایجاد نسخه WBS برای Revision 0
@@ -311,7 +390,9 @@ class TaskVersion(models.Model):
     planned_finish = models.DateTimeField(null=True, blank=True)
     duration_hours = models.DecimalField(max_digits=10, decimal_places=2)
     description=models.TextField(null=True, blank=True)
+
     is_deleted = models.BooleanField(default=False)
+
     sequence = models.IntegerField(default=0, help_text="ترتیب نمایش در گانت‌چارت")
     class Meta:
         unique_together = [("task", "revision")]
@@ -917,7 +998,7 @@ class VarianceReport(models.Model):
     revision = models.ForeignKey('Revision', on_delete=models.CASCADE, related_name="variances")
 
     # تاریخ محاسبه (Data Date)
-    report_date = models.DateField(auto_now_add=True)
+    report_date = models.DateField(default=timezone.localdate)
 
     # مقادیر پایه EVM (بر اساس ساعت)
     budget_at_completion = models.DecimalField(max_digits=15, decimal_places=2, default=0)  # BAC
@@ -1345,7 +1426,7 @@ class BudgetAllocation(models.Model):
         if revision:
             version = versions.filter(revision=revision).first()
         else:
-            version = versions.order_by('-revision__number').first()
+            version = versions.filter(revision_id=self.project.current_execution_revision_id).first()
         return version.wbs_node if version else None
 
     def _validate_parent_scope(self):

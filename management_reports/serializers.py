@@ -18,14 +18,18 @@ class CuratedBottleneckSerializer(serializers.ModelSerializer):
     def get_task_name(self, obj):
         # اگر این گلوگاه به یک تسک وصل است، آخرین نام آن را پیدا کن
         if obj.task:
-            latest_tv = obj.task.versions.filter(is_deleted=False).order_by('-revision__number').first()
+            latest_tv = obj.task.versions.filter(
+                revision_id=obj.task.project.current_execution_revision_id, is_deleted=False
+            ).first()
             return latest_tv.title if latest_tv else "تسک نامشخص"
         return ""
 
     def get_wbs_node_name(self, obj):
         # پیدا کردن نام پوشه WBS
         if obj.task:
-            latest_tv = obj.task.versions.filter(is_deleted=False).order_by('-revision__number').select_related('wbs_node').first()
+            latest_tv = obj.task.versions.filter(
+                revision_id=obj.task.project.current_execution_revision_id, is_deleted=False
+            ).select_related('wbs_node').first()
             return latest_tv.wbs_node.title if (latest_tv and latest_tv.wbs_node) else "-"
         return ""
 

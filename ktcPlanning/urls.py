@@ -14,7 +14,19 @@ from .views import (
 )
 
 # ایجاد یک نمونه از روتور پیش‌فرض DRF
-router = DefaultRouter()
+class OptionalSlashRouter(DefaultRouter):
+    """Accept DRF endpoints with or without a trailing slash.
+
+    Some cached frontend bundles still call endpoints like
+    /api/planning/calendars?templates=true. Keeping both forms valid prevents
+    harmless trailing-slash differences from breaking active testers.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trailing_slash = '/?'
+
+
+router = OptionalSlashRouter()
 
 # ثبت ویوها در روتور
 router.register(r'projects', ProjectViewSet, basename='project')
