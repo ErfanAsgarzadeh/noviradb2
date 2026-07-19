@@ -10,7 +10,7 @@ from .views import (
     ResourceSkillMappingViewSet, ResourceViewSet, ResourceSkillViewSet, ResourceRoleViewSet, PersonalTaskViewSet,
     VarianceReportViewSet, CalendarViewSet, ProjectViewerViewSet, SystemSettingsView, ExpenseTypeViewSet,
     UnitOfMeasureViewSet, FundingSourceViewSet, BudgetAllocationViewSet, BudgetBorrowViewSet, UnfundedForecastCostViewSet,
-    CostTransactionViewSet, TaskViewSet, ResourceLevelingPlanViewSet
+    CostTransactionViewSet, TaskFinancialPlanViewSet, PaymentMilestoneViewSet, PaymentTransactionViewSet, TaskViewSet, ResourceLevelingPlanViewSet
 )
 
 # ایجاد یک نمونه از روتور پیش‌فرض DRF
@@ -58,6 +58,9 @@ router.register(r'budget-allocations', BudgetAllocationViewSet, basename='budget
 router.register(r'budget-borrows', BudgetBorrowViewSet, basename='budget-borrow')
 router.register(r'unfunded-forecast-costs', UnfundedForecastCostViewSet, basename='unfunded-forecast-cost')
 router.register(r'cost-transactions', CostTransactionViewSet, basename='cost-transaction')
+router.register(r'task-financial-plans', TaskFinancialPlanViewSet, basename='task-financial-plan')
+router.register(r'payment-milestones', PaymentMilestoneViewSet, basename='payment-milestone')
+router.register(r'payment-transactions', PaymentTransactionViewSet, basename='payment-transaction')
 router.register(r'tasks', TaskViewSet, basename='task')
 router.register(r'resource-leveling-plans', ResourceLevelingPlanViewSet, basename='resource-leveling-plan')
 # مسیرهای نهایی اپلیکیشن

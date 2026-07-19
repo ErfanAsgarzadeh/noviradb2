@@ -1735,6 +1735,194 @@ class BudgetConsumption(models.Model):
     def __str__(self):
         return f"{self.transaction_id} -> {self.budget_allocation_id}: {self.amount}"
 
+class TaskFinancialPlan(models.Model):
+    DIRECTION_PAYABLE = "payable"
+    DIRECTION_RECEIVABLE = "receivable"
+    DIRECTION_CHOICES = [
+        (DIRECTION_PAYABLE, "Payable"),
+        (DIRECTION_RECEIVABLE, "Receivable"),
+    ]
+
+    STATUS_DRAFT = "draft"
+    STATUS_ACTIVE = "active"
+    STATUS_SUSPENDED = "suspended"
+    STATUS_COMPLETED = "completed"
+    STATUS_CANCELLED = "cancelled"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_SUSPENDED, "Suspended"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_CANCELLED, "Cancelled"),
+    ]
+
+    task = models.ForeignKey(Task, on_delete=models.PROTECT, related_name="financial_plans")
+    direction = models.CharField(max_length=16, choices=DIRECTION_CHOICES)
+    contract_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    currency = models.CharField(max_length=8, default="IRR")
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    description = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_task_financial_plans")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["task_id", "-created_at"]
+        indexes = [models.Index(fields=["task", "status"]), models.Index(fields=["status"])]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(contract_amount__gt=0), name="task_financial_plan_amount_positive"),
+            models.UniqueConstraint(fields=["task"], condition=models.Q(status="active"), name="one_active_financial_plan_per_task"),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.contract_amount is not None and self.contract_amount <= 0:
+            raise ValidationError("Contract amount must be greater than zero.")
+
+    def __str__(self):
+        return f"{self.task_id} - {self.direction} - {self.contract_amount} {self.currency}"
+
+
+class PaymentMilestone(models.Model):
+    TRIGGER_BEFORE_START = "before_start"
+    TRIGGER_APPROVED_PROGRESS = "approved_progress"
+    TRIGGER_TASK_COMPLETION = "task_completion"
+    TRIGGER_BEFORE_DELIVERY = "before_delivery"
+    TRIGGER_FIXED_DATE = "fixed_date"
+    TRIGGER_MANUAL = "manual"
+    TRIGGER_CHOICES = [
+        (TRIGGER_BEFORE_START, "Before start"),
+        (TRIGGER_APPROVED_PROGRESS, "Approved progress"),
+        (TRIGGER_TASK_COMPLETION, "Task completion"),
+        (TRIGGER_BEFORE_DELIVERY, "Before delivery"),
+        (TRIGGER_FIXED_DATE, "Fixed date"),
+        (TRIGGER_MANUAL, "Manual"),
+    ]
+
+    AMOUNT_PERCENTAGE = "percentage"
+    AMOUNT_FIXED = "fixed"
+    AMOUNT_TYPE_CHOICES = [(AMOUNT_PERCENTAGE, "Percentage"), (AMOUNT_FIXED, "Fixed")]
+
+    STATUS_LOCKED = "locked"
+    STATUS_ELIGIBLE = "eligible"
+    STATUS_INVOICED = "invoiced"
+    STATUS_PARTIALLY_PAID = "partially_paid"
+    STATUS_PAID = "paid"
+    STATUS_OVERDUE = "overdue"
+    STATUS_CANCELLED = "cancelled"
+    STATUS_CHOICES = [
+        (STATUS_LOCKED, "Locked"),
+        (STATUS_ELIGIBLE, "Eligible"),
+        (STATUS_INVOICED, "Invoiced"),
+        (STATUS_PARTIALLY_PAID, "Partially paid"),
+        (STATUS_PAID, "Paid"),
+        (STATUS_OVERDUE, "Overdue"),
+        (STATUS_CANCELLED, "Cancelled"),
+    ]
+
+    financial_plan = models.ForeignKey(TaskFinancialPlan, on_delete=models.PROTECT, related_name="milestones")
+    title = models.CharField(max_length=255)
+    sequence = models.PositiveIntegerField()
+    trigger_type = models.CharField(max_length=32, choices=TRIGGER_CHOICES)
+    amount_type = models.CharField(max_length=16, choices=AMOUNT_TYPE_CHOICES)
+    percentage = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    fixed_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    progress_threshold = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    due_date = models.DateField(null=True, blank=True)
+    blocks_task_start = models.BooleanField(default=False)
+    blocks_task_delivery = models.BooleanField(default=False)
+    blocks_progress_after_threshold = models.BooleanField(default=False)
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=STATUS_LOCKED)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["financial_plan", "sequence", "id"]
+        indexes = [
+            models.Index(fields=["financial_plan", "status"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["due_date"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=["financial_plan", "sequence"], name="unique_financial_milestone_sequence"),
+            models.CheckConstraint(condition=models.Q(percentage__isnull=True) | (models.Q(percentage__gt=0) & models.Q(percentage__lte=100)), name="payment_milestone_percentage_range"),
+            models.CheckConstraint(condition=models.Q(progress_threshold__isnull=True) | (models.Q(progress_threshold__gte=0) & models.Q(progress_threshold__lte=100)), name="payment_milestone_progress_range"),
+            models.CheckConstraint(condition=models.Q(fixed_amount__isnull=True) | models.Q(fixed_amount__gt=0), name="payment_milestone_fixed_amount_positive"),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.amount_type == self.AMOUNT_PERCENTAGE:
+            if self.percentage is None:
+                raise ValidationError("Percentage is required for percentage milestones.")
+            if self.fixed_amount is not None:
+                raise ValidationError("Fixed amount must be empty for percentage milestones.")
+            if self.percentage <= 0 or self.percentage > 100:
+                raise ValidationError("Percentage must be greater than 0 and at most 100.")
+        elif self.amount_type == self.AMOUNT_FIXED:
+            if self.fixed_amount is None:
+                raise ValidationError("Fixed amount is required for fixed milestones.")
+            if self.percentage is not None:
+                raise ValidationError("Percentage must be empty for fixed milestones.")
+            if self.fixed_amount <= 0:
+                raise ValidationError("Fixed amount must be greater than zero.")
+        if self.trigger_type == self.TRIGGER_APPROVED_PROGRESS:
+            if self.progress_threshold is None:
+                raise ValidationError("Progress threshold is required for approved progress milestones.")
+            if self.progress_threshold < 0 or self.progress_threshold > 100:
+                raise ValidationError("Progress threshold must be between 0 and 100.")
+        if self.trigger_type == self.TRIGGER_FIXED_DATE and self.due_date is None:
+            raise ValidationError("Due date is required for fixed date milestones.")
+
+    @property
+    def has_transactions(self):
+        return self.transactions.exists()
+
+    def __str__(self):
+        return f"{self.financial_plan_id} / {self.sequence} - {self.title}"
+
+
+class PaymentTransaction(models.Model):
+    TYPE_PAYMENT = "payment"
+    TYPE_REFUND = "refund"
+    TYPE_ADJUSTMENT = "adjustment"
+    TRANSACTION_TYPE_CHOICES = [
+        (TYPE_PAYMENT, "Payment"),
+        (TYPE_REFUND, "Refund"),
+        (TYPE_ADJUSTMENT, "Adjustment"),
+    ]
+
+    milestone = models.ForeignKey(PaymentMilestone, on_delete=models.PROTECT, related_name="transactions")
+    transaction_type = models.CharField(max_length=16, choices=TRANSACTION_TYPE_CHOICES)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    transaction_date = models.DateField()
+    reference_number = models.CharField(max_length=100, blank=True)
+    description = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_payment_transactions")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-transaction_date", "-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["milestone", "transaction_date"]),
+            models.Index(fields=["transaction_date"]),
+            models.Index(fields=["transaction_type"]),
+        ]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(transaction_type="adjustment") | models.Q(amount__gt=0), name="payment_refund_amount_positive"),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.transaction_type in {self.TYPE_PAYMENT, self.TYPE_REFUND} and self.amount <= 0:
+            raise ValidationError("Payment and refund amounts must be greater than zero.")
+        if self.transaction_type == self.TYPE_ADJUSTMENT and self.amount == 0:
+            raise ValidationError("Adjustment amount cannot be zero.")
+
+    def __str__(self):
+        return f"{self.milestone_id} - {self.transaction_type} - {self.amount}"
+
 
 class BudgetBorrow(models.Model):
     BORROW_STATUS_CHOICES = [

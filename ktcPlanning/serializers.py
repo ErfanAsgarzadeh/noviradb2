@@ -1,12 +1,14 @@
 # ktcPlanning/serializers.py
 from rest_framework import serializers
 from django.db.models import Sum
+from decimal import Decimal
 
 from .models import *
+from .financial_services import get_task_financial_status, milestone_amount, milestone_paid_amount, milestone_outstanding
 
 
 # =========================================================
-# CALENDAR SERIALIZERS (تعریف تقویم مستقل + ساعات کاری + تعطیلات)
+# CALENDAR SERIALIZERS (طھط¹ط±غŒظپ طھظ‚ظˆغŒظ… ظ…ط³طھظ‚ظ„ + ط³ط§ط¹ط§طھ ع©ط§ط±غŒ + طھط¹ط·غŒظ„ط§طھ)
 # =========================================================
 
 class WorkingIntervalSerializer(serializers.ModelSerializer):
@@ -48,13 +50,13 @@ class CalendarSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
         instance.save()
 
-        # جایگزینی کامل ساعات کاری در صورت ارسال
+        # ط¬ط§غŒع¯ط²غŒظ†غŒ ع©ط§ظ…ظ„ ط³ط§ط¹ط§طھ ع©ط§ط±غŒ ط¯ط± طµظˆط±طھ ط§ط±ط³ط§ظ„
         if intervals_data is not None:
             instance.intervals.all().delete()
             for iv in intervals_data:
                 WorkingInterval.objects.create(calendar=instance, **iv)
 
-        # جایگزینی کامل تعطیلات در صورت ارسال
+        # ط¬ط§غŒع¯ط²غŒظ†غŒ ع©ط§ظ…ظ„ طھط¹ط·غŒظ„ط§طھ ط¯ط± طµظˆط±طھ ط§ط±ط³ط§ظ„
         if exceptions_data is not None:
             instance.exceptions.all().delete()
             for ex in exceptions_data:
@@ -208,7 +210,7 @@ class RevisionSerializer(serializers.ModelSerializer):
     createdAt = serializers.DateTimeField(source='created_at', format="%Y-%m-%dT%H:%M:%S")
     approvedAt = serializers.DateTimeField(source='approved_at', format="%Y-%m-%dT%H:%M:%S")
     isBaseline = serializers.BooleanField(source='is_baseline')
-    # تاییدکننده‌ی تعیین‌شده — User از models.py در namespace هست (User = get_user_model())
+    # طھط§غŒغŒط¯ع©ظ†ظ†ط¯ظ‡â€ŒغŒ طھط¹غŒغŒظ†â€Œط´ط¯ظ‡ â€” User ط§ط² models.py ط¯ط± namespace ظ‡ط³طھ (User = get_user_model())
     designatedApproverId = serializers.PrimaryKeyRelatedField(
         source='designated_approver', queryset=User.objects.all(),
         required=False, allow_null=True
@@ -306,13 +308,13 @@ class ActivityNodeSerializer(serializers.ModelSerializer):
     startDate = serializers.DateTimeField(source='planned_start', format="%Y-%m-%d %H:%M:%S", allow_null=True)
     endDate = serializers.DateTimeField(source='planned_finish', format="%Y-%m-%d %H:%M:%S", allow_null=True)
 
-    # تغییر مهم: فیلد duration حالا می‌تواند از فرانت‌اند دریافت شود
+    # طھط؛غŒغŒط± ظ…ظ‡ظ…: ظپغŒظ„ط¯ duration ط­ط§ظ„ط§ ظ…غŒâ€Œطھظˆط§ظ†ط¯ ط§ط² ظپط±ط§ظ†طھâ€Œط§ظ†ط¯ ط¯ط±غŒط§ظپطھ ط´ظˆط¯
     duration = serializers.FloatField(required=False, write_only=True)
 
     progress = serializers.FloatField(required=False)
     sequence = serializers.IntegerField(required=False)
     
-    # فیلدهای Actual (شروع/پایان واقعی) - write_only چون در to_representation جداگانه هندل می‌شوند
+    # ظپغŒظ„ط¯ظ‡ط§غŒ Actual (ط´ط±ظˆط¹/ظ¾ط§غŒط§ظ† ظˆط§ظ‚ط¹غŒ) - write_only ع†ظˆظ† ط¯ط± to_representation ط¬ط¯ط§ع¯ط§ظ†ظ‡ ظ‡ظ†ط¯ظ„ ظ…غŒâ€Œط´ظˆظ†ط¯
     actual_start = serializers.DateTimeField(required=False, write_only=True, allow_null=True)
     actual_finish = serializers.DateTimeField(required=False, write_only=True, allow_null=True)
     
@@ -321,6 +323,7 @@ class ActivityNodeSerializer(serializers.ModelSerializer):
     constraintDate = serializers.SerializerMethodField()
     notes = serializers.SerializerMethodField()
     metrics = TaskScheduleMetricsSerializer(read_only=True, allow_null=True)
+    scheduleQuality = serializers.SerializerMethodField()
     description=serializers.CharField(required=False)
     weight = serializers.FloatField(required=False)
     class Meta:
@@ -328,14 +331,29 @@ class ActivityNodeSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'code', 'name', 'parentId', 'type', 'startDate', 'endDate',
             'duration', 'progress', 'sequence', 'actual_start', 'actual_finish',
-            'resources', 'constraintType', 'constraintDate', 'notes','metrics','description','weight'
+            'resources', 'constraintType', 'constraintDate', 'notes','metrics','scheduleQuality','description','weight'
         ]
 
     def get_parentId(self, obj):
-        # بررسی می‌کنیم که تسک به کدام ورژن WBS وصل است،
-        # سپس UUID گره اصلی آن WBS را به فرانت‌اند می‌فرستیم
+        # ط¨ط±ط±ط³غŒ ظ…غŒâ€Œع©ظ†غŒظ… ع©ظ‡ طھط³ع© ط¨ظ‡ ع©ط¯ط§ظ… ظˆط±عکظ† WBS ظˆطµظ„ ط§ط³طھطŒ
+        # ط³ظ¾ط³ UUID ع¯ط±ظ‡ ط§طµظ„غŒ ط¢ظ† WBS ط±ط§ ط¨ظ‡ ظپط±ط§ظ†طھâ€Œط§ظ†ط¯ ظ…غŒâ€Œظپط±ط³طھغŒظ…
         return obj.wbs_node.node.id if obj.wbs_node else None
-    # --- تبدیل دیتا هنگام ارسال به فرانت‌اند (ساعت به روز) ---
+
+    def get_scheduleQuality(self, obj):
+        actual = getattr(obj, 'actual', None)
+        progress = float(actual.progress or 0) if actual else 0
+        is_completed = bool(actual and (actual.actual_finish is not None or progress >= 100))
+        quality = getattr(obj, '_schedule_quality', None)
+        if quality:
+            return quality
+        return {
+            'isCompleted': is_completed,
+            'isOpenEnd': False,
+            'definesProjectFinish': False,
+            'severity': 'done' if is_completed else 'ok',
+            'message': 'Actualized task; not counted as remaining critical work.' if is_completed else '',
+        }
+    # --- طھط¨ط¯غŒظ„ ط¯غŒطھط§ ظ‡ظ†ع¯ط§ظ… ط§ط±ط³ط§ظ„ ط¨ظ‡ ظپط±ط§ظ†طھâ€Œط§ظ†ط¯ (ط³ط§ط¹طھ ط¨ظ‡ ط±ظˆط²) ---
 
 
     def to_representation(self, instance):
@@ -344,7 +362,7 @@ class ActivityNodeSerializer(serializers.ModelSerializer):
         actual = getattr(instance, 'actual', None)
         data['progress'] = float(actual.progress) if actual else 0
 
-        # اطلاعات واقعی برای نمایش در فرانت‌اند
+        # ط§ط·ظ„ط§ط¹ط§طھ ظˆط§ظ‚ط¹غŒ ط¨ط±ط§غŒ ظ†ظ…ط§غŒط´ ط¯ط± ظپط±ط§ظ†طھâ€Œط§ظ†ط¯
         data['actual'] = {
             'actualStart': actual.actual_start.strftime("%Y-%m-%dT%H:%M") if (actual and actual.actual_start) else '',
             'actualFinish': actual.actual_finish.strftime("%Y-%m-%dT%H:%M") if (actual and actual.actual_finish) else '',
@@ -353,12 +371,12 @@ class ActivityNodeSerializer(serializers.ModelSerializer):
 
         data['duration'] = float(instance.duration_hours) if instance.duration_hours else 0
         return data
-    # --- تبدیل دیتا هنگام دریافت از فرانت‌اند (روز به ساعت) ---
+    # --- طھط¨ط¯غŒظ„ ط¯غŒطھط§ ظ‡ظ†ع¯ط§ظ… ط¯ط±غŒط§ظپطھ ط§ط² ظپط±ط§ظ†طھâ€Œط§ظ†ط¯ (ط±ظˆط² ط¨ظ‡ ط³ط§ط¹طھ) ---
     def validate(self, attrs):
         if 'duration' in attrs:
             attrs['duration_hours'] = attrs.pop('duration')
-        elif not self.instance:  # اگر ساخت تسک جدید بود و مقداری نیامد
-            attrs['duration_hours'] = 40.0  # دیفالت 5 روز
+        elif not self.instance:  # ط§ع¯ط± ط³ط§ط®طھ طھط³ع© ط¬ط¯غŒط¯ ط¨ظˆط¯ ظˆ ظ…ظ‚ط¯ط§ط±غŒ ظ†غŒط§ظ…ط¯
+            attrs['duration_hours'] = 40.0  # ط¯غŒظپط§ظ„طھ 5 ط±ظˆط²
         return attrs
 
     def get_type(self, obj):
@@ -378,8 +396,8 @@ class ActivityNodeSerializer(serializers.ModelSerializer):
             return [assign.resource.name for assign in prefetched_assignments]
 
         assignments = Assignment.objects.filter(task=obj.task, revision=obj.revision)
-        # به جای برگرداندن یک آبجکت دارای نام و آیدی، فقط نام منابع را به صورت متن ساده برمی‌گردانیم
-        # خروجی به این شکل می‌شود: ['Ali', 'Crane', 'Excavator']
+        # ط¨ظ‡ ط¬ط§غŒ ط¨ط±ع¯ط±ط¯ط§ظ†ط¯ظ† غŒع© ط¢ط¨ط¬ع©طھ ط¯ط§ط±ط§غŒ ظ†ط§ظ… ظˆ ط¢غŒط¯غŒطŒ ظپظ‚ط· ظ†ط§ظ… ظ…ظ†ط§ط¨ط¹ ط±ط§ ط¨ظ‡ طµظˆط±طھ ظ…طھظ† ط³ط§ط¯ظ‡ ط¨ط±ظ…غŒâ€Œع¯ط±ط¯ط§ظ†غŒظ…
+        # ط®ط±ظˆط¬غŒ ط¨ظ‡ ط§غŒظ† ط´ع©ظ„ ظ…غŒâ€Œط´ظˆط¯: ['Ali', 'Crane', 'Excavator']
         return [assign.resource.name for assign in assignments]
 
     def get_constraintType(self, obj):
@@ -396,9 +414,18 @@ class ActivityNodeSerializer(serializers.ModelSerializer):
         actual_start = validated_data.pop('actual_start', None)
         actual_finish = validated_data.pop('actual_finish', None)
 
+        from .financial_services import validate_progress_transition, validate_task_delivery, validate_task_start
+
+        if actual_start is not None:
+            validate_task_start(instance.task)
+        if progress is not None:
+            validate_progress_transition(instance.task, progress)
+        if actual_finish is not None or (progress is not None and progress >= 100):
+            validate_task_delivery(instance.task)
+
         instance = super().update(instance, validated_data)
 
-        # اگر هر یک از فیلدهای actual ارسال شده باشد، TaskActual را آپدیت کن
+        # ط§ع¯ط± ظ‡ط± غŒع© ط§ط² ظپغŒظ„ط¯ظ‡ط§غŒ actual ط§ط±ط³ط§ظ„ ط´ط¯ظ‡ ط¨ط§ط´ط¯طŒ TaskActual ط±ط§ ط¢ظ¾ط¯غŒطھ ع©ظ†
         if progress is not None or actual_start is not None or actual_finish is not None:
             actual, _ = TaskActual.objects.get_or_create(
                 task_version=instance,
@@ -408,10 +435,16 @@ class ActivityNodeSerializer(serializers.ModelSerializer):
             )
             if progress is not None:
                 actual.progress = progress
-            if actual_start is not None:
-                actual.actual_start = actual_start
-            if actual_finish is not None:
-                actual.actual_finish = actual_finish
+                if float(progress) <= 0:
+                    # Progress 0 means the task has no actual execution yet.
+                    # Clear actual dates to keep CPM/EVM variance calculations clean.
+                    actual.actual_start = None
+                    actual.actual_finish = None
+            if progress is None or float(progress) > 0:
+                if actual_start is not None:
+                    actual.actual_start = actual_start
+                if actual_finish is not None:
+                    actual.actual_finish = actual_finish
             actual.updated_by = self.context['request'].user
             actual.save()
 
@@ -587,13 +620,13 @@ class TaskReportLogSerializer(serializers.ModelSerializer):
             'notes',
             'blockers',
             'timestamp',
-            # فیلدهای state machine (دو‌مرحله‌ای)
+            # ظپغŒظ„ط¯ظ‡ط§غŒ state machine (ط¯ظˆâ€Œظ…ط±ط­ظ„ظ‡â€Œط§غŒ)
             'approval_status',
             'reviewer_approved_by',
             'reviewer_approved_at',
             'final_approved_by',
             'final_approved_at',
-            # legacy (سازگاری تا فرانت‌اند به‌روزرسانی شود)
+            # legacy (ط³ط§ط²ع¯ط§ط±غŒ طھط§ ظپط±ط§ظ†طھâ€Œط§ظ†ط¯ ط¨ظ‡â€Œط±ظˆط²ط±ط³ط§ظ†غŒ ط´ظˆط¯)
             'is_approved',
             'approved_by',
             'approved_at',
@@ -717,7 +750,7 @@ class ResourceSkillSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class ResourceSerializer(serializers.ModelSerializer):
-    # برای اینکه اسم فیلدها در فرانت‌اند راحت‌تر مپ شود
+    # ط¨ط±ط§غŒ ط§غŒظ†ع©ظ‡ ط§ط³ظ… ظپغŒظ„ط¯ظ‡ط§ ط¯ط± ظپط±ط§ظ†طھâ€Œط§ظ†ط¯ ط±ط§ط­طھâ€Œطھط± ظ…ظ¾ ط´ظˆط¯
     resourceType = serializers.CharField(source='resource_type', required=False)
     poolId = serializers.PrimaryKeyRelatedField(source='pool', queryset=ResourcePool.objects.all(), required=False, allow_null=True)
     roleId = serializers.PrimaryKeyRelatedField(source='role', queryset=ResourceRole.objects.all(), required=False, allow_null=True)
@@ -729,7 +762,7 @@ class ResourceSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'code', 'name', 'resource_type', 'pool', 'role',
             'max_units', 'priority', 'is_active',
-            # فیلدهای هم‌نام برای فرانت‌اند:
+            # ظپغŒظ„ط¯ظ‡ط§غŒ ظ‡ظ…â€Œظ†ط§ظ… ط¨ط±ط§غŒ ظپط±ط§ظ†طھâ€Œط§ظ†ط¯:
             'resourceType', 'poolId', 'roleId', 'maxUnits', 'isActive'
         ]
 
@@ -804,7 +837,7 @@ class AssignmentSerializer(serializers.ModelSerializer):
     actualHours = serializers.DecimalField(source='actual_hours', max_digits=10, decimal_places=2, required=False,
                                            default=0)
 
-    # ── فیلدهای نمایشی جدید ──────────────────────────────────────────────────
+    # â”€â”€ ظپغŒظ„ط¯ظ‡ط§غŒ ظ†ظ…ط§غŒط´غŒ ط¬ط¯غŒط¯ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     resource_name = serializers.CharField(source='resource.name', read_only=True)
     resource_type = serializers.CharField(source='resource.resource_type', read_only=True)
 
@@ -818,7 +851,7 @@ class AssignmentSerializer(serializers.ModelSerializer):
             'unitsPercent',
             'plannedHours',
             'actualHours',
-            # نمایشی
+            # ظ†ظ…ط§غŒط´غŒ
             'resource_name',
             'resource_type',
         ]
@@ -833,18 +866,18 @@ class VarianceReportSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
     def get_task_name(self, obj):
-        # پیدا کردن عنوان تسک در همان ریویژنی که گزارش برای آن ثبت شده
+        # ظ¾غŒط¯ط§ ع©ط±ط¯ظ† ط¹ظ†ظˆط§ظ† طھط³ع© ط¯ط± ظ‡ظ…ط§ظ† ط±غŒظˆغŒعکظ†غŒ ع©ظ‡ ع¯ط²ط§ط±ط´ ط¨ط±ط§غŒ ط¢ظ† ط«ط¨طھ ط´ط¯ظ‡
         tv = obj.task.versions.filter(revision=obj.revision).first()
-        return tv.title if tv else "تسک نامشخص"
+        return tv.title if tv else "طھط³ع© ظ†ط§ظ…ط´ط®طµ"
 
     def get_task_code(self, obj):
-        # استخراج کد WBS برای این تسک
+        # ط§ط³طھط®ط±ط§ط¬ ع©ط¯ WBS ط¨ط±ط§غŒ ط§غŒظ† طھط³ع©
         tv = obj.task.versions.filter(revision=obj.revision).first()
         return tv.wbs_node.wbs_code if (tv and hasattr(tv, 'wbs_node')) else "N/A"
 
 
 
-# ─── SystemSettings Serializer ────────────────────────────────────────────────
+# â”€â”€â”€ SystemSettings Serializer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class SystemSettingsSerializer(serializers.ModelSerializer):
     allowPlanningManagerBypassReviewer = serializers.BooleanField(
@@ -866,7 +899,7 @@ class ExpenseTypeSerializer(serializers.ModelSerializer):
         model = ExpenseType
         fields = ['id', 'name', 'description', 'is_active', 'unit']
 
-# ─── جایگزین کن این بلاک را در serializers.py ───────────────────────────────
+# â”€â”€â”€ ط¬ط§غŒع¯ط²غŒظ† ع©ظ† ط§غŒظ† ط¨ظ„ط§ع© ط±ط§ ط¯ط± serializers.py â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class FundingSourceSerializer(serializers.ModelSerializer):
     allocated_amount = serializers.DecimalField(max_digits=18, decimal_places=2, read_only=True)
@@ -1329,12 +1362,12 @@ class UnfundedForecastCostSerializer(serializers.ModelSerializer):
 
 
 class CostTransactionSerializer(serializers.ModelSerializer):
-    # فیلدهای read-only که بکند محاسبه می‌کند
+    # ظپغŒظ„ط¯ظ‡ط§غŒ read-only ع©ظ‡ ط¨ع©ظ†ط¯ ظ…ط­ط§ط³ط¨ظ‡ ظ…غŒâ€Œع©ظ†ط¯
     amount = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
     created_by = serializers.PrimaryKeyRelatedField(read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
 
-    # نمایش نام منبع انتخابی برای خواندن آسان در فرانت
+    # ظ†ظ…ط§غŒط´ ظ†ط§ظ… ظ…ظ†ط¨ط¹ ط§ظ†طھط®ط§ط¨غŒ ط¨ط±ط§غŒ ط®ظˆط§ظ†ط¯ظ† ط¢ط³ط§ظ† ط¯ط± ظپط±ط§ظ†طھ
     resource_name = serializers.CharField(source='resource.name', read_only=True, default=None)
     expense_type_name = serializers.CharField(source='expense_type.name', read_only=True, default=None)
     task_title = serializers.SerializerMethodField()
@@ -1348,20 +1381,20 @@ class CostTransactionSerializer(serializers.ModelSerializer):
             'revision',
             'task',
             'assignment',
-            'resource_rate',   # FK — برای non-EXPENSE اجباری
-            'resource',        # FK — اختیاری (خوانده می‌شود از resource_rate.resource در clean)
-            'expense_type',    # FK — برای EXPENSE اجباری
+            'resource_rate',   # FK â€” ط¨ط±ط§غŒ non-EXPENSE ط§ط¬ط¨ط§ط±غŒ
+            'resource',        # FK â€” ط§ط®طھغŒط§ط±غŒ (ط®ظˆط§ظ†ط¯ظ‡ ظ…غŒâ€Œط´ظˆط¯ ط§ط² resource_rate.resource ط¯ط± clean)
+            'expense_type',    # FK â€” ط¨ط±ط§غŒ EXPENSE ط§ط¬ط¨ط§ط±غŒ
             'budget_allocation',
             'transaction_type',
             'transaction_date',
             'quantity',
-            'unit_rate',       # برای non-EXPENSE
-            'expense_rate',    # برای EXPENSE
-            'amount',          # read-only، محاسبه‌شده در save()
+            'unit_rate',       # ط¨ط±ط§غŒ non-EXPENSE
+            'expense_rate',    # ط¨ط±ط§غŒ EXPENSE
+            'amount',          # read-onlyطŒ ظ…ط­ط§ط³ط¨ظ‡â€Œط´ط¯ظ‡ ط¯ط± save()
             'description',
             'created_by',
             'created_at',
-            # فیلدهای کمکی نمایشی (read-only)
+            # ظپغŒظ„ط¯ظ‡ط§غŒ ع©ظ…ع©غŒ ظ†ظ…ط§غŒط´غŒ (read-only)
             'resource_name',
             'expense_type_name',
             'task_title',
@@ -1435,6 +1468,129 @@ class CostTransactionSerializer(serializers.ModelSerializer):
 
         return attrs
 
+
+class PaymentTransactionSerializer(serializers.ModelSerializer):
+    created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    created_at = serializers.DateTimeField(read_only=True)
+
+    class Meta:
+        model = PaymentTransaction
+        fields = ['id', 'milestone', 'transaction_type', 'amount', 'transaction_date', 'reference_number', 'description', 'created_by', 'created_at']
+        read_only_fields = ['id', 'created_by', 'created_at']
+
+    def validate(self, attrs):
+        instance = self.instance
+        transaction_type = attrs.get('transaction_type', getattr(instance, 'transaction_type', None))
+        amount = attrs.get('amount', getattr(instance, 'amount', None))
+        if transaction_type in {PaymentTransaction.TYPE_PAYMENT, PaymentTransaction.TYPE_REFUND} and amount is not None and amount <= 0:
+            raise serializers.ValidationError({'amount': 'Payment and refund amounts must be greater than zero.'})
+        if transaction_type == PaymentTransaction.TYPE_ADJUSTMENT and amount == 0:
+            raise serializers.ValidationError({'amount': 'Adjustment amount cannot be zero.'})
+        return attrs
+
+
+class PaymentMilestoneSerializer(serializers.ModelSerializer):
+    calculated_amount = serializers.SerializerMethodField()
+    paid_amount = serializers.SerializerMethodField()
+    outstanding = serializers.SerializerMethodField()
+    transactions = PaymentTransactionSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = PaymentMilestone
+        fields = [
+            'id', 'financial_plan', 'title', 'sequence', 'trigger_type', 'amount_type',
+            'percentage', 'fixed_amount', 'progress_threshold', 'due_date',
+            'blocks_task_start', 'blocks_task_delivery', 'blocks_progress_after_threshold',
+            'status', 'description', 'calculated_amount', 'paid_amount', 'outstanding',
+            'transactions', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['status', 'calculated_amount', 'paid_amount', 'outstanding', 'transactions', 'created_at', 'updated_at']
+
+    def get_calculated_amount(self, obj):
+        return str(milestone_amount(obj))
+
+    def get_paid_amount(self, obj):
+        return str(milestone_paid_amount(obj))
+
+    def get_outstanding(self, obj):
+        return str(milestone_outstanding(obj))
+
+    def validate(self, attrs):
+        instance = self.instance
+        financial_plan = attrs.get('financial_plan', getattr(instance, 'financial_plan', None))
+        sequence = attrs.get('sequence', getattr(instance, 'sequence', None))
+        amount_type = attrs.get('amount_type', getattr(instance, 'amount_type', None))
+        percentage = attrs.get('percentage', getattr(instance, 'percentage', None))
+        fixed_amount = attrs.get('fixed_amount', getattr(instance, 'fixed_amount', None))
+        trigger_type = attrs.get('trigger_type', getattr(instance, 'trigger_type', None))
+        progress_threshold = attrs.get('progress_threshold', getattr(instance, 'progress_threshold', None))
+        due_date = attrs.get('due_date', getattr(instance, 'due_date', None))
+        if financial_plan and sequence is not None:
+            duplicate_sequence = financial_plan.milestones.filter(sequence=sequence)
+            if instance:
+                duplicate_sequence = duplicate_sequence.exclude(pk=instance.pk)
+            if duplicate_sequence.exists():
+                raise serializers.ValidationError({'sequence': 'This sequence is already used in this financial plan. Use the next available number.'})
+        if instance and instance.transactions.exists() and {'amount_type', 'percentage', 'fixed_amount', 'financial_plan'}.intersection(attrs.keys()):
+            raise serializers.ValidationError({'milestone': 'Milestone with transactions cannot change financial amount fields.'})
+        if amount_type == PaymentMilestone.AMOUNT_PERCENTAGE:
+            if percentage is None:
+                raise serializers.ValidationError({'percentage': 'Percentage is required.'})
+            if fixed_amount is not None:
+                raise serializers.ValidationError({'fixed_amount': 'Fixed amount must be empty for percentage milestones.'})
+            if percentage <= 0 or percentage > 100:
+                raise serializers.ValidationError({'percentage': 'Percentage must be > 0 and <= 100.'})
+        elif amount_type == PaymentMilestone.AMOUNT_FIXED:
+            if fixed_amount is None:
+                raise serializers.ValidationError({'fixed_amount': 'Fixed amount is required.'})
+            if percentage is not None:
+                raise serializers.ValidationError({'percentage': 'Percentage must be empty for fixed milestones.'})
+            if fixed_amount <= 0:
+                raise serializers.ValidationError({'fixed_amount': 'Fixed amount must be greater than zero.'})
+        if financial_plan and amount_type == PaymentMilestone.AMOUNT_PERCENTAGE:
+            existing_total = financial_plan.milestones.filter(amount_type=PaymentMilestone.AMOUNT_PERCENTAGE)
+            if instance:
+                existing_total = existing_total.exclude(pk=instance.pk)
+            existing_total = existing_total.aggregate(total=Sum('percentage'))['total'] or Decimal('0')
+            if existing_total + percentage > Decimal('100'):
+                raise serializers.ValidationError({'percentage': 'Percentage milestones cannot exceed 100% of the plan.'})
+        if trigger_type == PaymentMilestone.TRIGGER_APPROVED_PROGRESS and progress_threshold is None:
+            raise serializers.ValidationError({'progress_threshold': 'Progress threshold is required.'})
+        if progress_threshold is not None and (progress_threshold < 0 or progress_threshold > 100):
+            raise serializers.ValidationError({'progress_threshold': 'Progress threshold must be between 0 and 100.'})
+        if trigger_type == PaymentMilestone.TRIGGER_FIXED_DATE and due_date is None:
+            raise serializers.ValidationError({'due_date': 'Due date is required.'})
+        return attrs
+
+
+class TaskFinancialPlanSerializer(serializers.ModelSerializer):
+    milestones = PaymentMilestoneSerializer(many=True, read_only=True)
+    financial_status = serializers.SerializerMethodField()
+    created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = TaskFinancialPlan
+        fields = [
+            'id', 'task', 'direction', 'contract_amount', 'currency', 'status',
+            'description', 'created_by', 'created_at', 'updated_at', 'milestones', 'financial_status',
+        ]
+        read_only_fields = ['id', 'created_by', 'created_at', 'updated_at', 'financial_status']
+
+    def get_financial_status(self, obj):
+        if obj.status == TaskFinancialPlan.STATUS_ACTIVE:
+            return get_task_financial_status(obj.task)
+        return None
+
+    def validate_contract_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('Contract amount must be greater than zero.')
+        return value
+
+    def validate(self, attrs):
+        status = attrs.get('status', getattr(self.instance, 'status', TaskFinancialPlan.STATUS_DRAFT))
+        if status == TaskFinancialPlan.STATUS_ACTIVE:
+            raise serializers.ValidationError({'status': 'Create or update the plan as draft, add milestones, then use activate.'})
+        return attrs
 class TaskDropdownSerializer(serializers.ModelSerializer):
     name = serializers.SerializerMethodField()
     code = serializers.SerializerMethodField()
@@ -1512,3 +1668,6 @@ class ResourceLevelingPlanSerializer(serializers.ModelSerializer):
 
     def get_resourceCount(self, obj):
         return obj.resource_usages.values("resource_id").distinct().count()
+
+
+

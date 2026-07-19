@@ -492,6 +492,14 @@ class CPMEngine:
         succ = self.nodes[edge.to_task_id]
         lag = edge.lag_hours
 
+        # Remaining-work scheduling rule:
+        # If the successor is already completed while the predecessor is not,
+        # the relation is out-of-sequence history. It must not pull unfinished
+        # predecessor late dates back into the past and create artificial
+        # negative float.
+        if succ.is_completed and not pred.is_completed:
+            return None
+
         if edge.dep_type == "FS":
             base = succ.late_start
             if base is None:
@@ -540,6 +548,11 @@ class CPMEngine:
         pred = self.nodes[edge.from_task_id]
         succ = self.nodes[edge.to_task_id]
         lag = edge.lag_hours
+
+        # Out-of-sequence completed successors are historical evidence, not
+        # remaining-work free-float constraints.
+        if succ.is_completed and not pred.is_completed:
+            return None
 
         if edge.dep_type == "FS":
             if pred.early_finish is None or succ.early_start is None:
@@ -736,7 +749,7 @@ class CPMEngine:
             if node.is_completed:
                 node.total_float_hours = 0
                 node.free_float_hours = 0
-                node.is_critical = True  # تسک‌های انجام‌شده روی مسیر واقعی هستند
+                node.is_critical = False  # actualized history; not remaining critical work
                 continue
 
             node.is_critical = node.total_float_hours <= 0
@@ -777,8 +790,10 @@ class CPMEngine:
             if node.early_start is None or node.early_finish is None:
                 continue
 
-            # آپدیت planned_start/finish در TaskVersion
-            tv_updates.append((node.tv_id, node.early_start, node.early_finish))
+            # Update planned_start/finish only for remaining/replanned work.
+            # Completed tasks keep their original planned dates so schedule variance remains measurable.
+            if not node.is_completed:
+                tv_updates.append((node.tv_id, node.early_start, node.early_finish))
 
             # ذخیره metrics
             ls = node.late_start or node.early_start

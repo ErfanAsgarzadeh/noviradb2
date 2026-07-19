@@ -20,11 +20,11 @@ from collections import defaultdict
 from rest_framework.views import APIView
 
 from .cpm import CPMCycleError, CPMEngine
-# ایمپورت تمامی مدل‌های مورد نیاز
+# ط§غŒظ…ظ¾ظˆط±طھ طھظ…ط§ظ…غŒ ظ…ط¯ظ„â€Œظ‡ط§غŒ ظ…ظˆط±ط¯ ظ†غŒط§ط²
 from .models import Project, Revision, WBSNodeVersion, TaskVersion, Dependency, SubprojectDependency, TaskRole, Task, WBSNode, TaskReportLog, \
     TaskActual, TaskChatMessage, Assignment, Resource, ResourcePool, ResourceRole, ResourceSkill, ResourceSkillMapping, \
     ResourceException, ResourceRate, VarianceReport, Calendar, ProjectViewer, SystemSettings, UnitOfMeasure, \
-    ExpenseType, FundingSource, BudgetAllocation, BudgetBorrow, UnfundedForecastCost, CostTransaction, TaskReportAttachment, BudgetConsumption, \
+    ExpenseType, FundingSource, BudgetAllocation, BudgetBorrow, UnfundedForecastCost, CostTransaction, TaskReportAttachment, BudgetConsumption, TaskFinancialPlan, PaymentMilestone, PaymentTransaction, \
     GlobalLevelingRun, LevelingPlanProject, TaskLevelingMetrics, ResourceUsage
 from .serializers import (
     ProjectSerializer,
@@ -39,7 +39,7 @@ from .serializers import (
     ResourceExceptionSerializer, ResourceRateSerializer, AssignmentSerializer, VarianceReportSerializer,
     CalendarSerializer, ProjectViewerSerializer, SystemSettingsSerializer, UnitOfMeasureSerializer,
     ExpenseTypeSerializer, FundingSourceSerializer, BudgetAllocationSerializer, BudgetBorrowSerializer, UnfundedForecastCostSerializer,
-    CostTransactionSerializer, TaskDropdownSerializer, ResourceLevelingPlanSerializer
+    CostTransactionSerializer, TaskDropdownSerializer, ResourceLevelingPlanSerializer, TaskFinancialPlanSerializer, PaymentMilestoneSerializer, PaymentTransactionSerializer
 )
 
 
@@ -68,6 +68,7 @@ from .msp_exporter import export_revision_to_msp_xml
 from django.db.models import Max
 
 from .variance_engine import EVMEngine
+from .financial_services import activate_plan, get_task_financial_status, register_transaction, validate_progress_transition, validate_task_delivery, validate_task_start
 from .permissions import (
     can_create_project, can_edit_project, require_can_create_project,
     require_can_edit_project, is_company_level, is_system_admin,
@@ -411,31 +412,31 @@ def log_budget_audit(request, action, target, old=None, extra=None):
 
 def check_revision_is_open(revision, user=None):
     """
-    گارد ترکیبی برای ویرایش زمان‌بندی:
-    1) نسخه نباید قفل (approved) باشد.
-    2) اگر کاربر داده شود، باید مجوز ویرایش پروژه را داشته باشد.
+    ع¯ط§ط±ط¯ طھط±ع©غŒط¨غŒ ط¨ط±ط§غŒ ظˆغŒط±ط§غŒط´ ط²ظ…ط§ظ†â€Œط¨ظ†ط¯غŒ:
+    1) ظ†ط³ط®ظ‡ ظ†ط¨ط§غŒط¯ ظ‚ظپظ„ (approved) ط¨ط§ط´ط¯.
+    2) ط§ع¯ط± ع©ط§ط±ط¨ط± ط¯ط§ط¯ظ‡ ط´ظˆط¯طŒ ط¨ط§غŒط¯ ظ…ط¬ظˆط² ظˆغŒط±ط§غŒط´ ظ¾ط±ظˆعکظ‡ ط±ط§ ط¯ط§ط´طھظ‡ ط¨ط§ط´ط¯.
 
-    رفتار قدیمی (فقط با revision) برای حفظ سازگاری حفظ شده است.
+    ط±ظپطھط§ط± ظ‚ط¯غŒظ…غŒ (ظپظ‚ط· ط¨ط§ revision) ط¨ط±ط§غŒ ط­ظپط¸ ط³ط§ط²ع¯ط§ط±غŒ ط­ظپط¸ ط´ط¯ظ‡ ط§ط³طھ.
     """
     if revision.approved_at is not None:
-        raise PermissionDenied("این نسخه قفل شده است و قابل تغییر نیست.")
+        raise PermissionDenied("ط§غŒظ† ظ†ط³ط®ظ‡ ظ‚ظپظ„ ط´ط¯ظ‡ ط§ط³طھ ظˆ ظ‚ط§ط¨ظ„ طھط؛غŒغŒط± ظ†غŒط³طھ.")
     if user is not None:
         require_can_edit_project(user, revision.project)
 
 
 def check_can_edit_revision(user, revision):
-    """نسخه‌ی صریح‌تر برای استفاده‌های جدید."""
+    """ظ†ط³ط®ظ‡â€ŒغŒ طµط±غŒط­â€Œطھط± ط¨ط±ط§غŒ ط§ط³طھظپط§ط¯ظ‡â€Œظ‡ط§غŒ ط¬ط¯غŒط¯."""
     check_revision_is_open(revision, user)
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
-    """مدیریت پروژه‌ها"""
+    """ظ…ط¯غŒط±غŒطھ ظ¾ط±ظˆعکظ‡â€Œظ‡ط§"""
     queryset = Project.objects.filter(is_deleted=False).exclude(name='System-Personal-Tasks')
     serializer_class = ProjectSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        # فقط پروژه‌هایی که کاربر اجازهٔ مشاهده دارد (سطحِ شرکت → همه).
+        # ظپظ‚ط· ظ¾ط±ظˆعکظ‡â€Œظ‡ط§غŒغŒ ع©ظ‡ ع©ط§ط±ط¨ط± ط§ط¬ط§ط²ظ‡ظ” ظ…ط´ط§ظ‡ط¯ظ‡ ط¯ط§ط±ط¯ (ط³ط·ط­ظگ ط´ط±ع©طھ â†’ ظ‡ظ…ظ‡).
         return super().get_queryset().filter(
             id__in=accessible_project_ids(self.request.user)
         )
@@ -443,7 +444,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         user = self.request.user
         require_can_create_project(user)
-        # مدیر واحد → پروژه به واحد خودش گره می‌خورد
+        # ظ…ط¯غŒط± ظˆط§ط­ط¯ â†’ ظ¾ط±ظˆعکظ‡ ط¨ظ‡ ظˆط§ط­ط¯ ط®ظˆط¯ط´ ع¯ط±ظ‡ ظ…غŒâ€Œط®ظˆط±ط¯
         owner_unit = getattr(user, 'unit', None)
         serializer.save(created_by=user, owner_unit=owner_unit)
 
@@ -484,8 +485,8 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
 class ProjectViewerViewSet(viewsets.ModelViewSet):
     """
-    مدیریتِ مشاهده‌گرهای پروژه (Project Viewers).
-    افزودن/حذفِ مشاهده‌گر فقط توسطِ سازندهٔ پروژه (و سطحِ شرکت) مجاز است.
+    ظ…ط¯غŒط±غŒطھظگ ظ…ط´ط§ظ‡ط¯ظ‡â€Œع¯ط±ظ‡ط§غŒ ظ¾ط±ظˆعکظ‡ (Project Viewers).
+    ط§ظپط²ظˆط¯ظ†/ط­ط°ظپظگ ظ…ط´ط§ظ‡ط¯ظ‡â€Œع¯ط± ظپظ‚ط· طھظˆط³ط·ظگ ط³ط§ط²ظ†ط¯ظ‡ظ” ظ¾ط±ظˆعکظ‡ (ظˆ ط³ط·ط­ظگ ط´ط±ع©طھ) ظ…ط¬ط§ط² ط§ط³طھ.
     """
     queryset = ProjectViewer.objects.select_related('user', 'project', 'added_by').all()
     serializer_class = ProjectViewerSerializer
@@ -509,14 +510,14 @@ class ProjectViewerViewSet(viewsets.ModelViewSet):
 
 
 class CalendarViewSet(viewsets.ModelViewSet):
-    """تعریف و مدیریت تقویم‌های کاری مستقل (ساعات کاری + تعطیلات)"""
+    """طھط¹ط±غŒظپ ظˆ ظ…ط¯غŒط±غŒطھ طھظ‚ظˆغŒظ…â€Œظ‡ط§غŒ ع©ط§ط±غŒ ظ…ط³طھظ‚ظ„ (ط³ط§ط¹ط§طھ ع©ط§ط±غŒ + طھط¹ط·غŒظ„ط§طھ)"""
     queryset = Calendar.objects.all().prefetch_related('intervals', 'exceptions')
     serializer_class = CalendarSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        # فقط قالب‌های مستقل (بدون پروژه) در صورت درخواست
+        # ظپظ‚ط· ظ‚ط§ظ„ط¨â€Œظ‡ط§غŒ ظ…ط³طھظ‚ظ„ (ط¨ط¯ظˆظ† ظ¾ط±ظˆعکظ‡) ط¯ط± طµظˆط±طھ ط¯ط±ط®ظˆط§ط³طھ
         if self.request.query_params.get('templates') == 'true':
             queryset = queryset.filter(project__isnull=True)
         project_id = self.request.query_params.get('project_id')
@@ -526,7 +527,7 @@ class CalendarViewSet(viewsets.ModelViewSet):
 
 
 class RevisionViewSet(viewsets.ModelViewSet):
-    """مدیریت نسخه‌ها (Revisions) با قابلیت فیلتر بر اساس پروژه"""
+    """ظ…ط¯غŒط±غŒطھ ظ†ط³ط®ظ‡â€Œظ‡ط§ (Revisions) ط¨ط§ ظ‚ط§ط¨ظ„غŒطھ ظپغŒظ„طھط± ط¨ط± ط§ط³ط§ط³ ظ¾ط±ظˆعکظ‡"""
     queryset = Revision.objects.filter(is_deleted=False ).order_by('-number')
     serializer_class = RevisionSerializer
     permission_classes = [IsAuthenticated]
@@ -554,15 +555,15 @@ class RevisionViewSet(viewsets.ModelViewSet):
             })
         instance.is_deleted = True
         instance.save(update_fields=['is_deleted'])
-    # --- متد قفل کردن نسخه ---
+    # --- ظ…طھط¯ ظ‚ظپظ„ ع©ط±ط¯ظ† ظ†ط³ط®ظ‡ ---
     @action(detail=True, methods=['post'], url_path='approve')
     def approve_revision(self, request, pk=None):
         revision = self.get_object()
 
         if revision.approved_at:
-            return Response({"detail": "این نسخه قبلاً تایید و قفل شده است."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "ط§غŒظ† ظ†ط³ط®ظ‡ ظ‚ط¨ظ„ط§ظ‹ طھط§غŒغŒط¯ ظˆ ظ‚ظپظ„ ط´ط¯ظ‡ ط§ط³طھ."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # فقط تاییدکننده‌ی تعیین‌شده (یا admin) می‌تواند تایید کند
+        # ظپظ‚ط· طھط§غŒغŒط¯ع©ظ†ظ†ط¯ظ‡â€ŒغŒ طھط¹غŒغŒظ†â€Œط´ط¯ظ‡ (غŒط§ admin) ظ…غŒâ€Œطھظˆط§ظ†ط¯ طھط§غŒغŒط¯ ع©ظ†ط¯
         from .permissions import require_can_approve_revision
         require_can_approve_revision(request.user, revision)
 
@@ -571,9 +572,9 @@ class RevisionViewSet(viewsets.ModelViewSet):
         revision.save()
         promote_approved_revision(revision, data_date=revision.project.current_data_date)
 
-        return Response({"detail": "نسخه با موفقیت قفل شد."}, status=status.HTTP_200_OK)
+        return Response({"detail": "ظ†ط³ط®ظ‡ ط¨ط§ ظ…ظˆظپظ‚غŒطھ ظ‚ظپظ„ ط´ط¯."}, status=status.HTTP_200_OK)
 
-    # --- ارسال اطلاعات به گانت‌چارت ---
+    # --- ط§ط±ط³ط§ظ„ ط§ط·ظ„ط§ط¹ط§طھ ط¨ظ‡ ع¯ط§ظ†طھâ€Œع†ط§ط±طھ ---
     @action(detail=True, methods=['get'], url_path='gantt-data')
     def get_gantt_data(self, request, pk=None):
         revision = self.get_object()
@@ -624,13 +625,13 @@ class RevisionViewSet(viewsets.ModelViewSet):
             "dependencies": list(dependency_serializer.data) + list(subproject_dependency_serializer.data)
         }, status=status.HTTP_200_OK)
 
-    # --- ساخت پیش‌نویس (Draft) از یک نسخه ---
+    # --- ط³ط§ط®طھ ظ¾غŒط´â€Œظ†ظˆغŒط³ (Draft) ط§ط² غŒع© ظ†ط³ط®ظ‡ ---
     @action(detail=True, methods=['post'], url_path='create-draft')
     @transaction.atomic
     def create_draft_from_revision(self, request, pk=None):
         base_revision = self.get_object()
 
-        # فقط کسی که اجازه ویرایش پروژه را دارد می‌تواند پیش‌نویس بسازد
+        # ظپظ‚ط· ع©ط³غŒ ع©ظ‡ ط§ط¬ط§ط²ظ‡ ظˆغŒط±ط§غŒط´ ظ¾ط±ظˆعکظ‡ ط±ط§ ط¯ط§ط±ط¯ ظ…غŒâ€Œطھظˆط§ظ†ط¯ ظ¾غŒط´â€Œظ†ظˆغŒط³ ط¨ط³ط§ط²ط¯
         require_can_edit_project(request.user, base_revision.project)
         existing_working = base_revision.project.working_revision
         if (
@@ -646,22 +647,22 @@ class RevisionViewSet(viewsets.ModelViewSet):
 
         if not base_revision.approved_at:
             return Response(
-                {"detail": "نسخه پایه هنوز باز است. ابتدا آن را قفل کنید."},
+                {"detail": "ظ†ط³ط®ظ‡ ظ¾ط§غŒظ‡ ظ‡ظ†ظˆط² ط¨ط§ط² ط§ط³طھ. ط§ط¨طھط¯ط§ ط¢ظ† ط±ط§ ظ‚ظپظ„ ع©ظ†غŒط¯."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # دریافت و اعتبارسنجی توضیحات (اجباری)
+        # ط¯ط±غŒط§ظپطھ ظˆ ط§ط¹طھط¨ط§ط±ط³ظ†ط¬غŒ طھظˆط¶غŒط­ط§طھ (ط§ط¬ط¨ط§ط±غŒ)
         description = request.data.get('description', '').strip()
         if not description:
             return Response(
-                {"detail": "وارد کردن توضیحات (دلیل ساخت پیش‌نویس) الزامی است."},
+                {"detail": "ظˆط§ط±ط¯ ع©ط±ط¯ظ† طھظˆط¶غŒط­ط§طھ (ط¯ظ„غŒظ„ ط³ط§ط®طھ ظ¾غŒط´â€Œظ†ظˆغŒط³) ط§ظ„ط²ط§ظ…غŒ ط§ط³طھ."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # تعیینِ Approver در زمانِ ساختِ نسخه — scope-aware:
-        # شرکتی → پیش‌فرض = مدیرِ برنامه‌ریزی
-        # درون‌واحدی → پیش‌فرض = مدیرِ واحدِ صاحبِ پروژه
-        # override دستی همیشه ممکن است (approverId / approver_id)
+        # طھط¹غŒغŒظ†ظگ Approver ط¯ط± ط²ظ…ط§ظ†ظگ ط³ط§ط®طھظگ ظ†ط³ط®ظ‡ â€” scope-aware:
+        # ط´ط±ع©طھغŒ â†’ ظ¾غŒط´â€Œظپط±ط¶ = ظ…ط¯غŒط±ظگ ط¨ط±ظ†ط§ظ…ظ‡â€Œط±غŒط²غŒ
+        # ط¯ط±ظˆظ†â€Œظˆط§ط­ط¯غŒ â†’ ظ¾غŒط´â€Œظپط±ط¶ = ظ…ط¯غŒط±ظگ ظˆط§ط­ط¯ظگ طµط§ط­ط¨ظگ ظ¾ط±ظˆعکظ‡
+        # override ط¯ط³طھغŒ ظ‡ظ…غŒط´ظ‡ ظ…ظ…ع©ظ† ط§ط³طھ (approverId / approver_id)
         approver_id = request.data.get('approverId') or request.data.get('approver_id')
         requested_approver = get_object_or_404(User, pk=approver_id) if approver_id else None
         try:
@@ -759,7 +760,7 @@ class RevisionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='run-cpm')
     def run_cpm_engine(self, request, pk=None):
         """
-        اجرای موتور محاسباتی زمان‌بندی (CPM) روی یک نسخه خاص
+        ط§ط¬ط±ط§غŒ ظ…ظˆطھظˆط± ظ…ط­ط§ط³ط¨ط§طھغŒ ط²ظ…ط§ظ†â€Œط¨ظ†ط¯غŒ (CPM) ط±ظˆغŒ غŒع© ظ†ط³ط®ظ‡ ط®ط§طµ
         """
         revision = self.get_object()
         official_working = get_official_revision(revision.project, ROLE_WORKING, required=False)
@@ -769,11 +770,11 @@ class RevisionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_409_CONFLICT,
             )
 
-        # بررسی اینکه آیا نسخه باز است و قابلیت ویرایش دارد یا خیر
+        # ط¨ط±ط±ط³غŒ ط§غŒظ†ع©ظ‡ ط¢غŒط§ ظ†ط³ط®ظ‡ ط¨ط§ط² ط§ط³طھ ظˆ ظ‚ط§ط¨ظ„غŒطھ ظˆغŒط±ط§غŒط´ ط¯ط§ط±ط¯ غŒط§ ط®غŒط±
         check_revision_is_open(revision, request.user)
 
         try:
-            # اجرای موتور CPM که Early/Late start و finish ها را حساب و ذخیره می‌کند
+            # ط§ط¬ط±ط§غŒ ظ…ظˆطھظˆط± CPM ع©ظ‡ Early/Late start ظˆ finish ظ‡ط§ ط±ط§ ط­ط³ط§ط¨ ظˆ ط°ط®غŒط±ظ‡ ظ…غŒâ€Œع©ظ†ط¯
 
             data_date = parse_cpm_data_date(request.data.get("dataDate"))
             engine = CPMEngine(revision, data_date=data_date)
@@ -803,8 +804,8 @@ class RevisionViewSet(viewsets.ModelViewSet):
                 )
             cpm_result["subproject_warnings"] = enriched_warnings
 
-            # پس از محاسبه، مستقیماً داده‌های آپدیت‌شده گانت‌چارت را استخراج کرده و برمی‌گردانیم
-            # این کار باعث می‌شود فرانت‌اند نیاز به Request دوم نداشته باشد
+            # ظ¾ط³ ط§ط² ظ…ط­ط§ط³ط¨ظ‡طŒ ظ…ط³طھظ‚غŒظ…ط§ظ‹ ط¯ط§ط¯ظ‡â€Œظ‡ط§غŒ ط¢ظ¾ط¯غŒطھâ€Œط´ط¯ظ‡ ع¯ط§ظ†طھâ€Œع†ط§ط±طھ ط±ط§ ط§ط³طھط®ط±ط§ط¬ ع©ط±ط¯ظ‡ ظˆ ط¨ط±ظ…غŒâ€Œع¯ط±ط¯ط§ظ†غŒظ…
+            # ط§غŒظ† ع©ط§ط± ط¨ط§ط¹ط« ظ…غŒâ€Œط´ظˆط¯ ظپط±ط§ظ†طھâ€Œط§ظ†ط¯ ظ†غŒط§ط² ط¨ظ‡ Request ط¯ظˆظ… ظ†ط¯ط§ط´طھظ‡ ط¨ط§ط´ط¯
             response = self.get_gantt_data(request, pk=pk)
             subproject_warnings = cpm_result.get("subproject_warnings", [])
             warnings_by_node = {warning["nodeId"]: warning for warning in subproject_warnings}
@@ -836,14 +837,14 @@ class RevisionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         except ValueError as e:
-            # این خطا معمولاً به خاطر وجود حلقه (Cycle) در گراف وابستگی‌ها پرتاب می‌شود
+            # ط§غŒظ† ط®ط·ط§ ظ…ط¹ظ…ظˆظ„ط§ظ‹ ط¨ظ‡ ط®ط§ط·ط± ظˆط¬ظˆط¯ ط­ظ„ظ‚ظ‡ (Cycle) ط¯ط± ع¯ط±ط§ظپ ظˆط§ط¨ط³طھع¯غŒâ€Œظ‡ط§ ظ¾ط±طھط§ط¨ ظ…غŒâ€Œط´ظˆط¯
             return Response(
                 {"detail": str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
         except Exception as e:
             return Response(
-                {"detail": f"خطای پیش‌بینی نشده در محاسبات CPM: {str(e)}"},
+                {"detail": f"ط®ط·ط§غŒ ظ¾غŒط´â€Œط¨غŒظ†غŒ ظ†ط´ط¯ظ‡ ط¯ط± ظ…ط­ط§ط³ط¨ط§طھ CPM: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 class WbsNodeViewSet(viewsets.ModelViewSet):
@@ -856,22 +857,22 @@ class WbsNodeViewSet(viewsets.ModelViewSet):
         queryset = self.filter_queryset(self.get_queryset())
         lookup_value = self.kwargs[self.lookup_field]
 
-        # گرفتن ریویژن از آدرس در صورت وجود
+        # ع¯ط±ظپطھظ† ط±غŒظˆغŒعکظ† ط§ط² ط¢ط¯ط±ط³ ط¯ط± طµظˆط±طھ ظˆط¬ظˆط¯
         revision_id = self.request.query_params.get('revision_id')
 
         filter_kwargs = {self.lookup_field: lookup_value}
         if revision_id:
             filter_kwargs['revision_id'] = revision_id
         else:
-            # پیدا کردن ردیف در نسخه‌ای که هنوز تایید و قفل نشده است
+            # ظ¾غŒط¯ط§ ع©ط±ط¯ظ† ط±ط¯غŒظپ ط¯ط± ظ†ط³ط®ظ‡â€Œط§غŒ ع©ظ‡ ظ‡ظ†ظˆط² طھط§غŒغŒط¯ ظˆ ظ‚ظپظ„ ظ†ط´ط¯ظ‡ ط§ط³طھ
             filter_kwargs['revision_id'] = F('node__project__working_revision_id')
 
-        # استفاده از first() برای جلوگیری از ارور تعدد ردیف
+        # ط§ط³طھظپط§ط¯ظ‡ ط§ط² first() ط¨ط±ط§غŒ ط¬ظ„ظˆع¯غŒط±غŒ ط§ط² ط§ط±ظˆط± طھط¹ط¯ط¯ ط±ط¯غŒظپ
         obj = queryset.filter(**filter_kwargs).first()
 
         if not obj:
             from django.http import Http404
-            raise Http404("گره WBS در نسخه فعال یافت نشد.")
+            raise Http404("ع¯ط±ظ‡ WBS ط¯ط± ظ†ط³ط®ظ‡ ظپط¹ط§ظ„ غŒط§ظپطھ ظ†ط´ط¯.")
 
         self.check_object_permissions(self.request, obj)
         return obj
@@ -897,16 +898,16 @@ class WbsNodeViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(revision_id=F('node__project__working_revision_id'))
         return queryset
 
-    # --- هندل کردن ساخت صحیح گره WBS ---
+    # --- ظ‡ظ†ط¯ظ„ ع©ط±ط¯ظ† ط³ط§ط®طھ طµط­غŒط­ ع¯ط±ظ‡ WBS ---
     def perform_create(self, serializer):
         revision_id = self.request.data.get('revisionId') or self.request.query_params.get('revision_id')
         if not revision_id:
-            raise ValidationError({"revisionId": "آیدی نسخه برای ساخت گره الزامی است."})
+            raise ValidationError({"revisionId": "ط¢غŒط¯غŒ ظ†ط³ط®ظ‡ ط¨ط±ط§غŒ ط³ط§ط®طھ ع¯ط±ظ‡ ط§ظ„ط²ط§ظ…غŒ ط§ط³طھ."})
 
         revision = get_object_or_404(Revision, id=revision_id)
         check_revision_is_open(revision, self.request.user)
 
-        # پیدا کردن گره والد (در صورت وجود)
+        # ظ¾غŒط¯ط§ ع©ط±ط¯ظ† ع¯ط±ظ‡ ظˆط§ظ„ط¯ (ط¯ط± طµظˆط±طھ ظˆط¬ظˆط¯)
         parent_id = self.request.data.get('parentId')
         parent_node = None
         if parent_id:
@@ -943,69 +944,69 @@ class WbsNodeViewSet(viewsets.ModelViewSet):
         serializer.save()
 
     def perform_destroy(self, instance):
-        # بررسی قفل نبودن نسخه
+        # ط¨ط±ط±ط³غŒ ظ‚ظپظ„ ظ†ط¨ظˆط¯ظ† ظ†ط³ط®ظ‡
         check_revision_is_open(instance.revision, self.request.user)
         if instance.parent_id is None:
             raise ValidationError({"detail": "The root WBS node cannot be deleted."})
 
-        # ۱. گرفتن خود گره و تمامی زیرمجموعه‌های آن (فرزندان، نوه‌ها و...) به کمک MPTT
+        # غ±. ع¯ط±ظپطھظ† ط®ظˆط¯ ع¯ط±ظ‡ ظˆ طھظ…ط§ظ…غŒ ط²غŒط±ظ…ط¬ظ…ظˆط¹ظ‡â€Œظ‡ط§غŒ ط¢ظ† (ظپط±ط²ظ†ط¯ط§ظ†طŒ ظ†ظˆظ‡â€Œظ‡ط§ ظˆ...) ط¨ظ‡ ع©ظ…ع© MPTT
         descendants = instance.get_descendants(include_self=True)
 
-        # ۲. مخفی کردن تمام تسک‌هایی که به این گره‌ها (والد یا فرزندان) متصل هستند
+        # غ². ظ…ط®ظپغŒ ع©ط±ط¯ظ† طھظ…ط§ظ… طھط³ع©â€Œظ‡ط§غŒغŒ ع©ظ‡ ط¨ظ‡ ط§غŒظ† ع¯ط±ظ‡â€Œظ‡ط§ (ظˆط§ظ„ط¯ غŒط§ ظپط±ط²ظ†ط¯ط§ظ†) ظ…طھطµظ„ ظ‡ط³طھظ†ط¯
         TaskVersion.objects.filter(
             wbs_node__in=descendants,
             revision=instance.revision
         ).update(is_deleted=True)
 
-        # ۳. مخفی کردن خود گره WBS و تمامی گره‌های فرزند آن به صورت یکجا
+        # غ³. ظ…ط®ظپغŒ ع©ط±ط¯ظ† ط®ظˆط¯ ع¯ط±ظ‡ WBS ظˆ طھظ…ط§ظ…غŒ ع¯ط±ظ‡â€Œظ‡ط§غŒ ظپط±ط²ظ†ط¯ ط¢ظ† ط¨ظ‡ طµظˆط±طھ غŒع©ط¬ط§
         descendants.update(is_deleted=True)
 
-    # --- مرتب‌سازی مجدد نودهای WBS (drag & drop) ---
+    # --- ظ…ط±طھط¨â€Œط³ط§ط²غŒ ظ…ط¬ط¯ط¯ ظ†ظˆط¯ظ‡ط§غŒ WBS (drag & drop) ---
     @action(detail=False, methods=['post'], url_path='reorder')
     @transaction.atomic
     def reorder(self, request):
         """
-        ترتیب نمایش نودهای WBS هم‌نیا (زیر یک والد) را تغییر می‌دهد.
-        ورودی: revisionId و orderedIds (لیست node.id ها به ترتیب جدید).
-        به دلیل محدودیت یکتایی (revision, parent, sequence) از روش دو مرحله‌ای
-        (آفست موقت سپس مقدار نهایی) استفاده می‌شود تا تداخل پیش نیاید.
+        طھط±طھغŒط¨ ظ†ظ…ط§غŒط´ ظ†ظˆط¯ظ‡ط§غŒ WBS ظ‡ظ…â€Œظ†غŒط§ (ط²غŒط± غŒع© ظˆط§ظ„ط¯) ط±ط§ طھط؛غŒغŒط± ظ…غŒâ€Œط¯ظ‡ط¯.
+        ظˆط±ظˆط¯غŒ: revisionId ظˆ orderedIds (ظ„غŒط³طھ node.id ظ‡ط§ ط¨ظ‡ طھط±طھغŒط¨ ط¬ط¯غŒط¯).
+        ط¨ظ‡ ط¯ظ„غŒظ„ ظ…ط­ط¯ظˆط¯غŒطھ غŒع©طھط§غŒغŒ (revision, parent, sequence) ط§ط² ط±ظˆط´ ط¯ظˆ ظ…ط±ط­ظ„ظ‡â€Œط§غŒ
+        (ط¢ظپط³طھ ظ…ظˆظ‚طھ ط³ظ¾ط³ ظ…ظ‚ط¯ط§ط± ظ†ظ‡ط§غŒغŒ) ط§ط³طھظپط§ط¯ظ‡ ظ…غŒâ€Œط´ظˆط¯ طھط§ طھط¯ط§ط®ظ„ ظ¾غŒط´ ظ†غŒط§غŒط¯.
         """
         revision_id = request.data.get('revisionId')
         ordered_ids = request.data.get('orderedIds', [])
 
         if not revision_id or not ordered_ids:
             return Response(
-                {"detail": "revisionId و orderedIds الزامی هستند."},
+                {"detail": "revisionId ظˆ orderedIds ط§ظ„ط²ط§ظ…غŒ ظ‡ط³طھظ†ط¯."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         revision = get_object_or_404(Revision, id=revision_id)
         check_revision_is_open(revision, request.user)
 
-        # نگاشت node.id → pk نسخه WBS در این ریویژن
+        # ظ†ع¯ط§ط´طھ node.id â†’ pk ظ†ط³ط®ظ‡ WBS ط¯ط± ط§غŒظ† ط±غŒظˆغŒعکظ†
         pk_map = {
             str(v.node_id): v.pk
             for v in WBSNodeVersion.objects.filter(revision=revision, node_id__in=ordered_ids)
         }
 
-        # نکته مهم: از .update() استفاده می‌کنیم نه .save()
-        # چون مدل MPTT با order_insertion_by=['sequence'] است و save() باعث
-        # جابجایی نود در درخت و خطای _make_sibling_of_root_node می‌شود.
-        # .update() فقط ستون sequence را آپدیت می‌کند و به ساختار درخت کاری ندارد.
+        # ظ†ع©طھظ‡ ظ…ظ‡ظ…: ط§ط² .update() ط§ط³طھظپط§ط¯ظ‡ ظ…غŒâ€Œع©ظ†غŒظ… ظ†ظ‡ .save()
+        # ع†ظˆظ† ظ…ط¯ظ„ MPTT ط¨ط§ order_insertion_by=['sequence'] ط§ط³طھ ظˆ save() ط¨ط§ط¹ط«
+        # ط¬ط§ط¨ط¬ط§غŒغŒ ظ†ظˆط¯ ط¯ط± ط¯ط±ط®طھ ظˆ ط®ط·ط§غŒ _make_sibling_of_root_node ظ…غŒâ€Œط´ظˆط¯.
+        # .update() ظپظ‚ط· ط³طھظˆظ† sequence ط±ط§ ط¢ظ¾ط¯غŒطھ ظ…غŒâ€Œع©ظ†ط¯ ظˆ ط¨ظ‡ ط³ط§ط®طھط§ط± ط¯ط±ط®طھ ع©ط§ط±غŒ ظ†ط¯ط§ط±ط¯.
 
-        # مرحله ۱: آفست موقت برای دور زدن محدودیت یکتایی (revision, parent, sequence)
+        # ظ…ط±ط­ظ„ظ‡ غ±: ط¢ظپط³طھ ظ…ظˆظ‚طھ ط¨ط±ط§غŒ ط¯ظˆط± ط²ط¯ظ† ظ…ط­ط¯ظˆط¯غŒطھ غŒع©طھط§غŒغŒ (revision, parent, sequence)
         for i, nid in enumerate(ordered_ids):
             pk = pk_map.get(str(nid))
             if pk:
                 WBSNodeVersion.objects.filter(pk=pk).update(sequence=100000 + i)
 
-        # مرحله ۲: مقادیر نهایی ۱..N
+        # ظ…ط±ط­ظ„ظ‡ غ²: ظ…ظ‚ط§ط¯غŒط± ظ†ظ‡ط§غŒغŒ غ±..N
         for i, nid in enumerate(ordered_ids):
             pk = pk_map.get(str(nid))
             if pk:
                 WBSNodeVersion.objects.filter(pk=pk).update(sequence=i + 1)
 
-        return Response({"detail": "ترتیب نودهای WBS به‌روزرسانی شد."}, status=status.HTTP_200_OK)
+        return Response({"detail": "طھط±طھغŒط¨ ظ†ظˆط¯ظ‡ط§غŒ WBS ط¨ظ‡â€Œط±ظˆط²ط±ط³ط§ظ†غŒ ط´ط¯."}, status=status.HTTP_200_OK)
 
 
     @action(detail=False, methods=['post'], url_path='reorder-mixed')
@@ -1090,12 +1091,12 @@ class ActivityNodeViewSet(viewsets.ModelViewSet):
         else:
             filter_kwargs['revision_id'] = F('task__project__working_revision_id')
 
-        # انتخاب دقیق همان ردیفی که متعلق به نسخه باز است
+        # ط§ظ†طھط®ط§ط¨ ط¯ظ‚غŒظ‚ ظ‡ظ…ط§ظ† ط±ط¯غŒظپغŒ ع©ظ‡ ظ…طھط¹ظ„ظ‚ ط¨ظ‡ ظ†ط³ط®ظ‡ ط¨ط§ط² ط§ط³طھ
         obj = queryset.filter(**filter_kwargs).first()
 
         if not obj:
             from django.http import Http404
-            raise Http404("تسک مورد نظر در نسخه فعال یافت نشد.")
+            raise Http404("طھط³ع© ظ…ظˆط±ط¯ ظ†ط¸ط± ط¯ط± ظ†ط³ط®ظ‡ ظپط¹ط§ظ„ غŒط§ظپطھ ظ†ط´ط¯.")
 
         self.check_object_permissions(self.request, obj)
         return obj
@@ -1105,7 +1106,7 @@ class ActivityNodeViewSet(viewsets.ModelViewSet):
         project_ids = accessible_project_ids(self.request.user)
         queryset = queryset.filter(revision__project_id__in=project_ids)
         revision_id = self.request.query_params.get('revision_id')
-        user_id = self.request.query_params.get('user_id')  # <--- فیلتر جدید
+        user_id = self.request.query_params.get('user_id')  # <--- ظپغŒظ„طھط± ط¬ط¯غŒط¯
         search = (self.request.query_params.get('search') or '').strip()
 
         if revision_id:
@@ -1113,13 +1114,72 @@ class ActivityNodeViewSet(viewsets.ModelViewSet):
         else:
             queryset = queryset.filter(revision_id__in=official_revision_ids(project_ids, ROLE_WORKING))
 
-        # فیلتر کردن تسک‌هایی که این کاربر در آن‌ها نقش دارد
+        # ظپغŒظ„طھط± ع©ط±ط¯ظ† طھط³ع©â€Œظ‡ط§غŒغŒ ع©ظ‡ ط§غŒظ† ع©ط§ط±ط¨ط± ط¯ط± ط¢ظ†â€Œظ‡ط§ ظ†ظ‚ط´ ط¯ط§ط±ط¯
         if user_id:
             queryset = queryset.filter(task__roles__user_id=user_id).distinct()
         if search:
             queryset = queryset.filter(Q(title__icontains=search) | Q(wbs_node__wbs_code__icontains=search)).distinct()
 
         return queryset.order_by('sequence')
+
+    def _attach_schedule_quality(self, task_versions):
+        items = list(task_versions)
+        if not items:
+            return items
+
+        revision_ids = {item.revision_id for item in items}
+        successor_sources = defaultdict(set)
+        for revision_id, predecessor_id in Dependency.objects.filter(
+            revision_id__in=revision_ids
+        ).values_list('revision_id', 'predecessor_id'):
+            successor_sources[revision_id].add(str(predecessor_id))
+
+        finish_by_revision = {}
+        for revision_id, finish in TaskVersion.objects.filter(
+            revision_id__in=revision_ids,
+            is_deleted=False,
+            planned_finish__isnull=False,
+        ).values('revision_id').annotate(project_finish=Max('planned_finish')).values_list('revision_id', 'project_finish'):
+            finish_by_revision[revision_id] = finish
+
+        for item in items:
+            actual = getattr(item, 'actual', None)
+            progress = float(actual.progress or 0) if actual else 0
+            is_completed = bool(actual and (actual.actual_finish is not None or progress >= 100))
+            has_successor = str(item.task_id) in successor_sources.get(item.revision_id, set())
+            project_finish = finish_by_revision.get(item.revision_id)
+            title_text = (item.title or '').strip().lower()
+            is_terminal_finish = bool(
+                (not has_successor) and item.planned_finish and project_finish and item.planned_finish == project_finish and
+                any(marker in title_text for marker in ('خاتمه', 'پایان', 'finish', 'completion', 'closeout', 'close out'))
+            )
+            is_open_end = (not has_successor) and (not is_completed) and (not is_terminal_finish)
+            defines_project_finish = bool(
+                is_open_end and item.planned_finish and project_finish and item.planned_finish == project_finish
+            )
+            if is_terminal_finish:
+                severity = 'ok'
+                message = 'Recognized project finish terminal.'
+            elif defines_project_finish:
+                severity = 'warning'
+                message = 'Open-end activity defines the project finish; connect this path to the final milestone.'
+            elif is_open_end:
+                severity = 'warning'
+                message = 'Open-end activity; this path is not connected to a successor/final milestone.'
+            elif is_completed:
+                severity = 'done'
+                message = 'Actualized task; not counted as remaining critical work.'
+            else:
+                severity = 'ok'
+                message = ''
+            item._schedule_quality = {
+                'isCompleted': is_completed,
+                'isOpenEnd': is_open_end,
+                'definesProjectFinish': defines_project_finish,
+                'severity': severity,
+                'message': message,
+            }
+        return items
 
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
@@ -1129,16 +1189,18 @@ class ActivityNodeViewSet(viewsets.ModelViewSet):
         page_param = request.query_params.get('page')
         page_size_param = request.query_params.get('pageSize') or request.query_params.get('page_size')
         if not page_param and not page_size_param:
-            serializer = self.get_serializer(display_queryset, many=True)
+            display_items = self._attach_schedule_quality(display_queryset)
+            serializer = self.get_serializer(display_items, many=True)
             return Response(serializer.data)
         try:
             page = max(int(page_param or 1), 1)
             page_size = min(max(int(page_size_param or 50), 1), 100)
         except (TypeError, ValueError):
             page, page_size = 1, 50
-        total = queryset.count()
+        total = display_queryset.count()
         start = (page - 1) * page_size
-        serializer = self.get_serializer(queryset[start:start + page_size], many=True)
+        page_items = self._attach_schedule_quality(display_queryset[start:start + page_size])
+        serializer = self.get_serializer(page_items, many=True)
         return Response({
             'results': serializer.data,
             'page': page,
@@ -1147,26 +1209,26 @@ class ActivityNodeViewSet(viewsets.ModelViewSet):
             'hasNext': start + len(serializer.data) < total,
         })
 
-    # --- هندل کردن ساخت صحیح تسک (گرفتن والد از ریکوئست) ---
+    # --- ظ‡ظ†ط¯ظ„ ع©ط±ط¯ظ† ط³ط§ط®طھ طµط­غŒط­ طھط³ع© (ع¯ط±ظپطھظ† ظˆط§ظ„ط¯ ط§ط² ط±غŒع©ظˆط¦ط³طھ) ---
     def perform_create(self, serializer):
         revision_id = self.request.data.get('revision_id')
         print(self.request.data)
         print(revision_id)
         if not revision_id:
-            raise ValidationError({"revision_id": "آیدی نسخه برای ساخت تسک الزامی است."})
+            raise ValidationError({"revision_id": "ط¢غŒط¯غŒ ظ†ط³ط®ظ‡ ط¨ط±ط§غŒ ط³ط§ط®طھ طھط³ع© ط§ظ„ط²ط§ظ…غŒ ط§ط³طھ."})
 
         revision = get_object_or_404(Revision, id=revision_id)
         check_revision_is_open(revision, self.request.user)
 
-        # تسک باید حتما به یک WBS متصل شود
+        # طھط³ع© ط¨ط§غŒط¯ ط­طھظ…ط§ ط¨ظ‡ غŒع© WBS ظ…طھطµظ„ ط´ظˆط¯
         parent_id = self.request.data.get('parentId')
         if not parent_id:
-            raise ValidationError({"parentId": "مشخص کردن گره والد (WBS) برای ساخت تسک الزامی است."})
+            raise ValidationError({"parentId": "ظ…ط´ط®طµ ع©ط±ط¯ظ† ع¯ط±ظ‡ ظˆط§ظ„ط¯ (WBS) ط¨ط±ط§غŒ ط³ط§ط®طھ طھط³ع© ط§ظ„ط²ط§ظ…غŒ ط§ط³طھ."})
 
         wbs_node = get_object_or_404(WBSNodeVersion, node_id=parent_id, revision=revision)
 
-        # تخصیص sequence بر اساس ترتیب ساخت (آخرین + ۱) در همان گره WBS
-        # تا ترتیب پیش‌فرض نمایش، ترتیب ایجاد تسک‌ها باشد
+        # طھط®طµغŒطµ sequence ط¨ط± ط§ط³ط§ط³ طھط±طھغŒط¨ ط³ط§ط®طھ (ط¢ط®ط±غŒظ† + غ±) ط¯ط± ظ‡ظ…ط§ظ† ع¯ط±ظ‡ WBS
+        # طھط§ طھط±طھغŒط¨ ظ¾غŒط´â€Œظپط±ط¶ ظ†ظ…ط§غŒط´طŒ طھط±طھغŒط¨ ط§غŒط¬ط§ط¯ طھط³ع©â€Œظ‡ط§ ط¨ط§ط´ط¯
         max_task_seq = TaskVersion.objects.filter(
             revision=revision, wbs_node=wbs_node, is_deleted=False
         ).aggregate(Max('sequence'))['sequence__max'] or 0
@@ -1202,10 +1264,10 @@ class DependencyViewSet(viewsets.ModelViewSet):
         return queryset
 
     def perform_create(self, serializer):
-        # اضافه کردن چک باز بودن نسخه هنگام ایجاد یک Dependency
+        # ط§ط¶ط§ظپظ‡ ع©ط±ط¯ظ† ع†ع© ط¨ط§ط² ط¨ظˆط¯ظ† ظ†ط³ط®ظ‡ ظ‡ظ†ع¯ط§ظ… ط§غŒط¬ط§ط¯ غŒع© Dependency
         revision_id = self.request.data.get('revisionId')
         if not revision_id:
-            raise ValidationError({"revisionId": "آیدی نسخه الزامی است."})
+            raise ValidationError({"revisionId": "ط¢غŒط¯غŒ ظ†ط³ط®ظ‡ ط§ظ„ط²ط§ظ…غŒ ط§ط³طھ."})
         revision = get_object_or_404(Revision, id=revision_id)
         check_revision_is_open(revision, self.request.user)
         predecessor_id = serializer.validated_data.get('predecessor_id')
@@ -1236,7 +1298,7 @@ class DependencyViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         check_revision_is_open(instance.revision, self.request.user)
-        instance.delete()  # وابستگی‌ها می‌توانند فیزیکی حذف شوند
+        instance.delete()  # ظˆط§ط¨ط³طھع¯غŒâ€Œظ‡ط§ ظ…غŒâ€Œطھظˆط§ظ†ظ†ط¯ ظپغŒط²غŒع©غŒ ط­ط°ظپ ط´ظˆظ†ط¯
 
 
 class SubprojectDependencyViewSet(viewsets.ModelViewSet):
@@ -1324,14 +1386,14 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
             from .permissions import is_planning_manager as _is_pm
             from django.db.models import Q
 
-            # صف بررسی‌کننده: گزارش‌هایی با وضعیت pending که کاربر روی تسکشان reviewer/PM است
+            # طµظپ ط¨ط±ط±ط³غŒâ€Œع©ظ†ظ†ط¯ظ‡: ع¯ط²ط§ط±ط´â€Œظ‡ط§غŒغŒ ط¨ط§ ظˆط¶ط¹غŒطھ pending ع©ظ‡ ع©ط§ط±ط¨ط± ط±ظˆغŒ طھط³ع©ط´ط§ظ† reviewer/PM ط§ط³طھ
             reviewer_q = Q(
                 approval_status='pending',
                 task__roles__user=user,
                 task__roles__revision_id__in=official_working_ids,
                 task__roles__role__in=['reviewer', 'project manager'],
             )
-            # صف مدیر برنامه‌ریزی: گزارش‌های reviewer_approved از پروژه‌های شرکتی
+            # طµظپ ظ…ط¯غŒط± ط¨ط±ظ†ط§ظ…ظ‡â€Œط±غŒط²غŒ: ع¯ط²ط§ط±ط´â€Œظ‡ط§غŒ reviewer_approved ط§ط² ظ¾ط±ظˆعکظ‡â€Œظ‡ط§غŒ ط´ط±ع©طھغŒ
             planning_q = Q(
                 approval_status='reviewer_approved',
                 task__project__scope='company',
@@ -1361,9 +1423,9 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         report = serializer.instance
-        # جلوگیری از ویرایش پس از تایید (هر مرحله)
+        # ط¬ظ„ظˆع¯غŒط±غŒ ط§ط² ظˆغŒط±ط§غŒط´ ظ¾ط³ ط§ط² طھط§غŒغŒط¯ (ظ‡ط± ظ…ط±ط­ظ„ظ‡)
         if report.approval_status != 'pending':
-            raise PermissionDenied("این گزارش در حال بررسی یا تایید شده و دیگر قابل ویرایش نیست.")
+            raise PermissionDenied("ط§غŒظ† ع¯ط²ط§ط±ط´ ط¯ط± ط­ط§ظ„ ط¨ط±ط±ط³غŒ غŒط§ طھط§غŒغŒط¯ ط´ط¯ظ‡ ظˆ ط¯غŒع¯ط± ظ‚ط§ط¨ظ„ ظˆغŒط±ط§غŒط´ ظ†غŒط³طھ.")
         serializer.save()
 
     @action(detail=True, methods=['get'], url_path=r'attachments/(?P<attachment_id>[^/.]+)/download')
@@ -1382,13 +1444,13 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='approve')
     def approve_report(self, request, pk=None):
         """
-        تاییدِ گزارش (دو‌مرحله‌ای):
-        - مرحلهٔ ۱: بررسی‌کننده (reviewer / project manager روی تسک) → reviewer_approved
-          برای پروژهٔ درون‌واحدی: auto-collapse به final_approved.
-        - مرحلهٔ ۲: مدیرِ برنامه‌ریزی (یا company-level) → final_approved (فقط شرکتی).
-        - Bypass: اگر SystemSettings.allow_planning_manager_bypass_reviewer فعال باشد،
-          مدیرِ برنامه‌ریزی می‌تواند مستقیماً از pending به final_approved ببرد.
-        پیشرفت در TaskActual فقط هنگامِ final_approved ثبت می‌شود.
+        طھط§غŒغŒط¯ظگ ع¯ط²ط§ط±ط´ (ط¯ظˆâ€Œظ…ط±ط­ظ„ظ‡â€Œط§غŒ):
+        - ظ…ط±ط­ظ„ظ‡ظ” غ±: ط¨ط±ط±ط³غŒâ€Œع©ظ†ظ†ط¯ظ‡ (reviewer / project manager ط±ظˆغŒ طھط³ع©) â†’ reviewer_approved
+          ط¨ط±ط§غŒ ظ¾ط±ظˆعکظ‡ظ” ط¯ط±ظˆظ†â€Œظˆط§ط­ط¯غŒ: auto-collapse ط¨ظ‡ final_approved.
+        - ظ…ط±ط­ظ„ظ‡ظ” غ²: ظ…ط¯غŒط±ظگ ط¨ط±ظ†ط§ظ…ظ‡â€Œط±غŒط²غŒ (غŒط§ company-level) â†’ final_approved (ظپظ‚ط· ط´ط±ع©طھغŒ).
+        - Bypass: ط§ع¯ط± SystemSettings.allow_planning_manager_bypass_reviewer ظپط¹ط§ظ„ ط¨ط§ط´ط¯طŒ
+          ظ…ط¯غŒط±ظگ ط¨ط±ظ†ط§ظ…ظ‡â€Œط±غŒط²غŒ ظ…غŒâ€Œطھظˆط§ظ†ط¯ ظ…ط³طھظ‚غŒظ…ط§ظ‹ ط§ط² pending ط¨ظ‡ final_approved ط¨ط¨ط±ط¯.
+        ظ¾غŒط´ط±ظپطھ ط¯ط± TaskActual ظپظ‚ط· ظ‡ظ†ع¯ط§ظ…ظگ final_approved ط«ط¨طھ ظ…غŒâ€Œط´ظˆط¯.
         """
         from .models import SystemSettings
         from .permissions import is_planning_manager as _is_pm
@@ -1399,11 +1461,11 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
         now = timezone.now()
 
         if report.approval_status == 'final_approved':
-            return Response({"detail": "این گزارش قبلاً تایید نهایی شده است."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "ط§غŒظ† ع¯ط²ط§ط±ط´ ظ‚ط¨ظ„ط§ظ‹ طھط§غŒغŒط¯ ظ†ظ‡ط§غŒغŒ ط´ط¯ظ‡ ط§ط³طھ."}, status=status.HTTP_400_BAD_REQUEST)
         if report.approval_status == 'rejected':
-            return Response({"detail": "این گزارش رد شده و قابلِ تایید نیست."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "ط§غŒظ† ع¯ط²ط§ط±ط´ ط±ط¯ ط´ط¯ظ‡ ظˆ ظ‚ط§ط¨ظ„ظگ طھط§غŒغŒط¯ ظ†غŒط³طھ."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ────────── Bypass path ──────────
+        # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Bypass path â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if (report.approval_status == 'pending'
                 and project.scope == 'company'
                 and (_is_pm(user) or is_company_level(user))
@@ -1413,31 +1475,31 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
             report.reviewer_approved_at = now
             report.final_approved_by = user
             report.final_approved_at = now
-            # سازگاری legacy
+            # ط³ط§ط²ع¯ط§ط±غŒ legacy
             report.is_approved = True
             report.approved_by = user
             report.approved_at = now
             report.save()
             self._commit_progress(report, user)
             return Response({
-                "detail": "گزارش با bypass مستقیماً تایید نهایی شد.",
+                "detail": "ع¯ط²ط§ط±ط´ ط¨ط§ bypass ظ…ط³طھظ‚غŒظ…ط§ظ‹ طھط§غŒغŒط¯ ظ†ظ‡ط§غŒغŒ ط´ط¯.",
                 "approvalStatus": "final_approved",
                 "viaBypass": True,
             }, status=status.HTTP_200_OK)
 
-        # ────────── مرحلهٔ ۱: تاییدِ بررسی‌کننده ──────────
+        # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ ظ…ط±ط­ظ„ظ‡ظ” غ±: طھط§غŒغŒط¯ظگ ط¨ط±ط±ط³غŒâ€Œع©ظ†ظ†ط¯ظ‡ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if report.approval_status == 'pending':
             is_reviewer = TaskRole.objects.filter(
                 task=report.task, user=user,
                 role__in=['reviewer', 'project manager']
             ).exists()
             if not (is_reviewer or is_company_level(user)):
-                raise PermissionDenied("فقط بررسی‌کنندهٔ تسک می‌تواند تاییدِ مرحلهٔ اول بدهد.")
+                raise PermissionDenied("ظپظ‚ط· ط¨ط±ط±ط³غŒâ€Œع©ظ†ظ†ط¯ظ‡ظ” طھط³ع© ظ…غŒâ€Œطھظˆط§ظ†ط¯ طھط§غŒغŒط¯ظگ ظ…ط±ط­ظ„ظ‡ظ” ط§ظˆظ„ ط¨ط¯ظ‡ط¯.")
 
             report.reviewer_approved_by = user
             report.reviewer_approved_at = now
 
-            # درون‌واحدی → auto-collapse: همین مرحله نهایی است
+            # ط¯ط±ظˆظ†â€Œظˆط§ط­ط¯غŒ â†’ auto-collapse: ظ‡ظ…غŒظ† ظ…ط±ط­ظ„ظ‡ ظ†ظ‡ط§غŒغŒ ط§ط³طھ
             if project.scope == 'intra_unit':
                 report.approval_status = 'final_approved'
                 report.final_approved_by = user
@@ -1448,28 +1510,28 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
                 report.save()
                 self._commit_progress(report, user)
                 return Response({
-                    "detail": "گزارش تایید شد و پیشرفت تسک به‌روزرسانی گردید.",
+                    "detail": "ع¯ط²ط§ط±ط´ طھط§غŒغŒط¯ ط´ط¯ ظˆ ظ¾غŒط´ط±ظپطھ طھط³ع© ط¨ظ‡â€Œط±ظˆط²ط±ط³ط§ظ†غŒ ع¯ط±ط¯غŒط¯.",
                     "approvalStatus": "final_approved",
                 }, status=status.HTTP_200_OK)
             else:
-                # شرکتی → منتظرِ تاییدِ نهاییِ مدیرِ برنامه‌ریزی
+                # ط´ط±ع©طھغŒ â†’ ظ…ظ†طھط¸ط±ظگ طھط§غŒغŒط¯ظگ ظ†ظ‡ط§غŒغŒظگ ظ…ط¯غŒط±ظگ ط¨ط±ظ†ط§ظ…ظ‡â€Œط±غŒط²غŒ
                 report.approval_status = 'reviewer_approved'
                 report.save()
                 return Response({
-                    "detail": "گزارش توسط بررسی‌کننده تایید شد. در انتظار تایید نهایی مدیر برنامه‌ریزی.",
+                    "detail": "ع¯ط²ط§ط±ط´ طھظˆط³ط· ط¨ط±ط±ط³غŒâ€Œع©ظ†ظ†ط¯ظ‡ طھط§غŒغŒط¯ ط´ط¯. ط¯ط± ط§ظ†طھط¸ط§ط± طھط§غŒغŒط¯ ظ†ظ‡ط§غŒغŒ ظ…ط¯غŒط± ط¨ط±ظ†ط§ظ…ظ‡â€Œط±غŒط²غŒ.",
                     "approvalStatus": "reviewer_approved",
                 }, status=status.HTTP_200_OK)
 
-        # ────────── مرحلهٔ ۲: تایید نهاییِ مدیر برنامه‌ریزی ──────────
+        # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ ظ…ط±ط­ظ„ظ‡ظ” غ²: طھط§غŒغŒط¯ ظ†ظ‡ط§غŒغŒظگ ظ…ط¯غŒط± ط¨ط±ظ†ط§ظ…ظ‡â€Œط±غŒط²غŒ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         elif report.approval_status == 'reviewer_approved':
             if project.scope != 'company':
                 return Response(
-                    {"detail": "این پروژه درون‌واحدی است و نیازی به تایید نهایی جداگانه ندارد."},
+                    {"detail": "ط§غŒظ† ظ¾ط±ظˆعکظ‡ ط¯ط±ظˆظ†â€Œظˆط§ط­ط¯غŒ ط§ط³طھ ظˆ ظ†غŒط§ط²غŒ ط¨ظ‡ طھط§غŒغŒط¯ ظ†ظ‡ط§غŒغŒ ط¬ط¯ط§ع¯ط§ظ†ظ‡ ظ†ط¯ط§ط±ط¯."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             if not (_is_pm(user) or is_company_level(user)):
                 raise PermissionDenied(
-                    "تاییدِ نهاییِ گزارش‌های پروژه‌های شرکتی فقط توسط مدیرِ واحدِ برنامه‌ریزی مجاز است."
+                    "طھط§غŒغŒط¯ظگ ظ†ظ‡ط§غŒغŒظگ ع¯ط²ط§ط±ط´â€Œظ‡ط§غŒ ظ¾ط±ظˆعکظ‡â€Œظ‡ط§غŒ ط´ط±ع©طھغŒ ظپظ‚ط· طھظˆط³ط· ظ…ط¯غŒط±ظگ ظˆط§ط­ط¯ظگ ط¨ط±ظ†ط§ظ…ظ‡â€Œط±غŒط²غŒ ظ…ط¬ط§ط² ط§ط³طھ."
                 )
             report.approval_status = 'final_approved'
             report.final_approved_by = user
@@ -1480,20 +1542,20 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
             report.save()
             self._commit_progress(report, user)
             return Response({
-                "detail": "گزارش تایید نهایی شد و پیشرفت تسک به‌روزرسانی گردید.",
+                "detail": "ع¯ط²ط§ط±ط´ طھط§غŒغŒط¯ ظ†ظ‡ط§غŒغŒ ط´ط¯ ظˆ ظ¾غŒط´ط±ظپطھ طھط³ع© ط¨ظ‡â€Œط±ظˆط²ط±ط³ط§ظ†غŒ ع¯ط±ط¯غŒط¯.",
                 "approvalStatus": "final_approved",
             }, status=status.HTTP_200_OK)
 
-        return Response({"detail": "وضعیت نامعتبر."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"detail": "ظˆط¶ط¹غŒطھ ظ†ط§ظ…ط¹طھط¨ط±."}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], url_path='reject')
     def reject_report(self, request, pk=None):
-        """ردِ گزارش توسط بررسی‌کننده یا مدیر برنامه‌ریزی."""
+        """ط±ط¯ظگ ع¯ط²ط§ط±ط´ طھظˆط³ط· ط¨ط±ط±ط³غŒâ€Œع©ظ†ظ†ط¯ظ‡ غŒط§ ظ…ط¯غŒط± ط¨ط±ظ†ط§ظ…ظ‡â€Œط±غŒط²غŒ."""
         report = self.get_object()
         user = request.user
 
         if report.approval_status == 'final_approved':
-            return Response({"detail": "این گزارش قبلاً تایید نهایی شده و قابلِ رد نیست."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "ط§غŒظ† ع¯ط²ط§ط±ط´ ظ‚ط¨ظ„ط§ظ‹ طھط§غŒغŒط¯ ظ†ظ‡ط§غŒغŒ ط´ط¯ظ‡ ظˆ ظ‚ط§ط¨ظ„ظگ ط±ط¯ ظ†غŒط³طھ."}, status=status.HTTP_400_BAD_REQUEST)
 
         reason = request.data.get('reason', '').strip()
 
@@ -1503,17 +1565,25 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
         ).exists()
         from .permissions import is_planning_manager as _is_pm
         if not (is_reviewer or _is_pm(user) or is_company_level(user)):
-            raise PermissionDenied("شما اجازهٔ رد کردن این گزارش را ندارید.")
+            raise PermissionDenied("ط´ظ…ط§ ط§ط¬ط§ط²ظ‡ظ” ط±ط¯ ع©ط±ط¯ظ† ط§غŒظ† ع¯ط²ط§ط±ط´ ط±ط§ ظ†ط¯ط§ط±غŒط¯.")
 
         report.approval_status = 'rejected'
         if reason:
             report.notes = f"REJECTED: {reason}\n---\n{report.notes}"
         report.save()
-        return Response({"detail": "گزارش رد شد.", "approvalStatus": "rejected"}, status=status.HTTP_200_OK)
+        return Response({"detail": "ع¯ط²ط§ط±ط´ ط±ط¯ ط´ط¯.", "approvalStatus": "rejected"}, status=status.HTTP_200_OK)
 
-    # ────────── Helper: ثبتِ پیشرفت در TaskActual ──────────
+    # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Helper: ط«ط¨طھظگ ظ¾غŒط´ط±ظپطھ ط¯ط± TaskActual â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _commit_progress(self, report, user):
-        """ثبتِ پیشرفت فقط هنگامِ final_approved — فراخوانی خارج از این حالت مجاز نیست."""
+        """ط«ط¨طھظگ ظ¾غŒط´ط±ظپطھ ظپظ‚ط· ظ‡ظ†ع¯ط§ظ…ظگ final_approved â€” ظپط±ط§ط®ظˆط§ظ†غŒ ط®ط§ط±ط¬ ط§ط² ط§غŒظ† ط­ط§ظ„طھ ظ…ط¬ط§ط² ظ†غŒط³طھ."""
+        if report.approval_status != 'final_approved':
+            raise ValidationError({'approval_status': 'Only final approved reports can commit task progress.'})
+        if report.progress_percent and report.progress_percent > 0:
+            validate_task_start(report.task)
+        validate_progress_transition(report.task, report.progress_percent)
+        if report.progress_percent >= 100:
+            validate_task_delivery(report.task)
+
         execution_revision = get_official_revision(
             report.task.project, ROLE_EXECUTION, required=True
         )
@@ -1531,8 +1601,15 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
             defaults={'updated_by': user}
         )
         task_actual.progress = report.progress_percent
+        if report.progress_percent <= 0:
+            # Progress 0 resets actual execution state.
+            task_actual.actual_start = None
+            task_actual.actual_finish = None
+            task_actual.updated_by = user
+            task_actual.save()
+            return
 
-        # محاسبه خودکار actual_start/finish
+        # ظ…ط­ط§ط³ط¨ظ‡ ط®ظˆط¯ع©ط§ط± actual_start/finish
         approved_reports = TaskReportLog.objects.filter(
             task=report.task, approval_status='final_approved'
         ).order_by('timestamp')
@@ -1568,7 +1645,7 @@ class TaskChatMessageViewSet(viewsets.ModelViewSet):
 
 
 class TaskRoleViewSet(viewsets.ModelViewSet):
-    """مدیریت نقش‌های تخصیص داده شده به تسک‌ها (Task Roles)"""
+    """ظ…ط¯غŒط±غŒطھ ظ†ظ‚ط´â€Œظ‡ط§غŒ طھط®طµغŒطµ ط¯ط§ط¯ظ‡ ط´ط¯ظ‡ ط¨ظ‡ طھط³ع©â€Œظ‡ط§ (Task Roles)"""
     queryset = TaskRole.objects.all()
     serializer_class = TaskRoleSerializer
     permission_classes = [IsAuthenticated]
@@ -1578,7 +1655,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
         project_ids = accessible_project_ids(self.request.user)
         queryset = queryset.filter(revision__project_id__in=project_ids)
 
-        # امکان فیلتر کردن دیتای برگشتی
+        # ط§ظ…ع©ط§ظ† ظپغŒظ„طھط± ع©ط±ط¯ظ† ط¯غŒطھط§غŒ ط¨ط±ع¯ط´طھغŒ
         revision_id = self.request.query_params.get('revision_id')
         task_id = self.request.query_params.get('taskId')
         user_id = self.request.query_params.get('userId')
@@ -1604,7 +1681,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         from .permissions import require_can_assign_task_role
-        # حذف نقش هم با همان منطق نقش (فقط کسی که می‌توانسته بسازد می‌تواند حذف کند)
+        # ط­ط°ظپ ظ†ظ‚ط´ ظ‡ظ… ط¨ط§ ظ‡ظ…ط§ظ† ظ…ظ†ط·ظ‚ ظ†ظ‚ط´ (ظپظ‚ط· ع©ط³غŒ ع©ظ‡ ظ…غŒâ€Œطھظˆط§ظ†ط³طھظ‡ ط¨ط³ط§ط²ط¯ ظ…غŒâ€Œطھظˆط§ظ†ط¯ ط­ط°ظپ ع©ظ†ط¯)
         require_can_assign_task_role(self.request.user, instance.task, instance.user, instance.role)
         instance.delete()
 
@@ -1618,7 +1695,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
 
         if not revision_id or not wbs_node_id or not user_id:
             return Response(
-                {"detail": "revisionId، wbsNodeId و userId الزامی هستند."},
+                {"detail": "revisionIdطŒ wbsNodeId ظˆ userId ط§ظ„ط²ط§ظ…غŒ ظ‡ط³طھظ†ط¯."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1645,7 +1722,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
 
         if not task_versions:
             return Response(
-                {"detail": "در این نود WBS تسکی برای تخصیص reviewer وجود ندارد."},
+                {"detail": "ط¯ط± ط§غŒظ† ظ†ظˆط¯ WBS طھط³ع©غŒ ط¨ط±ط§غŒ طھط®طµغŒطµ reviewer ظˆط¬ظˆط¯ ظ†ط¯ط§ط±ط¯."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1735,20 +1812,20 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='assignable-users')
     def assignable_users(self, request):
         """
-        افراد قابل انتخاب برای یک نقش روی یک تسک خاص — برای dropdown فرانت.
-        پارامترها: ?taskId=<task_id>&role=<reviewer|executor>
+        ط§ظپط±ط§ط¯ ظ‚ط§ط¨ظ„ ط§ظ†طھط®ط§ط¨ ط¨ط±ط§غŒ غŒع© ظ†ظ‚ط´ ط±ظˆغŒ غŒع© طھط³ع© ط®ط§طµ â€” ط¨ط±ط§غŒ dropdown ظپط±ط§ظ†طھ.
+        ظ¾ط§ط±ط§ظ…طھط±ظ‡ط§: ?taskId=<task_id>&role=<reviewer|executor>
         """
         from .permissions import _role as get_role, can_edit_project, is_task_reviewer
         task_id = request.query_params.get('taskId')
         role = request.query_params.get('role', 'reviewer')
 
         if not task_id:
-            return Response({"detail": "taskId الزامی است."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "taskId ط§ظ„ط²ط§ظ…غŒ ط§ط³طھ."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             task = Task.objects.get(pk=task_id)
         except Task.DoesNotExist:
-            return Response({"detail": "تسک یافت نشد."}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"detail": "طھط³ع© غŒط§ظپطھ ظ†ط´ط¯."}, status=status.HTTP_404_NOT_FOUND)
 
         actor = request.user
         users = User.objects.none()
@@ -1758,7 +1835,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
         elif role == 'reviewer' and can_edit_project(actor, task.project):
             users = User.objects.all()
         elif role == 'executor' and is_task_reviewer(actor, task) and getattr(actor, 'unit_id', None):
-            # Executor فقط از واحد مستقیم خود Reviewer (= actor)
+            # Executor ظپظ‚ط· ط§ط² ظˆط§ط­ط¯ ظ…ط³طھظ‚غŒظ… ط®ظˆط¯ Reviewer (= actor)
             users = User.objects.filter(unit_id=actor.unit_id)
 
         from CustomUser.serializers import CustomUserSerializer
@@ -1767,12 +1844,12 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='my-reviewer-tasks')
     def my_reviewer_tasks(self, request):
         """
-        لیستِ تمامِ تسک‌هایی که کاربر جاری روی آن‌ها reviewer (یا project manager) است
-        — برای صفحهٔ «انتخاب انجام‌دهنده» (Assign Executors).
+        ظ„غŒط³طھظگ طھظ…ط§ظ…ظگ طھط³ع©â€Œظ‡ط§غŒغŒ ع©ظ‡ ع©ط§ط±ط¨ط± ط¬ط§ط±غŒ ط±ظˆغŒ ط¢ظ†â€Œظ‡ط§ reviewer (غŒط§ project manager) ط§ط³طھ
+        â€” ط¨ط±ط§غŒ طµظپط­ظ‡ظ” آ«ط§ظ†طھط®ط§ط¨ ط§ظ†ط¬ط§ظ…â€Œط¯ظ‡ظ†ط¯ظ‡آ» (Assign Executors).
 
-        پاسخ شامل:
-          - tasks: لیست تسک‌ها با اطلاعاتِ پروژه، WBS، تاریخ‌ها و executors فعلی
-          - unitMembers: اعضای واحدِ کاربر (برای dropdown انتخاب executor)
+        ظ¾ط§ط³ط® ط´ط§ظ…ظ„:
+          - tasks: ظ„غŒط³طھ طھط³ع©â€Œظ‡ط§ ط¨ط§ ط§ط·ظ„ط§ط¹ط§طھظگ ظ¾ط±ظˆعکظ‡طŒ WBSطŒ طھط§ط±غŒط®â€Œظ‡ط§ ظˆ executors ظپط¹ظ„غŒ
+          - unitMembers: ط§ط¹ط¶ط§غŒ ظˆط§ط­ط¯ظگ ع©ط§ط±ط¨ط± (ط¨ط±ط§غŒ dropdown ط§ظ†طھط®ط§ط¨ executor)
         """
         actor = request.user
         unit_id = getattr(actor, 'unit_id', None)
@@ -1828,7 +1905,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
             role='executor',
         ).select_related('user')
 
-        # گروه‌بندی بر اساس (revision_id, task_id)
+        # ع¯ط±ظˆظ‡â€Œط¨ظ†ط¯غŒ ط¨ط± ط§ط³ط§ط³ (revision_id, task_id)
         executors_by_task = {}
         for tr in executor_roles:
             key = (tr.revision_id, tr.task_id)
@@ -1839,7 +1916,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
                 'jobTitle': getattr(tr.user, 'job_title', '') or '',
             })
 
-        # ساخت پاسخ هر تسک
+        # ط³ط§ط®طھ ظ¾ط§ط³ط® ظ‡ط± طھط³ع©
         tasks_data = []
         for tv in task_versions:
             project = tv.revision.project
@@ -1859,7 +1936,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
                 'executors': executors_by_task.get((tv.revision_id, tv.task_id), []),
             })
 
-        # اعضای واحدِ کاربر — dropdown ها از این لیست پر می‌شوند
+        # ط§ط¹ط¶ط§غŒ ظˆط§ط­ط¯ظگ ع©ط§ط±ط¨ط± â€” dropdown ظ‡ط§ ط§ط² ط§غŒظ† ظ„غŒط³طھ ظ¾ط± ظ…غŒâ€Œط´ظˆظ†ط¯
         if is_system_admin_actor:
             unit_members_qs = User.objects.all().order_by('username')
         elif unit_id:
@@ -1932,11 +2009,11 @@ def _bucket_label(key: str, granularity: str) -> str:
 
 
 def _working_days_in_bucket(bucket_dates: list[date]) -> int:
-    """Count Mon–Fri days in a list of dates (simplistic; ignores CalendarExceptions)."""
+    """Count Monâ€“Fri days in a list of dates (simplistic; ignores CalendarExceptions)."""
     return sum(1 for d in bucket_dates if d.weekday() < 5)
 
 
-# ─── view ─────────────────────────────────────────────────────────────────────
+# â”€â”€â”€ view â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class ResourceHistogramView(APIView):
     """
@@ -1974,25 +2051,25 @@ class ResourceHistogramView(APIView):
 
     permission_classes = [IsAuthenticated]
 
-    UNDERLOAD_THRESHOLD = 50    # % below this → underload
-    OVERLOAD_THRESHOLD  = 100   # % above this → overload
+    UNDERLOAD_THRESHOLD = 50    # % below this â†’ underload
+    OVERLOAD_THRESHOLD  = 100   # % above this â†’ overload
 
     def get(self, request, revision_id):
-        # ── 1. Fetch revision ──────────────────────────────────────────────
+        # â”€â”€ 1. Fetch revision â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         try:
             revision = Revision.objects.get(pk=revision_id)
         except Revision.DoesNotExist:
             return Response({"detail": "Revision not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        # محدودسازیِ خواندن: کاربر باید به پروژهٔ این نسخه دسترسیِ مشاهده داشته باشد.
+        # ظ…ط­ط¯ظˆط¯ط³ط§ط²غŒظگ ط®ظˆط§ظ†ط¯ظ†: ع©ط§ط±ط¨ط± ط¨ط§غŒط¯ ط¨ظ‡ ظ¾ط±ظˆعکظ‡ظ” ط§غŒظ† ظ†ط³ط®ظ‡ ط¯ط³طھط±ط³غŒظگ ظ…ط´ط§ظ‡ط¯ظ‡ ط¯ط§ط´طھظ‡ ط¨ط§ط´ط¯.
         if not can_view_project(request.user, revision.project):
-            return Response({"detail": "شما به این پروژه دسترسی ندارید."}, status=status.HTTP_403_FORBIDDEN)
+            return Response({"detail": "ط´ظ…ط§ ط¨ظ‡ ط§غŒظ† ظ¾ط±ظˆعکظ‡ ط¯ط³طھط±ط³غŒ ظ†ط¯ط§ط±غŒط¯."}, status=status.HTTP_403_FORBIDDEN)
 
         granularity = request.query_params.get("granularity", "day")
         if granularity not in ("day", "week", "month"):
             return Response({"detail": "granularity must be day|week|month."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ── 2. Pull all task versions for this revision ───────────────────
+        # â”€â”€ 2. Pull all task versions for this revision â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         task_versions = (
             TaskVersion.objects
             .filter(revision=revision, is_deleted=False)
@@ -2001,17 +2078,17 @@ class ResourceHistogramView(APIView):
             .select_related("task")
         )
 
-        # ── 3. Pull assignments for this revision ─────────────────────────
+        # â”€â”€ 3. Pull assignments for this revision â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         assignments = (
             Assignment.objects
             .filter(revision=revision)
             .select_related("resource", "task")
         )
 
-        # Map task_id → TaskVersion for quick lookup
+        # Map task_id â†’ TaskVersion for quick lookup
         tv_by_task = {str(tv.task_id): tv for tv in task_versions}
 
-        # ── 4. Determine global window ────────────────────────────────────
+        # â”€â”€ 4. Determine global window â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         starts  = [tv.planned_start.date() for tv in task_versions]
         finishes = [tv.planned_finish.date() for tv in task_versions]
 
@@ -2029,15 +2106,15 @@ class ResourceHistogramView(APIView):
 
         all_dates = list(_date_range(window_start, window_end))
 
-        # ── 5. Build bucket → list[date] mapping ──────────────────────────
+        # â”€â”€ 5. Build bucket â†’ list[date] mapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         bucket_dates: dict[str, list[date]] = defaultdict(list)
         for d in all_dates:
             bucket_dates[_bucket_key(d, granularity)].append(d)
 
         ordered_buckets = list(dict.fromkeys(_bucket_key(d, granularity) for d in all_dates))
 
-        # ── 6. Build per-resource, per-bucket load ────────────────────────
-        # Structure: resource_id → bucket_key → { allocated_hours, tasks }
+        # â”€â”€ 6. Build per-resource, per-bucket load â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Structure: resource_id â†’ bucket_key â†’ { allocated_hours, tasks }
         resource_load: dict[int, dict[str, dict]] = defaultdict(
             lambda: defaultdict(lambda: {"allocated_hours": Decimal("0"), "tasks": []})
         )
@@ -2079,7 +2156,7 @@ class ResourceHistogramView(APIView):
                     "hours_per_day": float(round(hours_per_working_day, 2)),
                 })
 
-        # ── 7. Deduplicate task entries per bucket ────────────────────────
+        # â”€â”€ 7. Deduplicate task entries per bucket â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for rid in resource_load:
             for bk in resource_load[rid]:
                 seen_tasks: dict[str, float] = {}
@@ -2093,7 +2170,7 @@ class ResourceHistogramView(APIView):
                     for tid, hrs in seen_tasks.items()
                 ]
 
-        # ── 8. Assemble response ──────────────────────────────────────────
+        # â”€â”€ 8. Assemble response â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         result_resources = []
         # Resources are global master data (Resource has no project FK). Include
         # active resources so planners can also see idle/available capacity.
@@ -2158,7 +2235,7 @@ class ImportMSPView(APIView):
 
     def post(self, request):
         xml_file = request.FILES.get("file")
-        # دریافت project_id و revision_id از درخواست
+        # ط¯ط±غŒط§ظپطھ project_id ظˆ revision_id ط§ط² ط¯ط±ط®ظˆط§ط³طھ
         project_id = request.data.get("project_id")
         revision_id = request.data.get("revision_id")
         active_node_id = request.data.get('active_node_id')
@@ -2218,7 +2295,7 @@ class ImportMSPView(APIView):
                 )
 
         try:
-            # فراخوانی تابع اصلاح شده در msp_importer.py
+            # ظپط±ط§ط®ظˆط§ظ†غŒ طھط§ط¨ط¹ ط§طµظ„ط§ط­ ط´ط¯ظ‡ ط¯ط± msp_importer.py
             result = import_msp_xml(xml_file, project_id, revision_id, active_node_id=active_node_id)
             if result.get("error"):
                 return Response(result, status=400)
@@ -2300,7 +2377,7 @@ class ResourceRateViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
 
-        # فیلتر امنیتی/دسترسی (اگر داری)
+        # ظپغŒظ„طھط± ط§ظ…ظ†غŒطھغŒ/ط¯ط³طھط±ط³غŒ (ط§ع¯ط± ط¯ط§ط±غŒ)
         # queryset = queryset.filter(...)
 
         resource_id = self.request.query_params.get('resource_id')
@@ -2344,26 +2421,26 @@ from django.contrib.auth import get_user_model
 User = get_user_model()
 class PersonalTaskViewSet(viewsets.ViewSet):
     """
-    مدیریت تسک‌های شخصی کاربران که به عنوان یک پروژه سیستمی در بک‌اند ثبت می‌شوند.
+    ظ…ط¯غŒط±غŒطھ طھط³ع©â€Œظ‡ط§غŒ ط´ط®طµغŒ ع©ط§ط±ط¨ط±ط§ظ† ع©ظ‡ ط¨ظ‡ ط¹ظ†ظˆط§ظ† غŒع© ظ¾ط±ظˆعکظ‡ ط³غŒط³طھظ…غŒ ط¯ط± ط¨ع©â€Œط§ظ†ط¯ ط«ط¨طھ ظ…غŒâ€Œط´ظˆظ†ط¯.
     """
     permission_classes = [IsAuthenticated]
 
-    # متد GET برای گرفتن لیست تسک‌های شخصی از سمت فرانت‌اند
+    # ظ…طھط¯ GET ط¨ط±ط§غŒ ع¯ط±ظپطھظ† ظ„غŒط³طھ طھط³ع©â€Œظ‡ط§غŒ ط´ط®طµغŒ ط§ط² ط³ظ…طھ ظپط±ط§ظ†طھâ€Œط§ظ†ط¯
     def list(self, request):
         sys_project = Project.objects.filter(name="System-Personal-Tasks").first()
         if not sys_project:
-            # اگر پروژه هنوز ساخته نشده، یعنی کاربر هنوز تسکی ایجاد نکرده است
+            # ط§ع¯ط± ظ¾ط±ظˆعکظ‡ ظ‡ظ†ظˆط² ط³ط§ط®طھظ‡ ظ†ط´ط¯ظ‡طŒ غŒط¹ظ†غŒ ع©ط§ط±ط¨ط± ظ‡ظ†ظˆط² طھط³ع©غŒ ط§غŒط¬ط§ط¯ ظ†ع©ط±ط¯ظ‡ ط§ط³طھ
             return Response([], status=status.HTTP_200_OK)
 
-        # پیدا کردن ریویژن فعال و تمام تسک‌هایی که حذف نشده‌اند
+        # ظ¾غŒط¯ط§ ع©ط±ط¯ظ† ط±غŒظˆغŒعکظ† ظپط¹ط§ظ„ ظˆ طھظ…ط§ظ… طھط³ع©â€Œظ‡ط§غŒغŒ ع©ظ‡ ط­ط°ظپ ظ†ط´ط¯ظ‡â€Œط§ظ†ط¯
         revision = get_official_revision(sys_project, ROLE_WORKING, required=True)
         tasks = TaskVersion.objects.filter(revision=revision, is_deleted=False)
 
-        # استفاده از سریالایزر گانت‌چارت برای همخوانی ساختار دیتا با فرانت‌اند
+        # ط§ط³طھظپط§ط¯ظ‡ ط§ط² ط³ط±غŒط§ظ„ط§غŒط²ط± ع¯ط§ظ†طھâ€Œع†ط§ط±طھ ط¨ط±ط§غŒ ظ‡ظ…ط®ظˆط§ظ†غŒ ط³ط§ط®طھط§ط± ط¯غŒطھط§ ط¨ط§ ظپط±ط§ظ†طھâ€Œط§ظ†ط¯
         serializer = ActivityNodeSerializer(tasks, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    # متد POST برای ایجاد تسک شخصی جدید
+    # ظ…طھط¯ POST ط¨ط±ط§غŒ ط§غŒط¬ط§ط¯ طھط³ع© ط´ط®طµغŒ ط¬ط¯غŒط¯
     @action(detail=False, methods=['post'], url_path='create')
     @transaction.atomic
     def create_personal_task(self, request):
@@ -2375,27 +2452,27 @@ class PersonalTaskViewSet(viewsets.ViewSet):
         current_id = (request.data.get('current_user')).get('id')
 
         if not all([title, start_date, duration_hours, user_id]):
-            return Response({"detail": "تمامی فیلدها (عنوان، تاریخ، مدت‌زمان و کاربر) الزامی است."},
+            return Response({"detail": "طھظ…ط§ظ…غŒ ظپغŒظ„ط¯ظ‡ط§ (ط¹ظ†ظˆط§ظ†طŒ طھط§ط±غŒط®طŒ ظ…ط¯طھâ€Œط²ظ…ط§ظ† ظˆ ع©ط§ط±ط¨ط±) ط§ظ„ط²ط§ظ…غŒ ط§ط³طھ."},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # ۱. ساخت یا دریافت پروژه سیستمی
+        # غ±. ط³ط§ط®طھ غŒط§ ط¯ط±غŒط§ظپطھ ظ¾ط±ظˆعکظ‡ ط³غŒط³طھظ…غŒ
         sys_project, created = Project.objects.get_or_create(
             name="System-Personal-Tasks",
             defaults={'created_by': request.user}
         )
 
-        # ۲. دریافت ریویژن (طبق مدل‌های شما، ریویژن صفر خودکار با ساخت پروژه ایجاد می‌شود)
+        # غ². ط¯ط±غŒط§ظپطھ ط±غŒظˆغŒعکظ† (ط·ط¨ظ‚ ظ…ط¯ظ„â€Œظ‡ط§غŒ ط´ظ…ط§طŒ ط±غŒظˆغŒعکظ† طµظپط± ط®ظˆط¯ع©ط§ط± ط¨ط§ ط³ط§ط®طھ ظ¾ط±ظˆعکظ‡ ط§غŒط¬ط§ط¯ ظ…غŒâ€Œط´ظˆط¯)
         revision = get_official_revision(sys_project, ROLE_WORKING, required=True)
 
-        # ۳. مدیریت ساختار WBS برای تسک‌های شخصی
-        # مدل WBSNode فیلد نام ندارد، نام در WBSNodeVersion ذخیره می‌شود
+        # غ³. ظ…ط¯غŒط±غŒطھ ط³ط§ط®طھط§ط± WBS ط¨ط±ط§غŒ طھط³ع©â€Œظ‡ط§غŒ ط´ط®طµغŒ
+        # ظ…ط¯ظ„ WBSNode ظپغŒظ„ط¯ ظ†ط§ظ… ظ†ط¯ط§ط±ط¯طŒ ظ†ط§ظ… ط¯ط± WBSNodeVersion ط°ط®غŒط±ظ‡ ظ…غŒâ€Œط´ظˆط¯
         wbs_node_version = WBSNodeVersion.objects.filter(revision=revision, title="My Personal Tasks").first()
 
         if not wbs_node_version:
-            # پیدا کردن گره ریشه که با سیگنال ایجاد شده
+            # ظ¾غŒط¯ط§ ع©ط±ط¯ظ† ع¯ط±ظ‡ ط±غŒط´ظ‡ ع©ظ‡ ط¨ط§ ط³غŒع¯ظ†ط§ظ„ ط§غŒط¬ط§ط¯ ط´ط¯ظ‡
             root_wbs = WBSNodeVersion.objects.get(revision=revision, parent__isnull=True)
 
-            # ساخت گره WBS فرزند برای کارهای شخصی
+            # ط³ط§ط®طھ ع¯ط±ظ‡ WBS ظپط±ط²ظ†ط¯ ط¨ط±ط§غŒ ع©ط§ط±ظ‡ط§غŒ ط´ط®طµغŒ
             base_node = WBSNode.objects.create(project=sys_project)
             wbs_node_version = WBSNodeVersion.objects.create(
                 node=base_node,
@@ -2405,7 +2482,7 @@ class PersonalTaskViewSet(viewsets.ViewSet):
                 sequence=1
             )
 
-        # ۴. ساخت تسک فیزیکی و نسخه آن
+        # غ´. ط³ط§ط®طھ طھط³ع© ظپغŒط²غŒع©غŒ ظˆ ظ†ط³ط®ظ‡ ط¢ظ†
         task = Task.objects.create(project=sys_project)
 
         task_ver = TaskVersion.objects.create(
@@ -2418,9 +2495,9 @@ class PersonalTaskViewSet(viewsets.ViewSet):
             description=description,
         )
 
-        # ۵. ایجاد نقش مجری
-        # این کار باعث می‌شود سیگنالی که در signals.py دارید، فوراً کاربر را به جدول Assignment
-        # اضافه کند تا برای لولینگ آماده شود.
+        # غµ. ط§غŒط¬ط§ط¯ ظ†ظ‚ط´ ظ…ط¬ط±غŒ
+        # ط§غŒظ† ع©ط§ط± ط¨ط§ط¹ط« ظ…غŒâ€Œط´ظˆط¯ ط³غŒع¯ظ†ط§ظ„غŒ ع©ظ‡ ط¯ط± signals.py ط¯ط§ط±غŒط¯طŒ ظپظˆط±ط§ظ‹ ع©ط§ط±ط¨ط± ط±ط§ ط¨ظ‡ ط¬ط¯ظˆظ„ Assignment
+        # ط§ط¶ط§ظپظ‡ ع©ظ†ط¯ طھط§ ط¨ط±ط§غŒ ظ„ظˆظ„غŒظ†ع¯ ط¢ظ…ط§ط¯ظ‡ ط´ظˆط¯.
         user = User.objects.get(id=user_id)
         current=User.objects.get(id=current_id)
         TaskRole.objects.create(
@@ -2437,53 +2514,53 @@ class PersonalTaskViewSet(viewsets.ViewSet):
         )
 
 
-        # ۶. بازگرداندن دیتای تسک با فرمت استاندارد برای نمایش سریع در لیست فرانت‌اند
+        # غ¶. ط¨ط§ط²ع¯ط±ط¯ط§ظ†ط¯ظ† ط¯غŒطھط§غŒ طھط³ع© ط¨ط§ ظپط±ظ…طھ ط§ط³طھط§ظ†ط¯ط§ط±ط¯ ط¨ط±ط§غŒ ظ†ظ…ط§غŒط´ ط³ط±غŒط¹ ط¯ط± ظ„غŒط³طھ ظپط±ط§ظ†طھâ€Œط§ظ†ط¯
         serializer = ActivityNodeSerializer(task_ver)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-    # متد DELETE برای لغو یا پاک کردن تسک شخصی
+    # ظ…طھط¯ DELETE ط¨ط±ط§غŒ ظ„ط؛ظˆ غŒط§ ظ¾ط§ع© ع©ط±ط¯ظ† طھط³ع© ط´ط®طµغŒ
     def destroy(self, request, pk=None):
         try:
             task_ver = TaskVersion.objects.get(task__id=pk)
 
-            # استفاده از ویژگی Soft Delete که در سیستم شما پیاده‌سازی شده است
+            # ط§ط³طھظپط§ط¯ظ‡ ط§ط² ظˆغŒعکع¯غŒ Soft Delete ع©ظ‡ ط¯ط± ط³غŒط³طھظ… ط´ظ…ط§ ظ¾غŒط§ط¯ظ‡â€Œط³ط§ط²غŒ ط´ط¯ظ‡ ط§ط³طھ
             task_ver.is_deleted = True
             task_ver.save()
 
-            # حذف نقش کاربر تا سیگنال remove_executor_assignment در signals.py
-            # تریگر شود و منبع را از Assignment پاک کند، تا ظرفیت آزاد شود.
+            # ط­ط°ظپ ظ†ظ‚ط´ ع©ط§ط±ط¨ط± طھط§ ط³غŒع¯ظ†ط§ظ„ remove_executor_assignment ط¯ط± signals.py
+            # طھط±غŒع¯ط± ط´ظˆط¯ ظˆ ظ…ظ†ط¨ط¹ ط±ط§ ط§ط² Assignment ظ¾ط§ع© ع©ظ†ط¯طŒ طھط§ ط¸ط±ظپغŒطھ ط¢ط²ط§ط¯ ط´ظˆط¯.
             TaskRole.objects.filter(task__id=pk).delete()
 
             return Response(status=status.HTTP_204_NO_CONTENT)
         except TaskVersion.DoesNotExist:
-            return Response({"detail": "تسک یافت نشد."}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"detail": "طھط³ع© غŒط§ظپطھ ظ†ط´ط¯."}, status=status.HTTP_404_NOT_FOUND)
 
 
     def partial_update(self, request, pk=None):
         try:
-            # پیدا کردن تسک فعلی که حذف نشده باشد
+            # ظ¾غŒط¯ط§ ع©ط±ط¯ظ† طھط³ع© ظپط¹ظ„غŒ ع©ظ‡ ط­ط°ظپ ظ†ط´ط¯ظ‡ ط¨ط§ط´ط¯
             task_ver = TaskVersion.objects.get(task__id=pk, is_deleted=False)
 
-            # دریافت فیلدهای ارسال شده از سمت کلاینت
+            # ط¯ط±غŒط§ظپطھ ظپغŒظ„ط¯ظ‡ط§غŒ ط§ط±ط³ط§ظ„ ط´ط¯ظ‡ ط§ط² ط³ظ…طھ ع©ظ„ط§غŒظ†طھ
             title = request.data.get('title')
             start_date = request.data.get('start_date')
             duration_hours = request.data.get('duration_hours')
             description = request.data.get('description')
             user_id = request.data.get('user_id')
 
-            # اعمال تغییرات روی تسک (در صورت وجود هر فیلد در ریکوئست)
+            # ط§ط¹ظ…ط§ظ„ طھط؛غŒغŒط±ط§طھ ط±ظˆغŒ طھط³ع© (ط¯ط± طµظˆط±طھ ظˆط¬ظˆط¯ ظ‡ط± ظپغŒظ„ط¯ ط¯ط± ط±غŒع©ظˆط¦ط³طھ)
             if title:
                 task_ver.title = title
             if start_date:
                 task_ver.planned_start = start_date
             if duration_hours:
                 task_ver.duration_hours = duration_hours
-            if description is not None:  # توضیحات می‌تواند خالی باشد
+            if description is not None:  # طھظˆط¶غŒط­ط§طھ ظ…غŒâ€Œطھظˆط§ظ†ط¯ ط®ط§ظ„غŒ ط¨ط§ط´ط¯
                 task_ver.description = description
 
             task_ver.save()
 
-            # در صورتی که کاربر مجری تغییر کرده باشد، نقش او را آپدیت می‌کنیم
+            # ط¯ط± طµظˆط±طھغŒ ع©ظ‡ ع©ط§ط±ط¨ط± ظ…ط¬ط±غŒ طھط؛غŒغŒط± ع©ط±ط¯ظ‡ ط¨ط§ط´ط¯طŒ ظ†ظ‚ط´ ط§ظˆ ط±ط§ ط¢ظ¾ط¯غŒطھ ظ…غŒâ€Œع©ظ†غŒظ…
             if user_id:
                 task_role = TaskRole.objects.filter(task=task_ver.task, role='executor').first()
                 if task_role:
@@ -2491,7 +2568,7 @@ class PersonalTaskViewSet(viewsets.ViewSet):
                         task_role.user_id = user_id
                         task_role.save()
                 else:
-                    # اگر نقشی از قبل نبود، یکی می‌سازیم
+                    # ط§ع¯ط± ظ†ظ‚ط´غŒ ط§ط² ظ‚ط¨ظ„ ظ†ط¨ظˆط¯طŒ غŒع©غŒ ظ…غŒâ€Œط³ط§ط²غŒظ…
                     TaskRole.objects.create(
                         revision=task_ver.revision,
                         task=task_ver.task,
@@ -2499,16 +2576,16 @@ class PersonalTaskViewSet(viewsets.ViewSet):
                         role='executor'
                     )
 
-            # استفاده از همان سریالایزری که در لیست و ساخت استفاده کردید
+            # ط§ط³طھظپط§ط¯ظ‡ ط§ط² ظ‡ظ…ط§ظ† ط³ط±غŒط§ظ„ط§غŒط²ط±غŒ ع©ظ‡ ط¯ط± ظ„غŒط³طھ ظˆ ط³ط§ط®طھ ط§ط³طھظپط§ط¯ظ‡ ع©ط±ط¯غŒط¯
             serializer = ActivityNodeSerializer(task_ver)
             return Response(serializer.data, status=status.HTTP_200_OK)
 
         except TaskVersion.DoesNotExist:
-            return Response({"detail": "تسک یافت نشد."}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"detail": "طھط³ع© غŒط§ظپطھ ظ†ط´ط¯."}, status=status.HTTP_404_NOT_FOUND)
 
 
 class VarianceReportViewSet(viewsets.ModelViewSet):
-    """مدیریت گزارش‌های انحراف و اتصال به موتور EVM"""
+    """ظ…ط¯غŒط±غŒطھ ع¯ط²ط§ط±ط´â€Œظ‡ط§غŒ ط§ظ†ط­ط±ط§ظپ ظˆ ط§طھطµط§ظ„ ط¨ظ‡ ظ…ظˆطھظˆط± EVM"""
     queryset = VarianceReport.objects.all()
     serializer_class = VarianceReportSerializer
     permission_classes = [IsAuthenticated]
@@ -2519,6 +2596,23 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
         revision_id = self.request.query_params.get('revision_id')
         if revision_id:
             queryset = queryset.filter(revision_id=revision_id)
+        task_id = self.request.query_params.get('task_id')
+        if task_id:
+            queryset = queryset.filter(task_id=task_id)
+        wbs_node_id = self.request.query_params.get('wbs_node_id')
+        if wbs_node_id:
+            wbs_queryset = WBSNodeVersion.objects.filter(node_id=wbs_node_id, is_deleted=False)
+            if revision_id:
+                wbs_queryset = wbs_queryset.filter(revision_id=revision_id)
+            wbs_version = wbs_queryset.first()
+            if wbs_version:
+                scoped_wbs_ids = wbs_version.get_descendants(include_self=True).values_list('id', flat=True)
+                queryset = queryset.filter(
+                    task__versions__revision_id=F('revision_id'),
+                    task__versions__wbs_node_id__in=scoped_wbs_ids,
+                ).distinct()
+            else:
+                queryset = queryset.none()
         search = (self.request.query_params.get('search') or '').strip()
         if search:
             queryset = queryset.filter(
@@ -2608,17 +2702,17 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], url_path='calculate')
     def trigger_calculation(self, request):
-        """اجرای دستی موتور محاسباتی برای یک پروژه"""
+        """ط§ط¬ط±ط§غŒ ط¯ط³طھغŒ ظ…ظˆطھظˆط± ظ…ط­ط§ط³ط¨ط§طھغŒ ط¨ط±ط§غŒ غŒع© ظ¾ط±ظˆعکظ‡"""
         project_id = request.data.get('project_id')
         if not project_id:
-            return Response({"error": "project_id الزامی است."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "project_id ط§ظ„ط²ط§ظ…غŒ ط§ط³طھ."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             data_datetime = parse_cpm_data_date(request.data.get('dataDate'))
             engine = EVMEngine(project_id=project_id, data_datetime=data_datetime)
             result = engine.run_historical_task_level_variances()
             return Response({
-                "status": "محاسبات با موفقیت انجام شد و دیتابیس به‌روزرسانی گردید.",
+                "status": "ظ…ط­ط§ط³ط¨ط§طھ ط¨ط§ ظ…ظˆظپظ‚غŒطھ ط§ظ†ط¬ط§ظ… ط´ط¯ ظˆ ط¯غŒطھط§ط¨غŒط³ ط¨ظ‡â€Œط±ظˆط²ط±ط³ط§ظ†غŒ ع¯ط±ط¯غŒط¯.",
                 "dataDate": engine.data_datetime.isoformat() if engine.data_datetime else None,
                 "historyDates": result.get("dates", []),
                 "snapshots": result.get("snapshots", 0),
@@ -2629,12 +2723,12 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ─── SystemSettings endpoint (singleton) ──────────────────────────────────────
+# â”€â”€â”€ SystemSettings endpoint (singleton) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class SystemSettingsView(APIView):
     """
-    GET: خواندنِ تنظیماتِ کلیِ سیستم (هر کاربرِ احرازشده).
-    PUT/PATCH: ویرایش فقط توسطِ سطحِ شرکت (company_admin / company_pm / superuser).
+    GET: ط®ظˆط§ظ†ط¯ظ†ظگ طھظ†ط¸غŒظ…ط§طھظگ ع©ظ„غŒظگ ط³غŒط³طھظ… (ظ‡ط± ع©ط§ط±ط¨ط±ظگ ط§ط­ط±ط§ط²ط´ط¯ظ‡).
+    PUT/PATCH: ظˆغŒط±ط§غŒط´ ظپظ‚ط· طھظˆط³ط·ظگ ط³ط·ط­ظگ ط´ط±ع©طھ (company_admin / company_pm / superuser).
     """
     permission_classes = [IsAuthenticated]
 
@@ -2651,7 +2745,7 @@ class SystemSettingsView(APIView):
 
     def _update(self, request):
         if not is_company_level(request.user):
-            raise PermissionDenied("ویرایشِ تنظیماتِ سیستم فقط برای کاربرانِ سطحِ شرکت مجاز است.")
+            raise PermissionDenied("ظˆغŒط±ط§غŒط´ظگ طھظ†ط¸غŒظ…ط§طھظگ ط³غŒط³طھظ… ظپظ‚ط· ط¨ط±ط§غŒ ع©ط§ط±ط¨ط±ط§ظ†ظگ ط³ط·ط­ظگ ط´ط±ع©طھ ظ…ط¬ط§ط² ط§ط³طھ.")
         settings_obj = SystemSettings.current()
         serializer = SystemSettingsSerializer(settings_obj, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
@@ -2661,17 +2755,17 @@ class SystemSettingsView(APIView):
 
 class UnitOfMeasureViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    ویوست برای واحدهای اندازه‌گیری.
-    معمولاً واحدها فقط خواندنی (ReadOnly) هستند و از طریق پنل ادمین یا شل اضافه می‌شوند.
-    اگر می‌خواهید از طریق API هم قابلیت اضافه کردن داشته باشید، از ModelViewSet استفاده کنید.
+    ظˆغŒظˆط³طھ ط¨ط±ط§غŒ ظˆط§ط­ط¯ظ‡ط§غŒ ط§ظ†ط¯ط§ط²ظ‡â€Œع¯غŒط±غŒ.
+    ظ…ط¹ظ…ظˆظ„ط§ظ‹ ظˆط§ط­ط¯ظ‡ط§ ظپظ‚ط· ط®ظˆط§ظ†ط¯ظ†غŒ (ReadOnly) ظ‡ط³طھظ†ط¯ ظˆ ط§ط² ط·ط±غŒظ‚ ظ¾ظ†ظ„ ط§ط¯ظ…غŒظ† غŒط§ ط´ظ„ ط§ط¶ط§ظپظ‡ ظ…غŒâ€Œط´ظˆظ†ط¯.
+    ط§ع¯ط± ظ…غŒâ€Œط®ظˆط§ظ‡غŒط¯ ط§ط² ط·ط±غŒظ‚ API ظ‡ظ… ظ‚ط§ط¨ظ„غŒطھ ط§ط¶ط§ظپظ‡ ع©ط±ط¯ظ† ط¯ط§ط´طھظ‡ ط¨ط§ط´غŒط¯طŒ ط§ط² ModelViewSet ط§ط³طھظپط§ط¯ظ‡ ع©ظ†غŒط¯.
     """
     queryset = UnitOfMeasure.objects.all().order_by('name')
     serializer_class = UnitOfMeasureSerializer
-    permission_classes = [IsAuthenticated] # در صورت نیاز به احراز هویت
+    permission_classes = [IsAuthenticated] # ط¯ط± طµظˆط±طھ ظ†غŒط§ط² ط¨ظ‡ ط§ط­ط±ط§ط² ظ‡ظˆغŒطھ
 
 class ExpenseTypeViewSet(viewsets.ModelViewSet):
     """
-    ویوست کامل برای مدیریت انواع هزینه‌ها (Expense Types).
+    ظˆغŒظˆط³طھ ع©ط§ظ…ظ„ ط¨ط±ط§غŒ ظ…ط¯غŒط±غŒطھ ط§ظ†ظˆط§ط¹ ظ‡ط²غŒظ†ظ‡â€Œظ‡ط§ (Expense Types).
     """
     queryset = ExpenseType.objects.all().order_by('name')
     serializer_class = ExpenseTypeSerializer
@@ -3006,14 +3100,14 @@ class UnfundedForecastCostViewSet(viewsets.ModelViewSet):
 
 
 class CostTransactionViewSet(viewsets.ModelViewSet):
-    """مدیریت تراکنش‌های مالی و هزینه‌ها"""
+    """ظ…ط¯غŒط±غŒطھ طھط±ط§ع©ظ†ط´â€Œظ‡ط§غŒ ظ…ط§ظ„غŒ ظˆ ظ‡ط²غŒظ†ظ‡â€Œظ‡ط§"""
     queryset = CostTransaction.objects.all().order_by('-transaction_date', '-created_at')
     serializer_class = CostTransactionSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        # فیلتر کردن هزینه‌ها بر اساس پروژه‌هایی که کاربر دسترسی دارد
+        # ظپغŒظ„طھط± ع©ط±ط¯ظ† ظ‡ط²غŒظ†ظ‡â€Œظ‡ط§ ط¨ط± ط§ط³ط§ط³ ظ¾ط±ظˆعکظ‡â€Œظ‡ط§غŒغŒ ع©ظ‡ ع©ط§ط±ط¨ط± ط¯ط³طھط±ط³غŒ ط¯ط§ط±ط¯
         queryset = queryset.filter(project_id__in=accessible_project_ids(self.request.user))
 
         project_id = self.request.query_params.get('project_id')
@@ -3184,6 +3278,132 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
         instance.delete()
 
 
+class TaskFinancialPlanViewSet(viewsets.ModelViewSet):
+    serializer_class = TaskFinancialPlanSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = TaskFinancialPlan.objects.select_related('task', 'task__project', 'created_by').prefetch_related('milestones__transactions')
+        queryset = queryset.filter(task__project_id__in=accessible_project_ids(self.request.user))
+        task_id = self.request.query_params.get('task_id')
+        if task_id:
+            queryset = queryset.filter(task_id=task_id)
+        status_value = self.request.query_params.get('status')
+        if status_value:
+            queryset = queryset.filter(status=status_value)
+        return queryset
+
+    def perform_create(self, serializer):
+        task = serializer.validated_data.get('task')
+        require_can_edit_project(self.request.user, task.project)
+        plan = serializer.save(created_by=self.request.user)
+        log_budget_audit(self.request, 'task_financial_plan_created', plan)
+
+    def perform_update(self, serializer):
+        plan = serializer.instance
+        require_can_edit_project(self.request.user, plan.task.project)
+        next_status = serializer.validated_data.get('status')
+        if next_status == TaskFinancialPlan.STATUS_ACTIVE:
+            raise ValidationError({'status': 'Use the activate action to activate financial plans.'})
+        if plan.status == TaskFinancialPlan.STATUS_ACTIVE and next_status not in (None, TaskFinancialPlan.STATUS_SUSPENDED):
+            raise ValidationError({'status': 'Use workflow actions to change active financial plans.'})
+        old = model_to_dict_safe(plan)
+        updated = serializer.save()
+        log_budget_audit(self.request, 'task_financial_plan_updated', updated, old=old)
+
+    def perform_destroy(self, instance):
+        require_can_edit_project(self.request.user, instance.task.project)
+        if instance.status == TaskFinancialPlan.STATUS_ACTIVE or PaymentTransaction.objects.filter(milestone__financial_plan=instance).exists():
+            raise ValidationError({'detail': 'Active plans or plans with ledger transactions cannot be deleted.'})
+        old = model_to_dict_safe(instance)
+        log_budget_audit(self.request, 'task_financial_plan_deleted', instance, old=old, extra={'deleted': old})
+        instance.delete()
+
+    @action(detail=True, methods=['post'])
+    def activate(self, request, pk=None):
+        plan = self.get_object()
+        require_can_edit_project(request.user, plan.task.project)
+        old = model_to_dict_safe(plan)
+        plan = activate_plan(plan)
+        log_budget_audit(request, 'task_financial_plan_activated', plan, old=old)
+        return Response(self.get_serializer(plan).data)
+
+    @action(detail=False, methods=['get'], url_path='status')
+    def status_summary(self, request):
+        task_id = request.query_params.get('task_id')
+        if not task_id:
+            raise ValidationError({'task_id': 'task_id is required.'})
+        task = get_object_or_404(Task.objects.filter(project_id__in=accessible_project_ids(request.user)), pk=task_id)
+        return Response(get_task_financial_status(task))
+
+
+class PaymentMilestoneViewSet(viewsets.ModelViewSet):
+    serializer_class = PaymentMilestoneSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = PaymentMilestone.objects.select_related('financial_plan', 'financial_plan__task', 'financial_plan__task__project').prefetch_related('transactions')
+        queryset = queryset.filter(financial_plan__task__project_id__in=accessible_project_ids(self.request.user))
+        plan_id = self.request.query_params.get('financial_plan_id')
+        if plan_id:
+            queryset = queryset.filter(financial_plan_id=plan_id)
+        return queryset
+
+    def _require_manage(self, milestone_or_plan):
+        plan = milestone_or_plan.financial_plan if hasattr(milestone_or_plan, 'financial_plan') else milestone_or_plan
+        require_can_edit_project(self.request.user, plan.task.project)
+
+    def perform_create(self, serializer):
+        plan = serializer.validated_data.get('financial_plan')
+        self._require_manage(plan)
+        milestone = serializer.save()
+        log_budget_audit(self.request, 'payment_milestone_created', milestone)
+
+    def perform_update(self, serializer):
+        milestone = serializer.instance
+        self._require_manage(milestone)
+        old = model_to_dict_safe(milestone)
+        updated = serializer.save()
+        log_budget_audit(self.request, 'payment_milestone_updated', updated, old=old)
+
+    def perform_destroy(self, instance):
+        self._require_manage(instance)
+        if instance.transactions.exists():
+            raise ValidationError({'detail': 'Milestones with ledger transactions cannot be deleted.'})
+        old = model_to_dict_safe(instance)
+        log_budget_audit(self.request, 'payment_milestone_deleted', instance, old=old, extra={'deleted': old})
+        instance.delete()
+
+    @action(detail=True, methods=['post'], url_path='transactions')
+    def record_transaction(self, request, pk=None):
+        milestone = self.get_object()
+        self._require_manage(milestone)
+        serializer = PaymentTransactionSerializer(data={**request.data, 'milestone': milestone.pk})
+        serializer.is_valid(raise_exception=True)
+        tx = register_transaction(
+            milestone,
+            serializer.validated_data['transaction_type'],
+            serializer.validated_data['amount'],
+            serializer.validated_data['transaction_date'],
+            user=request.user,
+            reference_number=serializer.validated_data.get('reference_number', ''),
+            description=serializer.validated_data.get('description', ''),
+        )
+        log_budget_audit(request, f"payment_transaction_{tx.transaction_type}_created", tx)
+        return Response(PaymentTransactionSerializer(tx).data, status=status.HTTP_201_CREATED)
+
+
+class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = PaymentTransactionSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = PaymentTransaction.objects.select_related('milestone', 'milestone__financial_plan', 'milestone__financial_plan__task')
+        queryset = queryset.filter(milestone__financial_plan__task__project_id__in=accessible_project_ids(self.request.user))
+        milestone_id = self.request.query_params.get('milestone_id')
+        if milestone_id:
+            queryset = queryset.filter(milestone_id=milestone_id)
+        return queryset
 class TaskViewSet(viewsets.ReadOnlyModelViewSet):
     """Read-only dropdown tasks scoped to the project's official execution revision."""
     queryset = Task.objects.all()
@@ -3600,3 +3820,6 @@ class ResourceLevelingPlanViewSet(viewsets.ModelViewSet):
             "tasks": tasks,
             "resources": sorted(resource_map.values(), key=lambda row: row["name"]),
         }
+
+
+

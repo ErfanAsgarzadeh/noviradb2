@@ -365,6 +365,16 @@ class Item(models.Model):
             raise ValidationError({'classification': 'Classification must belong to the same organization as item.'})
         if self.status == 'MERGED' and not self.replaced_by_item_id:
             raise ValidationError({'replaced_by_item': 'Merged items require a replacement item.'})
+        active_by_status = {
+            'DRAFT': True,
+            'ACTIVE': True,
+            'PHASE_OUT': True,
+            'BLOCKED': False,
+            'OBSOLETE': False,
+            'MERGED': False,
+        }
+        if self.status in active_by_status:
+            self.is_active = active_by_status[self.status]
 
     def save(self, *args, **kwargs):
         self.full_clean()

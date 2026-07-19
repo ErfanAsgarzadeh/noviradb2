@@ -7,3 +7,7 @@ admin.site.register(WBSNode)
 admin.site.register(FundingSource)
 admin.site.register(BudgetAllocation)
 
+
+admin.site.register(TaskFinancialPlan)
+admin.site.register(PaymentMilestone)
+admin.site.register(PaymentTransaction)

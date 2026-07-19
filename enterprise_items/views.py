@@ -5,6 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.serializers import ValidationError as DRFValidationError
 
@@ -85,6 +86,17 @@ from .bom_services import (
     validate_bom_revision_for_release,
 )
 from .readiness import evaluate_item_revision_readiness
+from .workspace_services import (
+    apply_part_list_filters,
+    audit_history_for_item,
+    change_item_status,
+    dashboard_metrics,
+    part_detail_summary,
+    part_list_row,
+    revision_attribute_workspace,
+    revision_summary,
+    sort_part_list,
+)
 from .services import (
     approve_revision,
     ensure_revision_deletable,
@@ -474,8 +486,9 @@ class CodeSchemeViewSet(viewsets.ModelViewSet):
 
 
 class ItemViewSet(viewsets.ModelViewSet):
-    queryset = Item.objects.select_related('organization', 'item_type', 'category', 'created_by').prefetch_related(
+    queryset = Item.objects.select_related('organization', 'item_type', 'category', 'classification', 'coding_scheme', 'coding_template', 'created_by').prefetch_related(
         'revisions',
+        'identifiers',
         'manufacturing_variants',
         'manufacturing_variants__inputs',
         'manufacturing_variants__stage_codes',
@@ -514,6 +527,41 @@ class ItemViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+
+    @action(detail=False, methods=['get'], url_path='workspace-dashboard')
+    def workspace_dashboard(self, request):
+        return Response(dashboard_metrics())
+
+    @action(detail=False, methods=['get'], url_path='workspace')
+    def workspace(self, request):
+        queryset = Item.objects.select_related('classification', 'coding_scheme', 'coding_template').prefetch_related('revisions', 'identifiers')
+        queryset = apply_part_list_filters(queryset, request.query_params)
+        queryset = sort_part_list(queryset, request.query_params.get('ordering'))
+        paginator = PageNumberPagination()
+        paginator.page_size = min(int(request.query_params.get('page_size', 25)), 100)
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        rows = [part_list_row(item) for item in page]
+        return paginator.get_paginated_response(rows)
+
+    @action(detail=True, methods=['get'], url_path='workspace-summary')
+    def workspace_summary(self, request, pk=None):
+        item = Item.objects.select_related('classification', 'coding_scheme', 'coding_template', 'item_type', 'organization').prefetch_related('revisions', 'identifiers').get(pk=pk)
+        return Response(part_detail_summary(item))
+
+    @action(detail=True, methods=['get'], url_path='history')
+    def history(self, request, pk=None):
+        return Response({'results': audit_history_for_item(self.get_object())})
+
+    @action(detail=True, methods=['post'], url_path='status-change')
+    def status_change(self, request, pk=None):
+        try:
+            item = change_item_status(self.get_object(), actor=request.user, status=request.data.get('status'), reason=request.data.get('reason', ''))
+            return Response(self.get_serializer(item).data)
+        except EngineeringPermissionError as exc:
+            raise PermissionDenied(str(exc))
+        except EngineeringLifecycleError as exc:
+            return Response(_validation_payload(exc), status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'])
     def activate(self, request, pk=None):
@@ -561,6 +609,17 @@ class ItemRevisionViewSet(viewsets.ModelViewSet):
     serializer_class = ItemRevisionSerializer
     permission_classes = [IsAuthenticated, CanManageEngineering]
 
+
+
+    @action(detail=True, methods=['get'], url_path='workspace-summary')
+    def workspace_summary(self, request, pk=None):
+        revision = self.get_object()
+        return Response(revision_summary(revision))
+
+    @action(detail=True, methods=['get'], url_path='technical-attributes')
+    def technical_attributes(self, request, pk=None):
+        revision = ItemRevision.objects.select_related('item__classification').prefetch_related('attribute_values__attribute_definition').get(pk=pk)
+        return Response({'results': revision_attribute_workspace(revision)})
     def get_queryset(self):
         queryset = super().get_queryset()
         item_id = self.request.query_params.get('item')
