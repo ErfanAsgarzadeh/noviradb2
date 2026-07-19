@@ -1183,24 +1183,33 @@ class ActivityNodeViewSet(viewsets.ModelViewSet):
 
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
-        series = self._series(queryset)
-        include_history = (request.query_params.get('history') or '').lower() in {'1', 'true', 'yes'}
-        display_queryset = queryset if include_history else self._latest_task_queryset(queryset)
+        display_queryset = queryset
+
         page_param = request.query_params.get('page')
-        page_size_param = request.query_params.get('pageSize') or request.query_params.get('page_size')
+        page_size_param = (
+                request.query_params.get('pageSize')
+                or request.query_params.get('page_size')
+        )
+
         if not page_param and not page_size_param:
             display_items = self._attach_schedule_quality(display_queryset)
             serializer = self.get_serializer(display_items, many=True)
             return Response(serializer.data)
+
         try:
             page = max(int(page_param or 1), 1)
             page_size = min(max(int(page_size_param or 50), 1), 100)
         except (TypeError, ValueError):
             page, page_size = 1, 50
+
         total = display_queryset.count()
         start = (page - 1) * page_size
-        page_items = self._attach_schedule_quality(display_queryset[start:start + page_size])
+
+        page_items = self._attach_schedule_quality(
+            display_queryset[start:start + page_size]
+        )
         serializer = self.get_serializer(page_items, many=True)
+
         return Response({
             'results': serializer.data,
             'page': page,
