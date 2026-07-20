@@ -783,8 +783,8 @@ class GlobalLevelingRun(models.Model):
     ]
 
     DEFAULT_PRIORITY_RULES = [
+        {"criterion": PRIORITY_PROJECT_PRIORITY, "direction": "asc"},
         {"criterion": PRIORITY_TOTAL_FLOAT, "direction": "asc"},
-        {"criterion": PRIORITY_LATE_START, "direction": "asc"},
     ]
 
     STATUS_DRAFT = "draft"
@@ -2073,3 +2073,4 @@ class UnfundedForecastCost(models.Model):
 
     def __str__(self):
         return f"{self.title} - {self.amount} - {self.forecast_date}"
+

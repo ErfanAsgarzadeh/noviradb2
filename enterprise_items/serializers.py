@@ -461,6 +461,18 @@ class ClassificationAttributeSerializer(serializers.ModelSerializer):
         fields = ['id', 'classification', 'attribute_definition', 'attribute', 'required_override', 'code_bearing_override', 'identity_defining_override', 'duplicate_key_override', 'default_unit', 'display_order', 'inherited', 'is_active', 'effective_required', 'effective_code_bearing', 'effective_identity_defining', 'effective_duplicate_key']
         read_only_fields = ['id', 'effective_required', 'effective_code_bearing', 'effective_identity_defining', 'effective_duplicate_key']
 
+    def create(self, validated_data):
+        try:
+            return super().create(validated_data)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(getattr(exc, 'message_dict', None) or exc.messages) from exc
+
+    def update(self, instance, validated_data):
+        try:
+            return super().update(instance, validated_data)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(getattr(exc, 'message_dict', None) or exc.messages) from exc
+
 
 class ItemRevisionAttributeValueSerializer(serializers.ModelSerializer):
     attribute = AttributeDefinitionSerializer(source='attribute_definition', read_only=True)
@@ -484,6 +496,18 @@ class AttributeEncodingOptionSerializer(serializers.ModelSerializer):
         fields = ['id', 'rule', 'source_value', 'encoded_value', 'sort_order', 'is_active']
         read_only_fields = ['id']
 
+    def create(self, validated_data):
+        try:
+            return super().create(validated_data)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(getattr(exc, 'message_dict', None) or exc.messages) from exc
+
+    def update(self, instance, validated_data):
+        try:
+            return super().update(instance, validated_data)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(getattr(exc, 'message_dict', None) or exc.messages) from exc
+
 
 class AttributeEncodingRuleSerializer(serializers.ModelSerializer):
     options = AttributeEncodingOptionSerializer(many=True, read_only=True)
@@ -492,6 +516,18 @@ class AttributeEncodingRuleSerializer(serializers.ModelSerializer):
         model = AttributeEncodingRule
         fields = ['id', 'organization', 'code', 'name', 'encoding_type', 'canonical_unit', 'multiplier', 'precision', 'rounding_policy', 'zero_pad_width', 'text_case', 'max_length', 'true_token', 'false_token', 'date_pattern', 'prefix', 'suffix', 'is_active', 'options', 'created_at', 'updated_at']
         read_only_fields = ['id', 'options', 'created_at', 'updated_at']
+
+    def create(self, validated_data):
+        try:
+            return super().create(validated_data)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(getattr(exc, 'message_dict', None) or exc.messages) from exc
+
+    def update(self, instance, validated_data):
+        try:
+            return super().update(instance, validated_data)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(getattr(exc, 'message_dict', None) or exc.messages) from exc
 
 
 class ItemCodingTemplateSegmentSerializer(serializers.ModelSerializer):
@@ -502,6 +538,18 @@ class ItemCodingTemplateSegmentSerializer(serializers.ModelSerializer):
         model = ItemCodingTemplateSegment
         fields = ['id', 'template', 'position', 'segment_type', 'literal_value', 'classification_level', 'attribute_definition', 'attribute', 'encoding_rule', 'rule', 'width', 'required', 'fallback_value', 'prefix', 'suffix']
         read_only_fields = ['id', 'attribute', 'rule']
+
+    def create(self, validated_data):
+        try:
+            return super().create(validated_data)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(getattr(exc, 'message_dict', None) or exc.messages) from exc
+
+    def update(self, instance, validated_data):
+        try:
+            return super().update(instance, validated_data)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(getattr(exc, 'message_dict', None) or exc.messages) from exc
 
 
 class ItemCodingTemplateSerializer(serializers.ModelSerializer):

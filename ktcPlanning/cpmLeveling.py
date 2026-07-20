@@ -137,14 +137,21 @@ class MultiProjectLevelingEngine:
                     "units_percent": float(assignment.units_percent) / 100.0,
                 })
 
-    def _get_resource_capacity(self, resource_id: int, date: datetime.date) -> float:
+    def _get_resource_capacity(
+        self,
+        resource_id: int,
+        date: datetime.date,
+        fallback_cal_engine: Optional[CalendarEngine] = None,
+    ) -> float:
         if date not in self.remaining_capacity[resource_id]:
             res = self.resources[resource_id]
             cal_engine = self.resource_cal_engines.get(resource_id)
-            if cal_engine is None:
-                base_hours = 8.0 if date.weekday() < 5 else 0.0
-            else:
+            if cal_engine is not None:
                 base_hours = cal_engine.get_day_schedule(date).total_hours
+            elif fallback_cal_engine is not None:
+                base_hours = fallback_cal_engine.get_day_schedule(date).total_hours
+            else:
+                base_hours = 8.0 if date.weekday() < 5 else 0.0
             max_units_factor = float(res.max_units) / 100.0
             self.remaining_capacity[resource_id][date] = base_hours * max_units_factor
         return self.remaining_capacity[resource_id][date]
@@ -326,7 +333,7 @@ class MultiProjectLevelingEngine:
 
                 for date, task_hours in daily_distribution.items():
                     res_needed = task_hours * req_percent
-                    available = self._get_resource_capacity(res_id, date)
+                    available = self._get_resource_capacity(res_id, date, cal_engine)
                     if res_needed > available + 0.001:
                         can_schedule = False
                         break
@@ -458,3 +465,5 @@ class MultiProjectLevelingEngine:
         ])
         logger.info(f"Resource Leveling Plan {self.leveling_run.id} calculated.")
         return {"status": "Success", "tasks_evaluated": len(self.global_nodes)}
+
+

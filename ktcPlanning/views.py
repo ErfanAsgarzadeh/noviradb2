@@ -1218,7 +1218,7 @@ class ActivityNodeViewSet(viewsets.ModelViewSet):
             'hasNext': start + len(serializer.data) < total,
         })
 
-    # --- ظ‡ظ†ط¯ظ„ ع©ط±ط¯ظ† ط³ط§ط®طھ طµط­غŒط­ طھط³ع© (ع¯ط±ظپطھظ† ظˆط§ظ„ط¯ ط§ط² ط±غŒع©ظˆط¦ط³طھ) ---
+
     def perform_create(self, serializer):
         revision_id = self.request.data.get('revision_id')
         print(self.request.data)
