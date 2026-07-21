@@ -12,6 +12,7 @@ from .views import (
     EngineeringReadinessViewSet,
     CodeSchemeViewSet,
     CodingOrganizationViewSet,
+    CodingViewSet,
     ItemCategoryViewSet,
     ItemClassificationViewSet,
     ItemCodingSchemeViewSet,
@@ -43,6 +44,7 @@ router.register('coding-template-segments', ItemCodingTemplateSegmentViewSet, ba
 router.register('revision-attribute-values', ItemRevisionAttributeValueViewSet, basename='item-revision-attribute-value')
 router.register('item-identifiers', ItemIdentifierViewSet, basename='item-identifier')
 router.register('part-coding', PartCodingWorkflowViewSet, basename='part-coding')
+router.register('coding', CodingViewSet, basename='coding')
 router.register('code-schemes', CodeSchemeViewSet, basename='code-scheme')
 router.register('items', ItemViewSet, basename='enterprise-item')
 router.register('boms', BOMViewSet, basename='bom')

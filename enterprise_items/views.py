@@ -73,6 +73,14 @@ from .coding_services import (
     retire_template,
     validate_template,
 )
+from .coding_profile_services import (
+    create_profile as create_coding_profile,
+    decode_code as decode_profile_code,
+    get_profile as get_coding_profile,
+    list_profiles as list_coding_profiles,
+    preview_with_profile,
+    resolve_profile as resolve_coding_profile,
+)
 from .bom_services import (
     approve_bom_revision,
     clone_bom_revision,
@@ -413,6 +421,116 @@ class PartCodingWorkflowViewSet(viewsets.ViewSet):
             }, status=status.HTTP_201_CREATED)
         except (DjangoValidationError, EngineeringLifecycleError, EngineeringPermissionError) as exc:
             return Response(_validation_payload(exc), status=status.HTTP_400_BAD_REQUEST)
+
+
+class CodingViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated, CanManageEngineering]
+
+    @action(detail=False, methods=['get', 'post'], url_path='profiles')
+    def profiles(self, request):
+        if request.method == 'GET':
+            return Response({'results': list_coding_profiles()})
+        try:
+            organization = CodingOrganization.objects.get(pk=request.data.get('organization'))
+            classification = ItemClassification.objects.get(pk=request.data.get('classification'))
+            profile = create_coding_profile(
+                actor=request.user,
+                organization=organization,
+                classification=classification,
+                code=request.data.get('code', ''),
+                name=request.data.get('name', ''),
+                strategy=request.data.get('strategy') or ItemCodingScheme.STRATEGY_HYBRID,
+                family_prefix=request.data.get('family_prefix', ''),
+                separator=request.data.get('separator', '-'),
+                sequence_enabled=bool(request.data.get('sequence_enabled', True)),
+                sequence_length=int(request.data.get('sequence_length') or 5),
+                maximum_code_length=int(request.data.get('maximum_code_length') or 80),
+                description=request.data.get('description', ''),
+            )
+            return Response(profile, status=status.HTTP_201_CREATED)
+        except (DjangoValidationError, EngineeringLifecycleError, ValueError) as exc:
+            return Response(_validation_payload(exc), status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['get'], url_path=r'profiles/(?P<profile_id>[0-9a-f-]{36})')
+    def profile_detail(self, request, profile_id=None):
+        return Response(get_coding_profile(profile_id))
+
+    @action(detail=False, methods=['post'], url_path=r'profiles/(?P<profile_id>[^/.]+)/validate')
+    def profile_validate(self, request, profile_id=None):
+        template = ItemCodingTemplate.objects.get(pk=profile_id)
+        try:
+            return Response(validate_template(template))
+        except EngineeringLifecycleError as exc:
+            return Response({'valid': False, 'errors': exc.args[0] if exc.args else {}}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['post'], url_path=r'profiles/(?P<profile_id>[^/.]+)/activate')
+    def profile_activate(self, request, profile_id=None):
+        template = ItemCodingTemplate.objects.get(pk=profile_id)
+        try:
+            activated = activate_template(template, actor=request.user)
+            return Response(get_coding_profile(str(activated.pk)))
+        except (EngineeringLifecycleError, EngineeringPermissionError) as exc:
+            return Response(_validation_payload(exc), status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['post'], url_path=r'profiles/(?P<profile_id>[^/.]+)/clone')
+    def profile_clone(self, request, profile_id=None):
+        template = ItemCodingTemplate.objects.get(pk=profile_id)
+        try:
+            clone = clone_template(template, actor=request.user, version=request.data.get('version'))
+            return Response(get_coding_profile(str(clone.pk)), status=status.HTTP_201_CREATED)
+        except (EngineeringLifecycleError, EngineeringPermissionError) as exc:
+            return Response(_validation_payload(exc), status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['get'], url_path=r'profiles/(?P<profile_id>[^/.]+)/explain')
+    def profile_explain(self, request, profile_id=None):
+        profile = get_coding_profile(profile_id)
+        return Response({'profile': profile, 'explanation': 'This Coding Profile is backed by one Coding Scheme, one Coding Template, ordered Template Segments, and optional Encoding Rules.'})
+
+    @action(detail=False, methods=['post'], url_path='profiles/resolve')
+    def resolve(self, request):
+        try:
+            classification = ItemClassification.objects.get(pk=request.data.get('classification'))
+            return Response(resolve_coding_profile(classification=classification))
+        except (ItemClassification.DoesNotExist, EngineeringLifecycleError) as exc:
+            return Response(_validation_payload(exc), status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['post'], url_path='preview')
+    def preview(self, request):
+        serializer = CodePreviewSerializer(data={
+            **request.data,
+            'coding_scheme': request.data.get('coding_scheme') or None,
+        })
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            return Response(preview_with_profile(
+                organization=data['organization'],
+                classification=data['classification'],
+                attributes=data.get('attributes') or {},
+                profile=request.data.get('profile') or request.data.get('coding_profile'),
+                manual_code=data.get('manual_code', ''),
+                identifiers=data.get('identifiers'),
+                name=data.get('name', ''),
+            ))
+        except (DjangoValidationError, EngineeringLifecycleError) as exc:
+            return Response(_validation_payload(exc), status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['post'], url_path='simulate')
+    def simulate(self, request):
+        response = self.preview(request)
+        if response.status_code < 400 and isinstance(response.data, dict):
+            response.data['simulation'] = {'committed_sequence': False, 'safe_to_repeat': True}
+        return response
+
+    @action(detail=False, methods=['post'], url_path='decode')
+    def decode(self, request):
+        part_number = (request.data.get('part_number') or '').strip()
+        if not part_number:
+            return Response({'part_number': 'This field is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        classification = None
+        if request.data.get('classification'):
+            classification = ItemClassification.objects.get(pk=request.data.get('classification'))
+        return Response(decode_profile_code(part_number=part_number, profile=request.data.get('profile'), classification=classification))
 
 
 class CodingOrganizationViewSet(viewsets.ModelViewSet):

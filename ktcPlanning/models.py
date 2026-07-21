@@ -163,11 +163,14 @@ class Project(models.Model):
             ancestor = ancestor.parent_project
 
     def get_default_approver(self):
+        owner_unit = self.owner_unit or getattr(self.created_by, 'unit', None)
+        unit_manager = getattr(owner_unit, 'manager', None) if owner_unit else None
+        if unit_manager:
+            return unit_manager
         if self.scope == 'company':
             from .permissions import get_planning_manager
             return get_planning_manager()
-        owner_unit = self.owner_unit or getattr(self.created_by, 'unit', None)
-        return getattr(owner_unit, 'manager', None) if owner_unit else None
+        return None
 
 class UnitOfMeasure(models.Model):
     code = models.CharField(max_length=20, unique=True)   # HOUR, DAY, LITER

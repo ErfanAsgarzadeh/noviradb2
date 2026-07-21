@@ -3,6 +3,7 @@ import uuid
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
+from django.db.models.functions import Upper
 from django.utils import timezone
 
 
@@ -321,6 +322,10 @@ class Item(models.Model):
     semantic_identity_hash = models.CharField(max_length=64, blank=True, db_index=True)
     coding_scheme = models.ForeignKey('ItemCodingScheme', null=True, blank=True, on_delete=models.SET_NULL, related_name='items')
     coding_template = models.ForeignKey('ItemCodingTemplate', null=True, blank=True, on_delete=models.SET_NULL, related_name='items')
+    structure = models.ForeignKey('StructureDefinition', null=True, blank=True, on_delete=models.PROTECT, related_name='parts')
+    code_definition = models.ForeignKey('CodeDefinition', null=True, blank=True, on_delete=models.PROTECT, related_name='parts')
+    code_definition_version = models.ForeignKey('CodeDefinitionVersion', null=True, blank=True, on_delete=models.PROTECT, related_name='parts')
+    coding_snapshot = models.JSONField(default=dict, blank=True)
     code_generation_strategy = models.CharField(max_length=24, blank=True, default='')
     generated_code_locked = models.BooleanField(default=False)
     replaced_by_item = models.ForeignKey('self', null=True, blank=True, on_delete=models.SET_NULL, related_name='replaces_items')
@@ -345,6 +350,9 @@ class Item(models.Model):
             models.Index(fields=['item_code']),
             models.Index(fields=['organization', 'semantic_identity_hash']),
             models.Index(fields=['organization', 'classification']),
+            models.Index(fields=['organization', 'structure']),
+            models.Index(fields=['organization', 'code_definition']),
+            models.Index(fields=['organization', 'code_definition_version']),
         ]
 
     def clean(self):
@@ -1097,3 +1105,722 @@ class ProcessStageCode(models.Model):
 
     def __str__(self):
         return f'{self.variant} / {self.stage_code}'
+
+
+ENGINEERING_VALUE_TYPES = {
+    'TEXT', 'LONG_TEXT', 'INTEGER', 'DECIMAL', 'BOOLEAN', 'DATE', 'SINGLE_SELECT', 'MULTI_SELECT', 'UNIT_VALUE', 'RANGE', 'REFERENCE', 'DOCUMENT_REFERENCE'
+}
+SAFE_CONDITION_KEYS = {'all', 'any', 'field', 'operator', 'value', 'equals', 'not_equals', 'in', 'not_in', 'exists'}
+RESET_POLICIES = {'NEVER', 'CALENDAR_YEAR', 'CALENDAR_MONTH', 'MANUAL'}
+
+
+def _validate_safe_mapping(value, field_name, allowed_keys=None):
+    if value in ({}, [], None):
+        return
+    if not isinstance(value, dict):
+        raise ValidationError({field_name: 'Structured configuration must be an object.'})
+    keys = set(value.keys())
+    if allowed_keys is not None and not keys.issubset(allowed_keys):
+        raise ValidationError({field_name: f'Unsupported keys: {sorted(keys - allowed_keys)}'})
+
+
+def _validate_structured_value(data_type, value, field_name='value'):
+    if value in ({}, None):
+        return
+    if not isinstance(value, dict):
+        raise ValidationError({field_name: 'Structured value must be an object.'})
+    if data_type in {'TEXT', 'LONG_TEXT', 'DATE', 'DOCUMENT_REFERENCE'}:
+        if set(value.keys()) != {'value'} or not isinstance(value.get('value'), str):
+            raise ValidationError({field_name: f'{data_type} expects a value object.'})
+    elif data_type == 'INTEGER':
+        raw = value.get('value')
+        if set(value.keys()) != {'value'} or not isinstance(raw, int) or isinstance(raw, bool):
+            raise ValidationError({field_name: 'INTEGER expects {"value": 12}.'})
+    elif data_type == 'DECIMAL':
+        if set(value.keys()) != {'value'} or not isinstance(value.get('value'), str):
+            raise ValidationError({field_name: 'DECIMAL expects {"value": "12.50"}.'})
+    elif data_type == 'BOOLEAN':
+        if set(value.keys()) != {'value'} or not isinstance(value.get('value'), bool):
+            raise ValidationError({field_name: 'BOOLEAN expects {"value": true}.'})
+    elif data_type == 'UNIT_VALUE':
+        if set(value.keys()) != {'value', 'unit'} or not isinstance(value.get('value'), str) or not isinstance(value.get('unit'), str):
+            raise ValidationError({field_name: 'UNIT_VALUE expects {"value": "12.50", "unit": "mm"}.'})
+    elif data_type == 'RANGE':
+        if set(value.keys()) != {'minimum', 'maximum', 'unit'}:
+            raise ValidationError({field_name: 'RANGE expects minimum, maximum and unit.'})
+        if not all(isinstance(value.get(key), str) for key in ['minimum', 'maximum', 'unit']):
+            raise ValidationError({field_name: 'RANGE values must be strings.'})
+    elif data_type == 'SINGLE_SELECT':
+        if set(value.keys()) != {'option_id'} or not isinstance(value.get('option_id'), str):
+            raise ValidationError({field_name: 'SINGLE_SELECT expects {"option_id": "..."}.'})
+    elif data_type == 'MULTI_SELECT':
+        if set(value.keys()) != {'option_ids'} or not isinstance(value.get('option_ids'), list) or not all(isinstance(item, str) for item in value.get('option_ids')):
+            raise ValidationError({field_name: 'MULTI_SELECT expects {"option_ids": ["..."]}.'})
+    elif data_type == 'REFERENCE':
+        if set(value.keys()) != {'target_type', 'target_id'} or not isinstance(value.get('target_type'), str) or not isinstance(value.get('target_id'), str):
+            raise ValidationError({field_name: 'REFERENCE expects target_type and target_id.'})
+
+
+def _normalize_token(token):
+    return (token or '').strip().upper()
+
+
+
+class ParameterDefinition(models.Model):
+    TYPE_TEXT = 'TEXT'
+    TYPE_LONG_TEXT = 'LONG_TEXT'
+    TYPE_INTEGER = 'INTEGER'
+    TYPE_DECIMAL = 'DECIMAL'
+    TYPE_BOOLEAN = 'BOOLEAN'
+    TYPE_DATE = 'DATE'
+    TYPE_SINGLE_SELECT = 'SINGLE_SELECT'
+    TYPE_MULTI_SELECT = 'MULTI_SELECT'
+    TYPE_UNIT_VALUE = 'UNIT_VALUE'
+    TYPE_RANGE = 'RANGE'
+    TYPE_REFERENCE = 'REFERENCE'
+    DATA_TYPE_CHOICES = [
+        (TYPE_TEXT, 'Text'), (TYPE_LONG_TEXT, 'Long text'), (TYPE_INTEGER, 'Integer'),
+        (TYPE_DECIMAL, 'Decimal'), (TYPE_BOOLEAN, 'Boolean'), (TYPE_DATE, 'Date'),
+        (TYPE_SINGLE_SELECT, 'Single select'), (TYPE_MULTI_SELECT, 'Multi select'),
+        (TYPE_UNIT_VALUE, 'Unit value'), (TYPE_RANGE, 'Range'), (TYPE_REFERENCE, 'Reference'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(CodingOrganization, on_delete=models.CASCADE, related_name='engineering_parameters')
+    code = models.CharField(max_length=80)
+    name = models.CharField(max_length=180)
+    description = models.TextField(blank=True)
+    data_type = models.CharField(max_length=24, choices=DATA_TYPE_CHOICES)
+    default_unit = models.CharField(max_length=32, blank=True, default='')
+    searchable = models.BooleanField(default=True)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='created_parameter_definitions')
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='updated_parameter_definitions')
+
+    class Meta:
+        ordering = ['organization', 'code']
+        constraints = [models.UniqueConstraint(fields=['organization', 'code'], name='uniq_parameter_code_per_org')]
+        indexes = [models.Index(fields=['organization', 'active']), models.Index(fields=['organization', 'code'])]
+
+    def __str__(self):
+        return f'{self.code} - {self.name}'
+
+
+class ParameterOption(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    parameter = models.ForeignKey(ParameterDefinition, on_delete=models.CASCADE, related_name='options')
+    display_label = models.CharField(max_length=180)
+    stored_value = models.CharField(max_length=180)
+    description = models.TextField(blank=True)
+    sort_order = models.PositiveIntegerField(default=10)
+    active = models.BooleanField(default=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['parameter', 'sort_order', 'display_label']
+        constraints = [
+            models.UniqueConstraint(fields=['parameter', 'stored_value'], name='uniq_parameter_option_value'),
+            models.UniqueConstraint(fields=['parameter', 'sort_order'], name='uniq_parameter_option_order'),
+        ]
+        indexes = [models.Index(fields=['parameter', 'active'])]
+
+    def __str__(self):
+        return self.display_label
+
+
+class ParameterMetadataField(models.Model):
+    REQUIREDNESS_REQUIRED = 'REQUIRED'
+    REQUIREDNESS_RECOMMENDED = 'RECOMMENDED'
+    REQUIREDNESS_OPTIONAL = 'OPTIONAL'
+    REQUIREDNESS_CHOICES = [(REQUIREDNESS_REQUIRED, 'Required'), (REQUIREDNESS_RECOMMENDED, 'Recommended'), (REQUIREDNESS_OPTIONAL, 'Optional')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(CodingOrganization, on_delete=models.CASCADE, related_name='parameter_metadata_fields')
+    code = models.CharField(max_length=80)
+    label = models.CharField(max_length=180)
+    description = models.TextField(blank=True)
+    data_type = models.CharField(max_length=24, choices=ParameterDefinition.DATA_TYPE_CHOICES)
+    group = models.CharField(max_length=80, blank=True, default='General')
+    requiredness = models.CharField(max_length=16, choices=REQUIREDNESS_CHOICES, default=REQUIREDNESS_OPTIONAL)
+    unit = models.CharField(max_length=32, blank=True, default='')
+    default_value = models.JSONField(default=dict, blank=True)
+    validation_config = models.JSONField(default=dict, blank=True)
+    options = models.JSONField(default=list, blank=True)
+    sort_order = models.PositiveIntegerField(default=10)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['organization', 'group', 'sort_order']
+        constraints = [models.UniqueConstraint(fields=['organization', 'code'], name='uniq_parameter_metadata_field_code')]
+        indexes = [models.Index(fields=['organization', 'active']), models.Index(fields=['organization', 'group'])]
+
+
+class ParameterMetadataValue(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    parameter = models.ForeignKey(ParameterDefinition, on_delete=models.CASCADE, related_name='metadata_values')
+    field_definition = models.ForeignKey(ParameterMetadataField, on_delete=models.PROTECT, related_name='values')
+    value = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['parameter', 'field_definition'], name='uniq_parameter_metadata_value')]
+
+
+class StructureDefinition(models.Model):
+    STATUS_DRAFT = 'DRAFT'
+    STATUS_ACTIVE = 'ACTIVE'
+    STATUS_INACTIVE = 'INACTIVE'
+    STATUS_SUPERSEDED = 'SUPERSEDED'
+    STATUS_CHOICES = [(STATUS_DRAFT, 'Draft'), (STATUS_ACTIVE, 'Active'), (STATUS_INACTIVE, 'Inactive'), (STATUS_SUPERSEDED, 'Superseded')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(CodingOrganization, on_delete=models.CASCADE, related_name='engineering_structures')
+    code = models.CharField(max_length=80)
+    name = models.CharField(max_length=180)
+    description = models.TextField(blank=True)
+    classification = models.ForeignKey(ItemClassification, null=True, blank=True, on_delete=models.SET_NULL, related_name='engineering_structures')
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    version = models.PositiveIntegerField(default=1)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='created_structure_definitions')
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='updated_structure_definitions')
+
+    class Meta:
+        ordering = ['organization', 'code']
+        constraints = [models.UniqueConstraint(fields=['organization', 'code'], name='uniq_structure_code_per_org')]
+        indexes = [models.Index(fields=['organization', 'active']), models.Index(fields=['organization', 'status']), models.Index(fields=['organization', 'code'])]
+
+    def __str__(self):
+        return self.name
+
+
+class StructureParameter(models.Model):
+    REQUIRED = 'REQUIRED'
+    OPTIONAL = 'OPTIONAL'
+    CONDITIONAL = 'CONDITIONAL'
+    REQUIREDNESS_CHOICES = [(REQUIRED, 'Required'), (OPTIONAL, 'Optional'), (CONDITIONAL, 'Conditional')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    structure = models.ForeignKey(StructureDefinition, on_delete=models.CASCADE, related_name='parameters')
+    parameter = models.ForeignKey(ParameterDefinition, on_delete=models.PROTECT, related_name='structure_usages')
+    sort_order = models.PositiveIntegerField(default=10)
+    display_group = models.CharField(max_length=80, blank=True, default='Primary Characteristics')
+    requiredness = models.CharField(max_length=16, choices=REQUIREDNESS_CHOICES, default=OPTIONAL)
+    identity_defining = models.BooleanField(default=False)
+    default_value = models.JSONField(default=dict, blank=True)
+    visibility_condition = models.JSONField(default=dict, blank=True)
+    required_condition = models.JSONField(default=dict, blank=True)
+    display_label_override = models.CharField(max_length=180, blank=True, default='')
+    help_text_override = models.TextField(blank=True)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['structure', 'sort_order']
+        constraints = [
+            models.UniqueConstraint(fields=['structure', 'parameter'], name='uniq_structure_parameter'),
+            models.UniqueConstraint(fields=['structure', 'sort_order'], name='uniq_structure_parameter_order'),
+        ]
+        indexes = [models.Index(fields=['structure', 'active']), models.Index(fields=['structure', 'identity_defining'])]
+
+
+class CodeDefinition(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(CodingOrganization, on_delete=models.CASCADE, related_name='engineering_code_definitions')
+    structure = models.ForeignKey(StructureDefinition, on_delete=models.PROTECT, related_name='code_definitions')
+    code = models.CharField(max_length=80)
+    name = models.CharField(max_length=180)
+    description = models.TextField(blank=True)
+    separator = models.CharField(max_length=8, blank=True, default='-')
+    maximum_length = models.PositiveIntegerField(default=80)
+    status = models.CharField(max_length=16, choices=StructureDefinition.STATUS_CHOICES, default=StructureDefinition.STATUS_DRAFT)
+    active_version = models.PositiveIntegerField(default=0)
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='created_code_definitions')
+
+    class Meta:
+        ordering = ['organization', 'code']
+        constraints = [
+            models.UniqueConstraint(fields=['organization', 'code'], name='uniq_code_definition_code_per_org'),
+            models.UniqueConstraint(fields=['structure'], condition=models.Q(is_default=True), name='uniq_default_code_definition_per_structure'),
+        ]
+        indexes = [models.Index(fields=['organization', 'status']), models.Index(fields=['structure', 'is_default'])]
+
+    def __str__(self):
+        return self.name
+
+
+class CodeDefinitionVersion(models.Model):
+    STATUS_DRAFT = 'DRAFT'
+    STATUS_ACTIVE = 'ACTIVE'
+    STATUS_SUPERSEDED = 'SUPERSEDED'
+    STATUS_INACTIVE = 'INACTIVE'
+    STATUS_CHOICES = [(STATUS_DRAFT, 'Draft'), (STATUS_ACTIVE, 'Active'), (STATUS_SUPERSEDED, 'Superseded'), (STATUS_INACTIVE, 'Inactive')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code_definition = models.ForeignKey(CodeDefinition, on_delete=models.CASCADE, related_name='versions')
+    version_number = models.PositiveIntegerField()
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    configuration_snapshot = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='created_code_definition_versions')
+    activated_at = models.DateTimeField(null=True, blank=True)
+    activated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='activated_code_definition_versions')
+    superseded_at = models.DateTimeField(null=True, blank=True)
+    superseded_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='superseded_code_definition_versions')
+
+    class Meta:
+        ordering = ['code_definition', '-version_number']
+        constraints = [
+            models.UniqueConstraint(fields=['code_definition', 'version_number'], name='uniq_code_definition_version_number'),
+            models.UniqueConstraint(fields=['code_definition'], condition=models.Q(status='ACTIVE'), name='uniq_active_version_per_code_definition'),
+        ]
+        indexes = [models.Index(fields=['code_definition', 'status']), models.Index(fields=['status', 'activated_at'])]
+
+    def clean(self):
+        super().clean()
+        if not self.pk:
+            return
+        original = CodeDefinitionVersion.objects.filter(pk=self.pk).values('status', 'version_number', 'configuration_snapshot').first()
+        if original and original['status'] == self.STATUS_ACTIVE and self.status == self.STATUS_ACTIVE:
+            if original['version_number'] != self.version_number or original['configuration_snapshot'] != self.configuration_snapshot:
+                raise ValidationError({'status': 'Active Code Definition versions are immutable. Clone a Draft before editing.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+
+class CodeSegment(models.Model):
+    TYPE_FIXED_TEXT = 'FIXED_TEXT'
+    TYPE_PARAMETER = 'PARAMETER'
+    TYPE_SEQUENCE = 'SEQUENCE'
+    TYPE_DATE = 'DATE'
+    TYPE_SEPARATOR = 'SEPARATOR'
+    SEGMENT_TYPE_CHOICES = [(TYPE_FIXED_TEXT, 'Fixed text'), (TYPE_PARAMETER, 'Parameter'), (TYPE_SEQUENCE, 'Sequence'), (TYPE_DATE, 'Date'), (TYPE_SEPARATOR, 'Separator')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    version = models.ForeignKey(CodeDefinitionVersion, on_delete=models.CASCADE, related_name='segments')
+    segment_type = models.CharField(max_length=24, choices=SEGMENT_TYPE_CHOICES)
+    sort_order = models.PositiveIntegerField(default=10)
+    parameter = models.ForeignKey(ParameterDefinition, null=True, blank=True, on_delete=models.PROTECT, related_name='code_segments')
+    fixed_value = models.CharField(max_length=80, blank=True, default='')
+    requiredness = models.CharField(max_length=16, choices=StructureParameter.REQUIREDNESS_CHOICES, default=StructureParameter.REQUIRED)
+    width = models.PositiveIntegerField(null=True, blank=True)
+    padding = models.CharField(max_length=16, blank=True, default='')
+    prefix = models.CharField(max_length=32, blank=True, default='')
+    suffix = models.CharField(max_length=32, blank=True, default='')
+    transform = models.JSONField(default=dict, blank=True)
+    fallback = models.JSONField(default=dict, blank=True)
+    condition = models.JSONField(default=dict, blank=True)
+    configuration = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['version', 'sort_order']
+        constraints = [
+            models.UniqueConstraint(fields=['version', 'sort_order'], name='uniq_code_segment_order'),
+            models.CheckConstraint(condition=models.Q(width__isnull=True) | models.Q(width__gt=0), name='chk_code_segment_width_positive'),
+        ]
+        indexes = [models.Index(fields=['version', 'segment_type']), models.Index(fields=['parameter'])]
+
+
+class CodeOptionEncoding(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code_segment = models.ForeignKey(CodeSegment, on_delete=models.CASCADE, related_name='option_encodings')
+    parameter_option = models.ForeignKey(ParameterOption, on_delete=models.PROTECT, related_name='code_encodings')
+    encoded_token = models.CharField(max_length=80)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['code_segment', 'encoded_token']
+        constraints = [
+            models.UniqueConstraint(fields=['code_segment', 'parameter_option'], name='uniq_code_option_encoding_option'),
+            models.UniqueConstraint(fields=['code_segment', 'encoded_token'], condition=models.Q(active=True), name='uniq_active_code_option_token_per_segment'),
+            models.UniqueConstraint(Upper('encoded_token'), 'code_segment', condition=models.Q(active=True), name='uniq_active_code_option_token_norm'),
+        ]
+        indexes = [models.Index(fields=['code_segment', 'active']), models.Index(fields=['encoded_token'])]
+
+
+class SequenceDefinition(models.Model):
+    SCOPE_GLOBAL = 'GLOBAL'
+    SCOPE_CODE_DEFINITION = 'CODE_DEFINITION'
+    SCOPE_STRUCTURE = 'STRUCTURE'
+    SCOPE_PREFIX = 'PREFIX'
+    SCOPE_CALENDAR_YEAR = 'CALENDAR_YEAR'
+    SCOPE_CHOICES = [(SCOPE_GLOBAL, 'Global'), (SCOPE_CODE_DEFINITION, 'Code definition'), (SCOPE_STRUCTURE, 'Structure'), (SCOPE_PREFIX, 'Prefix'), (SCOPE_CALENDAR_YEAR, 'Calendar year')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code_definition_version = models.ForeignKey(CodeDefinitionVersion, on_delete=models.CASCADE, related_name='sequences')
+    scope = models.CharField(max_length=24, choices=SCOPE_CHOICES)
+    scope_key = models.CharField(max_length=120, blank=True, default='')
+    starting_value = models.PositiveIntegerField(default=1)
+    current_value = models.PositiveIntegerField(default=0)
+    width = models.PositiveIntegerField(default=5)
+    padding_character = models.CharField(max_length=1, default='0')
+    reset_policy = models.CharField(max_length=32, blank=True, default='NEVER')
+    exhausted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['code_definition_version', 'scope', 'scope_key'], name='uniq_sequence_scope_key_per_version'),
+            models.CheckConstraint(condition=models.Q(starting_value__gte=0), name='chk_sequence_starting_non_negative'),
+            models.CheckConstraint(condition=models.Q(current_value__gte=0), name='chk_sequence_current_non_negative'),
+            models.CheckConstraint(condition=models.Q(current_value__gte=models.F('starting_value') - 1), name='chk_sequence_current_not_below_start_minus_one'),
+            models.CheckConstraint(condition=models.Q(width__gt=0), name='chk_sequence_width_positive')]
+        indexes = [models.Index(fields=['code_definition_version', 'scope', 'scope_key']), models.Index(fields=['exhausted_at'])]
+
+
+class TechnicalDataTemplate(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(CodingOrganization, on_delete=models.CASCADE, related_name='technical_data_templates')
+    structure = models.ForeignKey(StructureDefinition, on_delete=models.PROTECT, related_name='technical_data_templates')
+    code = models.CharField(max_length=80)
+    name = models.CharField(max_length=180)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=16, choices=StructureDefinition.STATUS_CHOICES, default=StructureDefinition.STATUS_DRAFT)
+    version = models.PositiveIntegerField(default=1)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='created_technical_data_templates')
+
+    class Meta:
+        ordering = ['organization', 'code']
+        constraints = [models.UniqueConstraint(fields=['organization', 'code'], name='uniq_technical_template_code_per_org')]
+        indexes = [models.Index(fields=['organization', 'active']), models.Index(fields=['structure', 'status'])]
+
+
+class TechnicalFieldDefinition(models.Model):
+    SCOPE_PART = 'PART'
+    SCOPE_REVISION = 'REVISION'
+    SCOPE_CHOICES = [(SCOPE_PART, 'Part'), (SCOPE_REVISION, 'Revision')]
+    REQ_REQUIRED = 'REQUIRED'
+    REQ_RECOMMENDED = 'RECOMMENDED'
+    REQ_OPTIONAL = 'OPTIONAL'
+    REQ_CONDITIONAL = 'CONDITIONAL'
+    REQUIREDNESS_CHOICES = [(REQ_REQUIRED, 'Required'), (REQ_RECOMMENDED, 'Recommended'), (REQ_OPTIONAL, 'Optional'), (REQ_CONDITIONAL, 'Conditional')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    template = models.ForeignKey(TechnicalDataTemplate, on_delete=models.CASCADE, related_name='fields')
+    code = models.CharField(max_length=80)
+    label = models.CharField(max_length=180)
+    description = models.TextField(blank=True)
+    data_type = models.CharField(max_length=32, choices=ParameterDefinition.DATA_TYPE_CHOICES + [('DOCUMENT_REFERENCE', 'Document reference')])
+    display_group = models.CharField(max_length=80, blank=True, default='General')
+    scope = models.CharField(max_length=16, choices=SCOPE_CHOICES, default=SCOPE_REVISION)
+    requiredness = models.CharField(max_length=16, choices=REQUIREDNESS_CHOICES, default=REQ_OPTIONAL)
+    unit = models.CharField(max_length=32, blank=True, default='')
+    default_value = models.JSONField(default=dict, blank=True)
+    validation_config = models.JSONField(default=dict, blank=True)
+    options = models.JSONField(default=list, blank=True)
+    sort_order = models.PositiveIntegerField(default=10)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['template', 'display_group', 'sort_order']
+        constraints = [
+            models.UniqueConstraint(fields=['template', 'code'], name='uniq_technical_field_code_per_template'),
+            models.UniqueConstraint(fields=['template', 'sort_order'], name='uniq_technical_field_order_per_template'),
+        ]
+        indexes = [models.Index(fields=['template', 'scope']), models.Index(fields=['template', 'active'])]
+
+
+class PartParameterValue(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    part = models.ForeignKey(Item, on_delete=models.CASCADE, related_name='parameter_values')
+    structure_parameter = models.ForeignKey(StructureParameter, on_delete=models.PROTECT, related_name='part_values')
+    parameter = models.ForeignKey(ParameterDefinition, on_delete=models.PROTECT, related_name='part_values')
+    value = models.JSONField(default=dict, blank=True)
+    normalized_value = models.CharField(max_length=255, blank=True, default='')
+    display_value = models.CharField(max_length=255, blank=True, default='')
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['part', 'parameter'], name='uniq_part_parameter_value')]
+        indexes = [models.Index(fields=['part', 'structure_parameter']), models.Index(fields=['parameter', 'normalized_value'])]
+
+
+class PartTechnicalValue(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    part = models.ForeignKey(Item, on_delete=models.CASCADE, related_name='technical_values')
+    technical_field = models.ForeignKey(TechnicalFieldDefinition, on_delete=models.PROTECT, related_name='part_values')
+    value = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['part', 'technical_field'], name='uniq_part_technical_value')]
+        indexes = [models.Index(fields=['part']), models.Index(fields=['technical_field'])]
+
+
+class RevisionTechnicalValue(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    revision = models.ForeignKey(ItemRevision, on_delete=models.CASCADE, related_name='technical_values')
+    technical_field = models.ForeignKey(TechnicalFieldDefinition, on_delete=models.PROTECT, related_name='revision_values')
+    value = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['revision', 'technical_field'], name='uniq_revision_technical_value')]
+        indexes = [models.Index(fields=['revision']), models.Index(fields=['technical_field'])]
+
+# PHASE_1F_DOMAIN_VALIDATION_BOUNDARY
+# Model-level invariants for the new Engineering domain. These cover cross-table
+# organization consistency and JSON value contracts that cannot be expressed with
+# portable database constraints.
+
+def _clean_parameter_definition(self):
+    if self.data_type not in dict(ParameterDefinition.DATA_TYPE_CHOICES):
+        raise ValidationError({'data_type': 'Unsupported Engineering parameter data type.'})
+    if self.code:
+        self.code = self.code.strip().upper()
+
+
+def _clean_parameter_option(self):
+    if self.parameter and self.parameter.data_type not in {ParameterDefinition.TYPE_SINGLE_SELECT, ParameterDefinition.TYPE_MULTI_SELECT}:
+        raise ValidationError({'parameter': 'Options are allowed only for SINGLE_SELECT or MULTI_SELECT parameters.'})
+    if self.stored_value:
+        self.stored_value = self.stored_value.strip().upper()
+    if self.sort_order < 0:
+        raise ValidationError({'sort_order': 'Sort order must be non-negative.'})
+
+
+def _clean_parameter_metadata_field(self):
+    if self.data_type not in dict(ParameterDefinition.DATA_TYPE_CHOICES):
+        raise ValidationError({'data_type': 'Unsupported metadata data type.'})
+    if self.default_value:
+        _validate_structured_value(self.data_type, self.default_value, 'default_value')
+
+
+def _clean_parameter_metadata_value(self):
+    if self.parameter and self.field_definition and self.parameter.organization_id != self.field_definition.organization_id:
+        raise ValidationError({'field_definition': 'Metadata field organization must match Parameter organization.'})
+    if self.field_definition:
+        _validate_structured_value(self.field_definition.data_type, self.value, 'value')
+
+
+def _clean_structure_definition(self):
+    if self.classification_id and self.organization_id and self.classification.organization_id != self.organization_id:
+        raise ValidationError({'classification': 'Classification organization must match Structure organization.'})
+
+
+def _clean_structure_parameter(self):
+    if self.structure and self.parameter and self.structure.organization_id != self.parameter.organization_id:
+        raise ValidationError({'parameter': 'Parameter organization must match Structure organization.'})
+    if self.parameter and not self.parameter.active and self._state.adding:
+        raise ValidationError({'parameter': 'Inactive Parameters cannot be newly assigned to a Structure.'})
+    if self.default_value and self.parameter:
+        _validate_structured_value(self.parameter.data_type, self.default_value, 'default_value')
+    _validate_safe_mapping(self.visibility_condition, 'visibility_condition', SAFE_CONDITION_KEYS)
+    _validate_safe_mapping(self.required_condition, 'required_condition', SAFE_CONDITION_KEYS)
+
+
+def _clean_code_definition(self):
+    if self.structure and self.organization_id != self.structure.organization_id:
+        raise ValidationError({'structure': 'Structure organization must match Code Definition organization.'})
+    if self.separator and self.separator.strip() != self.separator:
+        raise ValidationError({'separator': 'Separator cannot contain leading or trailing whitespace.'})
+    if self.maximum_length <= 0:
+        raise ValidationError({'maximum_length': 'Maximum length must be positive.'})
+    if self.active_version < 0:
+        raise ValidationError({'active_version': 'Active version cannot be negative.'})
+
+
+def _clean_code_definition_version(self):
+    if self.status == CodeDefinitionVersion.STATUS_ACTIVE and self.activated_at is None:
+        self.activated_at = timezone.now()
+    if self._state.adding:
+        return
+    original = CodeDefinitionVersion.objects.filter(pk=self.pk).values('status', 'version_number', 'configuration_snapshot').first()
+    if original and original['status'] == self.STATUS_ACTIVE and self.status == self.STATUS_ACTIVE:
+        if original['version_number'] != self.version_number or original['configuration_snapshot'] != self.configuration_snapshot:
+            raise ValidationError({'status': 'Active Code Definition versions are immutable. Clone a Draft before editing.'})
+
+
+def _clean_code_segment(self):
+    structure = self.version.code_definition.structure if self.version_id else None
+    if self.width is not None and self.width <= 0:
+        raise ValidationError({'width': 'Width must be positive.'})
+    if self.padding and len(self.padding) > 1:
+        raise ValidationError({'padding': 'Padding character must be one character.'})
+    _validate_safe_mapping(self.condition, 'condition', SAFE_CONDITION_KEYS)
+    _validate_safe_mapping(self.transform, 'transform')
+    if self.segment_type == CodeSegment.TYPE_PARAMETER:
+        if not self.parameter_id:
+            raise ValidationError({'parameter': 'Parameter segment requires a Parameter.'})
+        if structure and not StructureParameter.objects.filter(structure=structure, parameter=self.parameter, active=True).exists():
+            raise ValidationError({'parameter': 'Parameter must belong to the associated Structure.'})
+        if self.fixed_value:
+            raise ValidationError({'fixed_value': 'Parameter segment cannot also define fixed text.'})
+    elif self.segment_type == CodeSegment.TYPE_FIXED_TEXT:
+        if not self.fixed_value:
+            raise ValidationError({'fixed_value': 'FIXED_TEXT segment requires fixed_value.'})
+        if self.parameter_id:
+            raise ValidationError({'parameter': 'FIXED_TEXT segment cannot reference a Parameter.'})
+    elif self.segment_type == CodeSegment.TYPE_SEQUENCE:
+        if self.parameter_id or self.fixed_value:
+            raise ValidationError({'segment_type': 'SEQUENCE segment cannot reference Parameter or fixed_value.'})
+    elif self.parameter_id:
+        raise ValidationError({'parameter': 'Only PARAMETER segments may reference a Parameter.'})
+
+
+def _clean_code_option_encoding(self):
+    token = _normalize_token(self.encoded_token)
+    if not token:
+        raise ValidationError({'encoded_token': 'Encoded token is required.'})
+    self.encoded_token = token
+    if len(token) > 80:
+        raise ValidationError({'encoded_token': 'Encoded token exceeds maximum length.'})
+    segment = self.code_segment
+    option = self.parameter_option
+    if segment.segment_type != CodeSegment.TYPE_PARAMETER or not segment.parameter_id:
+        raise ValidationError({'code_segment': 'Option encodings are allowed only on Parameter segments.'})
+    if segment.parameter.data_type not in {ParameterDefinition.TYPE_SINGLE_SELECT, ParameterDefinition.TYPE_MULTI_SELECT}:
+        raise ValidationError({'code_segment': 'Option encodings require a Select Parameter segment.'})
+    if option.parameter_id != segment.parameter_id:
+        raise ValidationError({'parameter_option': 'Option must belong to the segment Parameter.'})
+    existing = CodeOptionEncoding.objects.filter(code_segment=segment, active=True)
+    if self.pk:
+        existing = existing.exclude(pk=self.pk)
+    if self.active and any(_normalize_token(row.encoded_token) == token for row in existing):
+        raise ValidationError({'encoded_token': 'Active encoded token must be unique after normalization.'})
+
+
+def _clean_sequence_definition(self):
+    if self.scope not in dict(SequenceDefinition.SCOPE_CHOICES):
+        raise ValidationError({'scope': 'Unsupported sequence scope.'})
+    if self.scope in {SequenceDefinition.SCOPE_PREFIX, SequenceDefinition.SCOPE_CALENDAR_YEAR} and not self.scope_key:
+        raise ValidationError({'scope_key': 'This sequence scope requires an explicit scope key.'})
+    if self.scope_key:
+        self.scope_key = self.scope_key.strip().upper()
+    if self.reset_policy not in RESET_POLICIES:
+        raise ValidationError({'reset_policy': 'Unsupported reset policy.'})
+    if self.starting_value < 0 or self.current_value < 0:
+        raise ValidationError({'current_value': 'Sequence values must be non-negative.'})
+    if self.current_value < self.starting_value - 1:
+        raise ValidationError({'current_value': 'Current value cannot be below the pre-allocation starting boundary.'})
+    if self.width <= 0:
+        raise ValidationError({'width': 'Width must be positive.'})
+    if len(self.padding_character) != 1:
+        raise ValidationError({'padding_character': 'Padding character must be exactly one character.'})
+
+
+def _clean_technical_data_template(self):
+    if self.structure and self.organization_id != self.structure.organization_id:
+        raise ValidationError({'structure': 'Structure organization must match Technical Data Template organization.'})
+    if self.version <= 0:
+        raise ValidationError({'version': 'Version must be positive.'})
+
+
+def _clean_technical_field_definition(self):
+    if self.data_type not in dict(ParameterDefinition.DATA_TYPE_CHOICES + [('DOCUMENT_REFERENCE', 'Document reference')]):
+        raise ValidationError({'data_type': 'Unsupported Technical Field data type.'})
+    if self.data_type not in {ParameterDefinition.TYPE_SINGLE_SELECT, ParameterDefinition.TYPE_MULTI_SELECT} and self.options:
+        raise ValidationError({'options': 'Options are allowed only for Select technical fields.'})
+    if self.default_value:
+        _validate_structured_value(self.data_type, self.default_value, 'default_value')
+    _validate_safe_mapping(self.validation_config, 'validation_config')
+
+
+def _clean_part_parameter_value(self):
+    if self.part and self.structure_parameter and self.part.structure_id != self.structure_parameter.structure_id:
+        raise ValidationError({'structure_parameter': 'Structure Parameter must belong to the Part Structure.'})
+    if self.structure_parameter and self.parameter_id != self.structure_parameter.parameter_id:
+        raise ValidationError({'parameter': 'Parameter must match the Structure Parameter.'})
+    if self.part and self.parameter and self.part.organization_id != self.parameter.organization_id:
+        raise ValidationError({'parameter': 'Parameter organization must match Part organization.'})
+    if self.parameter:
+        _validate_structured_value(self.parameter.data_type, self.value, 'value')
+
+
+def _clean_part_technical_value(self):
+    if self.technical_field.scope != TechnicalFieldDefinition.SCOPE_PART:
+        raise ValidationError({'technical_field': 'PartTechnicalValue requires a PART-scope field.'})
+    if self.part.structure_id != self.technical_field.template.structure_id:
+        raise ValidationError({'technical_field': 'Technical Field template must belong to the Part Structure.'})
+    if self.part.organization_id != self.technical_field.template.organization_id:
+        raise ValidationError({'technical_field': 'Technical Field organization must match Part organization.'})
+    _validate_structured_value(self.technical_field.data_type, self.value, 'value')
+
+
+def _clean_revision_technical_value(self):
+    if self.technical_field.scope != TechnicalFieldDefinition.SCOPE_REVISION:
+        raise ValidationError({'technical_field': 'RevisionTechnicalValue requires a REVISION-scope field.'})
+    if self.revision.item.structure_id != self.technical_field.template.structure_id:
+        raise ValidationError({'technical_field': 'Technical Field template must belong to the Revision Part Structure.'})
+    if self.revision.item.organization_id != self.technical_field.template.organization_id:
+        raise ValidationError({'technical_field': 'Technical Field organization must match Revision Part organization.'})
+    _validate_structured_value(self.technical_field.data_type, self.value, 'value')
+
+
+def _clean_item_phase1f(self):
+    if self.item_code:
+        normalized = self.item_code.strip()
+        if not normalized:
+            raise ValidationError({'item_code': 'Item code is required.'})
+        queryset = Item.objects.filter(organization_id=self.organization_id, item_code__iexact=normalized)
+        if self.pk:
+            queryset = queryset.exclude(pk=self.pk)
+        if queryset.exists():
+            raise ValidationError({'item_code': 'Item code must be unique within the organization.'})
+        self.item_code = normalized
+    if self.base_unit:
+        self.base_unit = self.base_unit.strip().upper()
+    if self.classification_id and self.classification.organization_id != self.organization_id:
+        raise ValidationError({'classification': 'Classification must belong to the same organization as item.'})
+    if self.status == 'MERGED' and not self.replaced_by_item_id:
+        raise ValidationError({'replaced_by_item': 'Merged items require a replacement item.'})
+    active_by_status = {
+        'DRAFT': True,
+        'ACTIVE': True,
+        'PHASE_OUT': True,
+        'BLOCKED': False,
+        'OBSOLETE': False,
+        'MERGED': False,
+    }
+    if self.status in active_by_status:
+        self.is_active = active_by_status[self.status]
+    if self.weight is not None and self.weight < 0:
+        raise ValidationError({'weight': 'Weight cannot be negative.'})
+    if self.structure_id and self.organization_id != self.structure.organization_id:
+        raise ValidationError({'structure': 'Structure organization must match Part organization.'})
+    if self.code_definition_id:
+        if not self.structure_id:
+            raise ValidationError({'code_definition': 'Code Definition requires a Structure.'})
+        if self.code_definition.structure_id != self.structure_id:
+            raise ValidationError({'code_definition': 'Code Definition must belong to selected Structure.'})
+    if self.code_definition_version_id:
+        if not self.code_definition_id:
+            raise ValidationError({'code_definition_version': 'Code Definition Version requires a Code Definition.'})
+        if self.code_definition_version.code_definition_id != self.code_definition_id:
+            raise ValidationError({'code_definition_version': 'Version must belong to selected Code Definition.'})
+        if self.code_definition_version.status not in {CodeDefinitionVersion.STATUS_ACTIVE, CodeDefinitionVersion.STATUS_SUPERSEDED}:
+            raise ValidationError({'code_definition_version': 'Part may reference only Active or Superseded Code Definition versions.'})
+
+
+def _phase1f_save(self, *args, **kwargs):
+    self.full_clean()
+    return models.Model.save(self, *args, **kwargs)
+
+ParameterDefinition.clean = _clean_parameter_definition
+ParameterOption.clean = _clean_parameter_option
+ParameterMetadataField.clean = _clean_parameter_metadata_field
+ParameterMetadataValue.clean = _clean_parameter_metadata_value
+StructureDefinition.clean = _clean_structure_definition
+StructureParameter.clean = _clean_structure_parameter
+CodeDefinition.clean = _clean_code_definition
+CodeDefinitionVersion.clean = _clean_code_definition_version
+CodeSegment.clean = _clean_code_segment
+CodeOptionEncoding.clean = _clean_code_option_encoding
+SequenceDefinition.clean = _clean_sequence_definition
+TechnicalDataTemplate.clean = _clean_technical_data_template
+TechnicalFieldDefinition.clean = _clean_technical_field_definition
+PartParameterValue.clean = _clean_part_parameter_value
+PartTechnicalValue.clean = _clean_part_technical_value
+RevisionTechnicalValue.clean = _clean_revision_technical_value
+Item.clean = _clean_item_phase1f
+
+for _phase1f_model in [
+    ParameterDefinition, ParameterOption, ParameterMetadataField, ParameterMetadataValue,
+    StructureDefinition, StructureParameter, CodeDefinition, CodeDefinitionVersion, CodeSegment,
+    CodeOptionEncoding, SequenceDefinition, TechnicalDataTemplate, TechnicalFieldDefinition,
+    PartParameterValue, PartTechnicalValue, RevisionTechnicalValue, Item,
+]:
+    _phase1f_model.save = _phase1f_save
