@@ -9,6 +9,7 @@ from rest_framework.test import APIClient
 
 from ktcPlanning.financial_services import (
     activate_plan,
+    allocate_plan_payment,
     get_task_financial_status,
     register_transaction,
     validate_progress_transition,
@@ -181,6 +182,34 @@ class TestTaskFinancialPlanService:
         status_payload = get_task_financial_status(financial_setup["task"])
         progress_row = next(item for item in status_payload["milestones"] if item["id"] == middle.id)
         assert progress_row["status"] == PaymentMilestone.STATUS_LOCKED
+
+    def test_plan_level_payment_allocates_across_open_milestones(self, financial_setup):
+        plan = make_plan(financial_setup["task"], financial_setup["admin"])
+        advance, middle, final = add_30_30_40(plan)
+        activate_plan(plan)
+
+        transactions = allocate_plan_payment(
+            plan,
+            Decimal("100000000.00"),
+            timezone.localdate(),
+            financial_setup["admin"],
+            reference_number="PAY-100",
+        )
+
+        assert [tx.milestone_id for tx in transactions] == [advance.id, middle.id, final.id]
+        assert [tx.amount for tx in transactions] == [Decimal("30000000.00"), Decimal("30000000.00"), Decimal("40000000.00")]
+        status_payload = get_task_financial_status(financial_setup["task"])
+        assert status_payload["outstanding"] == "0.00"
+        assert status_payload["can_start"] is True
+        assert status_payload["can_deliver"] is True
+
+    def test_plan_level_payment_rejects_overpayment(self, financial_setup):
+        plan = make_plan(financial_setup["task"], financial_setup["admin"])
+        add_30_30_40(plan)
+        activate_plan(plan)
+
+        with pytest.raises(Exception):
+            allocate_plan_payment(plan, Decimal("100000001.00"), timezone.localdate(), financial_setup["admin"])
 
     def test_payment_transaction_does_not_create_cost_transaction_or_ac(self, financial_setup):
         plan = make_plan(financial_setup["task"], financial_setup["admin"])

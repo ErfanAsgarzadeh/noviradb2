@@ -39,7 +39,7 @@ from .serializers import (
     ResourceExceptionSerializer, ResourceRateSerializer, AssignmentSerializer, VarianceReportSerializer,
     CalendarSerializer, ProjectViewerSerializer, SystemSettingsSerializer, UnitOfMeasureSerializer,
     ExpenseTypeSerializer, FundingSourceSerializer, BudgetAllocationSerializer, BudgetBorrowSerializer, UnfundedForecastCostSerializer,
-    CostTransactionSerializer, TaskDropdownSerializer, ResourceLevelingPlanSerializer, TaskFinancialPlanSerializer, PaymentMilestoneSerializer, PaymentTransactionSerializer
+    CostTransactionSerializer, TaskDropdownSerializer, ResourceLevelingPlanSerializer, TaskFinancialPlanSerializer, PaymentMilestoneSerializer, PaymentTransactionSerializer, PlanPaymentAllocationSerializer
 )
 
 
@@ -68,7 +68,7 @@ from .msp_exporter import export_revision_to_msp_xml
 from django.db.models import Max
 
 from .variance_engine import EVMEngine
-from .financial_services import activate_plan, get_task_financial_status, register_transaction, validate_progress_transition, validate_task_delivery, validate_task_start
+from .financial_services import activate_plan, allocate_plan_payment, get_task_financial_status, register_transaction, validate_progress_transition, validate_task_delivery, validate_task_start
 from .permissions import (
     can_create_project, can_edit_project, require_can_create_project,
     require_can_edit_project, is_company_level, is_system_admin,
@@ -3337,6 +3337,26 @@ class TaskFinancialPlanViewSet(viewsets.ModelViewSet):
         log_budget_audit(request, 'task_financial_plan_activated', plan, old=old)
         return Response(self.get_serializer(plan).data)
 
+    @action(detail=True, methods=['post'], url_path='transactions')
+    def record_plan_payment(self, request, pk=None):
+        plan = self.get_object()
+        require_can_edit_project(request.user, plan.task.project)
+        serializer = PlanPaymentAllocationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        transactions = allocate_plan_payment(
+            plan,
+            serializer.validated_data['amount'],
+            serializer.validated_data['transaction_date'],
+            user=request.user,
+            reference_number=serializer.validated_data.get('reference_number', ''),
+            description=serializer.validated_data.get('description', ''),
+        )
+        for tx in transactions:
+            log_budget_audit(request, 'payment_transaction_allocated_created', tx)
+        return Response({
+            'transactions': PaymentTransactionSerializer(transactions, many=True).data,
+            'financial_status': get_task_financial_status(plan.task),
+        }, status=status.HTTP_201_CREATED)
     @action(detail=False, methods=['get'], url_path='status')
     def status_summary(self, request):
         task_id = request.query_params.get('task_id')

@@ -314,3 +314,55 @@ def register_transaction(milestone, transaction_type, amount, transaction_date, 
         tx.save()
         refresh_milestone_status(locked)
         return tx
+
+def allocate_plan_payment(plan, amount, transaction_date, user=None, reference_number="", description=""):
+    amount = money(amount)
+    if amount <= 0:
+        raise ValidationError({"amount": "Payment amount must be greater than zero."})
+
+    with transaction.atomic():
+        locked_plan = (
+            TaskFinancialPlan.objects.select_for_update()
+            .select_related("task")
+            .prefetch_related("milestones__transactions")
+            .get(pk=plan.pk)
+        )
+        if locked_plan.status != TaskFinancialPlan.STATUS_ACTIVE:
+            raise ValidationError({"financial_plan": "Only active financial plans can receive allocated payments."})
+
+        milestones = list(
+            PaymentMilestone.objects.select_for_update()
+            .filter(financial_plan=locked_plan)
+            .prefetch_related("transactions")
+            .order_by("sequence", "id")
+        )
+        total_outstanding = money(sum((milestone_outstanding(item) for item in milestones), Decimal("0.00")))
+        if amount > total_outstanding:
+            raise ValidationError({"amount": "Payment amount exceeds outstanding financial plan amount."})
+
+        remaining = amount
+        created = []
+        for milestone in milestones:
+            if remaining <= 0:
+                break
+            outstanding = milestone_outstanding(milestone)
+            if outstanding <= 0:
+                continue
+            line_amount = min(remaining, outstanding)
+            tx = PaymentTransaction(
+                milestone=milestone,
+                transaction_type=PaymentTransaction.TYPE_PAYMENT,
+                amount=money(line_amount),
+                transaction_date=transaction_date,
+                reference_number=reference_number or "",
+                description=description or "",
+                created_by=user,
+            )
+            tx.full_clean()
+            tx.save()
+            created.append(tx)
+            remaining = money(remaining - line_amount)
+            refresh_milestone_status(milestone)
+
+        evaluate_financial_plan(locked_plan.task)
+        return created

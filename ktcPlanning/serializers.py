@@ -6,6 +6,8 @@ from decimal import Decimal
 from .models import *
 from .financial_services import get_task_financial_status, milestone_amount, milestone_paid_amount, milestone_outstanding
 
+SUPPORTED_TASK_FINANCIAL_CURRENCIES = {"IRR", "USD", "EUR"}
+
 
 # =========================================================
 # CALENDAR SERIALIZERS (طھط¹ط±غŒظپ طھظ‚ظˆغŒظ… ظ…ط³طھظ‚ظ„ + ط³ط§ط¹ط§طھ ع©ط§ط±غŒ + طھط¹ط·غŒظ„ط§طھ)
@@ -1472,10 +1474,22 @@ class CostTransactionSerializer(serializers.ModelSerializer):
 class PaymentTransactionSerializer(serializers.ModelSerializer):
     created_by = serializers.PrimaryKeyRelatedField(read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
+    financial_plan = serializers.IntegerField(source='milestone.financial_plan_id', read_only=True)
+    project = serializers.IntegerField(source='milestone.financial_plan.task.project_id', read_only=True)
+    task = serializers.UUIDField(source='milestone.financial_plan.task_id', read_only=True)
+    task_title = serializers.CharField(source='milestone.financial_plan.task.title', read_only=True)
+    milestone_title = serializers.CharField(source='milestone.title', read_only=True)
+    milestone_sequence = serializers.IntegerField(source='milestone.sequence', read_only=True)
+    currency = serializers.CharField(source='milestone.financial_plan.currency', read_only=True)
 
     class Meta:
         model = PaymentTransaction
-        fields = ['id', 'milestone', 'transaction_type', 'amount', 'transaction_date', 'reference_number', 'description', 'created_by', 'created_at']
+        fields = [
+            'id', 'milestone', 'financial_plan', 'project', 'task', 'task_title',
+            'milestone_title', 'milestone_sequence', 'currency', 'transaction_type',
+            'amount', 'transaction_date', 'reference_number', 'description',
+            'created_by', 'created_at',
+        ]
         read_only_fields = ['id', 'created_by', 'created_at']
 
     def validate(self, attrs):
@@ -1488,6 +1502,17 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'amount': 'Adjustment amount cannot be zero.'})
         return attrs
 
+
+class PlanPaymentAllocationSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=18, decimal_places=2)
+    transaction_date = serializers.DateField()
+    reference_number = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    description = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('Payment amount must be greater than zero.')
+        return value
 
 class PaymentMilestoneSerializer(serializers.ModelSerializer):
     calculated_amount = serializers.SerializerMethodField()
@@ -1585,6 +1610,12 @@ class TaskFinancialPlanSerializer(serializers.ModelSerializer):
         if value <= 0:
             raise serializers.ValidationError('Contract amount must be greater than zero.')
         return value
+
+    def validate_currency(self, value):
+        normalized = (value or '').strip().upper()
+        if normalized not in SUPPORTED_TASK_FINANCIAL_CURRENCIES:
+            raise serializers.ValidationError('Supported currencies are IRR, USD, and EUR.')
+        return normalized
 
     def validate(self, attrs):
         status = attrs.get('status', getattr(self.instance, 'status', TaskFinancialPlan.STATUS_DRAFT))
