@@ -472,6 +472,16 @@ class ProjectViewSet(viewsets.ModelViewSet):
             unknown = set(request.data.keys()) - allowed
             if unknown:
                 raise ValidationError({'detail': f"Unsupported fields: {', '.join(sorted(unknown))}"})
+            baseline_id = request.data.get('activeBaselineRevisionId')
+            if baseline_id:
+                baseline = Revision.objects.filter(
+                    pk=baseline_id,
+                    project=project,
+                    is_deleted=False,
+                ).first()
+                if baseline and baseline.approved_at is not None and not baseline.is_baseline:
+                    baseline.is_baseline = True
+                    baseline.save(update_fields=['is_baseline'])
             old = model_to_dict_safe(project)
             serializer = self.get_serializer(project, data=request.data, partial=True)
             serializer.is_valid(raise_exception=True)
