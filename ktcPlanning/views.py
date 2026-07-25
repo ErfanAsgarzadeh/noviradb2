@@ -3225,7 +3225,7 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
         return depth
 
     def _eligible_budget_allocations(self, cost_transaction):
-        base = BudgetAllocation.objects.select_for_update().select_related('parent_allocation').filter(
+        base = BudgetAllocation.objects.select_for_update(of=('self',)).select_related('parent_allocation').filter(
             project=cost_transaction.project,
             cost_type=cost_transaction.transaction_type,
             status='APPROVED',
