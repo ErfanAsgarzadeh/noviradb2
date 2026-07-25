@@ -1572,6 +1572,14 @@ class CostTransaction(models.Model):
         related_name="transactions",
     )
 
+    financial_plan = models.ForeignKey(
+        "TaskFinancialPlan",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="cost_transactions",
+    )
+
     transaction_type = models.CharField(
         max_length=20,
         choices=TRANSACTION_TYPES
@@ -1633,6 +1641,18 @@ class CostTransaction(models.Model):
             and self.budget_allocation.project_id != self.project_id
         ):
             raise ValidationError("Budget allocation must belong to the selected project.")
+
+        if self.financial_plan_id:
+            if self.financial_plan.direction != TaskFinancialPlan.DIRECTION_PAYABLE:
+                raise ValidationError({"financial_plan": "Cost transactions can only be linked to payable financial plans."})
+            if self.financial_plan.status == TaskFinancialPlan.STATUS_CANCELLED:
+                raise ValidationError({"financial_plan": "Cancelled financial plans cannot receive cost transactions."})
+            if not self.task_id:
+                raise ValidationError({"task": "Task is required when linking a financial plan."})
+            if self.financial_plan.task_id != self.task_id:
+                raise ValidationError({"financial_plan": "Financial plan must belong to the selected task."})
+            if self.financial_plan.task.project_id != self.project_id:
+                raise ValidationError({"financial_plan": "Financial plan must belong to the selected project."})
 
         if self.transaction_type == "COST":
             if self.amount is None:
@@ -1793,13 +1813,6 @@ class TaskFinancialPlan(models.Model):
     ]
 
     task = models.ForeignKey(Task, on_delete=models.PROTECT, related_name="financial_plans")
-    cost_transaction = models.ForeignKey(
-        "CostTransaction",
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="financial_plans",
-    )
     direction = models.CharField(max_length=16, choices=DIRECTION_CHOICES)
     contract_amount = models.DecimalField(max_digits=18, decimal_places=2)
     currency = models.CharField(max_length=8, default="IRR")
@@ -1821,99 +1834,6 @@ class TaskFinancialPlan(models.Model):
         super().clean()
         if self.contract_amount is not None and self.contract_amount <= 0:
             raise ValidationError("Contract amount must be greater than zero.")
-        self.validate_cost_transaction_link()
-
-    @staticmethod
-    def effective_resource_for_transaction(transaction):
-        if not transaction:
-            return None
-        if transaction.resource_id:
-            return transaction.resource
-        if transaction.assignment_id:
-            return transaction.assignment.resource
-        if transaction.resource_rate_id:
-            return transaction.resource_rate.resource
-        return None
-
-    def effective_cost_resource(self):
-        return self.effective_resource_for_transaction(self.cost_transaction)
-
-    @classmethod
-    def validate_cost_transaction_values(
-        cls,
-        *,
-        task,
-        direction,
-        contract_amount,
-        cost_transaction,
-        instance=None,
-        require_payable_cost_transaction=True,
-        check_active_conflict=False,
-    ):
-        errors = {}
-
-        if direction == cls.DIRECTION_RECEIVABLE:
-            if cost_transaction:
-                errors["cost_transaction"] = "Receivable financial plans cannot be linked to a cost transaction."
-            if errors:
-                raise ValidationError(errors)
-            return
-
-        if direction == cls.DIRECTION_PAYABLE and not cost_transaction:
-            if require_payable_cost_transaction:
-                errors["cost_transaction"] = "Payable financial plans require a cost transaction."
-            if errors:
-                raise ValidationError(errors)
-            return
-
-        if not cost_transaction:
-            return
-
-        if cost_transaction.transaction_type != "COST":
-            errors["cost_transaction"] = "Selected cost transaction must have transaction type COST."
-        if task and cost_transaction.task_id != task.id:
-            errors["cost_transaction"] = "Selected cost transaction must belong to the same task."
-        if task and cost_transaction.project_id != task.project_id:
-            errors["cost_transaction"] = "Selected cost transaction must belong to the same project."
-        if contract_amount is not None and cost_transaction.amount != contract_amount:
-            errors["contract_amount"] = "Contract amount must equal the selected cost transaction amount."
-        if cost_transaction.assignment_id:
-            if task and cost_transaction.assignment.task_id != task.id:
-                errors["cost_transaction"] = "Selected cost transaction assignment must belong to the same task."
-            if cost_transaction.revision_id and cost_transaction.assignment.revision_id != cost_transaction.revision_id:
-                errors["cost_transaction"] = "Selected cost transaction assignment revision must match the cost transaction revision."
-            if cost_transaction.assignment.revision.project_id != cost_transaction.project_id:
-                errors["cost_transaction"] = "Selected cost transaction assignment must belong to the same project."
-        if cost_transaction.revision_id and cost_transaction.revision.project_id != cost_transaction.project_id:
-            errors["cost_transaction"] = "Selected cost transaction revision must belong to the same project."
-
-        resource = cls.effective_resource_for_transaction(cost_transaction)
-        if resource and resource.resource_type != Resource.COST:
-            errors["cost_transaction"] = "Selected cost transaction must use a COST resource."
-
-        if check_active_conflict:
-            conflicting_plans = cls.objects.filter(
-                cost_transaction=cost_transaction,
-                status=cls.STATUS_ACTIVE,
-            )
-            if instance and instance.pk:
-                conflicting_plans = conflicting_plans.exclude(pk=instance.pk)
-            if conflicting_plans.exists():
-                errors["cost_transaction"] = "Selected cost transaction is already linked to another active financial plan."
-
-        if errors:
-            raise ValidationError(errors)
-
-    def validate_cost_transaction_link(self, require_payable_cost_transaction=True, check_active_conflict=False):
-        self.validate_cost_transaction_values(
-            task=self.task,
-            direction=self.direction,
-            contract_amount=self.contract_amount,
-            cost_transaction=self.cost_transaction,
-            instance=self,
-            require_payable_cost_transaction=require_payable_cost_transaction,
-            check_active_conflict=check_active_conflict,
-        )
 
     def __str__(self):
         return f"{self.task_id} - {self.direction} - {self.contract_amount} {self.currency}"

@@ -1,7 +1,6 @@
 from decimal import Decimal
 
 import pytest
-from django.core.exceptions import ValidationError
 from django.db.models import Sum
 from django.urls import reverse
 from django.utils import timezone
@@ -260,36 +259,34 @@ class TestCostTransactionDirectAmount:
         assert tx.budget_consumptions.aggregate(total=Sum("amount"))["total"] == Decimal("120.00")
 
     def make_linked_cost_transaction(self, cost_setup):
-        tx = CostTransaction.objects.create(
+        plan = TaskFinancialPlan.objects.create(
+            task=cost_setup["task"],
+            direction=TaskFinancialPlan.DIRECTION_PAYABLE,
+            contract_amount=Decimal("100.00"),
+            currency="IRR",
+            created_by=cost_setup["admin"],
+        )
+        return CostTransaction.objects.create(
             project=cost_setup["project"],
             revision=cost_setup["revision"],
             task=cost_setup["task"],
             transaction_type="COST",
             transaction_date=timezone.localdate(),
             amount=Decimal("100.00"),
+            financial_plan=plan,
             description="Original description",
             created_by=cost_setup["admin"],
         )
-        TaskFinancialPlan.objects.create(
-            task=cost_setup["task"],
-            cost_transaction=tx,
-            direction=TaskFinancialPlan.DIRECTION_PAYABLE,
-            contract_amount=Decimal("100.00"),
-            currency="IRR",
-            created_by=cost_setup["admin"],
-        )
-        return tx
 
     @pytest.mark.parametrize(
         ("field", "value", "expected_error"),
         [
-            ("amount", "120.00", "amount"),
-            ("task", None, "task"),
-            ("project", None, "project"),
+            ("task", None, "financial_plan"),
+            ("project", None, "financial_plan"),
             ("transaction_type", "LABOR", "transaction_type"),
         ],
     )
-    def test_linked_financial_plan_blocks_protected_field_updates(self, cost_setup, field, value, expected_error):
+    def test_linked_financial_plan_blocks_invalid_relationship_updates(self, cost_setup, field, value, expected_error):
         tx = self.make_linked_cost_transaction(cost_setup)
         if field in {"task", "project"}:
             other_project = make_project(creator=cost_setup["admin"], scope="intra_unit")
@@ -304,6 +301,14 @@ class TestCostTransactionDirectAmount:
         if field == "transaction_type":
             assert "quantity" not in serializer.errors
             assert "resource_rate" not in serializer.errors
+
+    def test_linked_financial_plan_allows_amount_update(self, cost_setup):
+        tx = self.make_linked_cost_transaction(cost_setup)
+        serializer = CostTransactionSerializer(instance=tx, data={"amount": "120.00"}, partial=True)
+
+        assert serializer.is_valid(), serializer.errors
+        updated = serializer.save()
+        assert updated.amount == Decimal("120.00")
 
     def test_transaction_type_cannot_change_after_creation_without_financial_plan(self, cost_setup):
         tx = CostTransaction.objects.create(
@@ -364,7 +369,7 @@ class TestCostTransactionDirectAmount:
         assert tx.quantity == Decimal("1.00")
         assert tx.unit_rate == Decimal("90.00")
 
-    def test_financial_plan_validates_against_new_direct_cost_amount(self, cost_setup):
+    def test_cost_transaction_validates_payable_plan_task_and_project(self, cost_setup):
         tx = CostTransaction.objects.create(
             project=cost_setup["project"],
             revision=cost_setup["revision"],
@@ -374,20 +379,27 @@ class TestCostTransactionDirectAmount:
             amount=Decimal("100.00"),
             created_by=cost_setup["admin"],
         )
-        plan = TaskFinancialPlan(
+        plan = TaskFinancialPlan.objects.create(
             task=cost_setup["task"],
-            cost_transaction=tx,
             direction=TaskFinancialPlan.DIRECTION_PAYABLE,
             contract_amount=Decimal("101.00"),
             currency="IRR",
             created_by=cost_setup["admin"],
         )
 
-        with pytest.raises(ValidationError):
-            plan.full_clean()
+        serializer = CostTransactionSerializer(instance=tx, data={"financial_plan": plan.id}, partial=True)
+        assert serializer.is_valid(), serializer.errors
 
-        plan.contract_amount = Decimal("100.00")
-        plan.full_clean()
+        receivable = TaskFinancialPlan.objects.create(
+            task=cost_setup["task"],
+            direction=TaskFinancialPlan.DIRECTION_RECEIVABLE,
+            contract_amount=Decimal("100.00"),
+            currency="IRR",
+            created_by=cost_setup["admin"],
+        )
+        serializer = CostTransactionSerializer(instance=tx, data={"financial_plan": receivable.id}, partial=True)
+        assert serializer.is_valid() is False
+        assert "financial_plan" in serializer.errors
 
 
 def response_rows(response):
@@ -417,14 +429,15 @@ class TestCostTransactionSelectorApi:
             amount=Decimal("200.00"),
             created_by=cost_setup["admin"],
         )
-        TaskFinancialPlan.objects.create(
+        plan = TaskFinancialPlan.objects.create(
             task=cost_setup["task"],
-            cost_transaction=planned_tx,
             direction=TaskFinancialPlan.DIRECTION_PAYABLE,
             contract_amount=Decimal("200.00"),
             currency="IRR",
             created_by=cost_setup["admin"],
         )
+        planned_tx.financial_plan = plan
+        planned_tx.save(update_fields=["financial_plan"])
 
         response = client.get(reverse("cost-transaction-list"), {
             "task_id": str(cost_setup["task"].id),

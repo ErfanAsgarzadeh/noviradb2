@@ -4,9 +4,8 @@ from django.db import transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
-from django.core.exceptions import ValidationError as DjangoValidationError
 
-from .models import PaymentMilestone, PaymentTransaction, TaskFinancialPlan, TaskReportLog
+from .models import CostTransaction, PaymentMilestone, PaymentTransaction, TaskFinancialPlan, TaskReportLog
 
 MONEY_QUANT = Decimal("0.01")
 PROGRESS_QUANT = Decimal("0.01")
@@ -73,6 +72,39 @@ def milestone_outstanding(milestone):
     return money(milestone_amount(milestone) - milestone_paid_amount(milestone))
 
 
+def allocate_cost_transactions_to_milestones(plan, milestones=None):
+    milestones = list(milestones if milestones is not None else plan.milestones.all().order_by("sequence", "id"))
+    allocations = {milestone.id: Decimal("0.00") for milestone in milestones}
+    remaining_by_milestone = {milestone.id: milestone_amount(milestone) for milestone in milestones}
+    cost_transactions = (
+        CostTransaction.objects.filter(financial_plan=plan)
+        .order_by("transaction_date", "created_at", "id")
+    )
+
+    for cost_transaction in cost_transactions:
+        remaining_cost = money(cost_transaction.amount)
+        for milestone in milestones:
+            if remaining_cost <= 0:
+                break
+            milestone_remaining = remaining_by_milestone[milestone.id]
+            if milestone_remaining <= 0:
+                continue
+            applied = min(remaining_cost, milestone_remaining)
+            allocations[milestone.id] = money(allocations[milestone.id] + applied)
+            remaining_by_milestone[milestone.id] = money(milestone_remaining - applied)
+            remaining_cost = money(remaining_cost - applied)
+    return allocations
+
+
+def milestone_incurred_amount(milestone):
+    milestones = list(milestone.financial_plan.milestones.all().order_by("sequence", "id"))
+    return money(allocate_cost_transactions_to_milestones(milestone.financial_plan, milestones).get(milestone.id, Decimal("0.00")))
+
+
+def milestone_cost_outstanding(milestone):
+    return money(milestone_amount(milestone) - milestone_incurred_amount(milestone))
+
+
 def is_milestone_paid(milestone):
     return milestone_outstanding(milestone) <= Decimal("0.00")
 
@@ -132,20 +164,12 @@ def validate_plan_milestones(plan):
 
 def activate_plan(plan):
     with transaction.atomic():
-        locked_plan = TaskFinancialPlan.objects.select_for_update(of=("self",)).select_related("task", "task__project", "cost_transaction", "cost_transaction__project", "cost_transaction__task", "cost_transaction__revision", "cost_transaction__assignment", "cost_transaction__assignment__resource", "cost_transaction__assignment__revision", "cost_transaction__assignment__revision__project", "cost_transaction__resource", "cost_transaction__resource_rate", "cost_transaction__resource_rate__resource").get(pk=plan.pk)
+        locked_plan = TaskFinancialPlan.objects.select_for_update(of=("self",)).select_related("task", "task__project").get(pk=plan.pk)
         if TaskFinancialPlan.objects.select_for_update().filter(
             task=locked_plan.task,
             status=TaskFinancialPlan.STATUS_ACTIVE,
         ).exclude(pk=locked_plan.pk).exists():
             raise ValidationError({"task": "Only one active financial plan is allowed for each task."})
-        try:
-            locked_plan.validate_cost_transaction_link(
-                require_payable_cost_transaction=True,
-                check_active_conflict=True,
-            )
-        except DjangoValidationError as exc:
-            detail = exc.message_dict if hasattr(exc, "message_dict") else {"detail": exc.messages}
-            raise ValidationError(detail)
         validate_plan_milestones(locked_plan)
         locked_plan.status = TaskFinancialPlan.STATUS_ACTIVE
         locked_plan.save(update_fields=["status", "updated_at"])
@@ -208,11 +232,12 @@ def get_task_financial_status(task):
         }
 
     milestones = list(plan.milestones.all())
+    cost_allocations = allocate_cost_transactions_to_milestones(plan, milestones)
     for milestone in milestones:
         refresh_milestone_status(milestone, approved_progress=approved)
 
     milestone_rows = []
-    total_amount = total_eligible = total_paid = Decimal("0.00")
+    total_amount = total_eligible = total_paid = total_incurred = Decimal("0.00")
     blocking = []
     today = timezone.localdate()
 
@@ -220,6 +245,8 @@ def get_task_financial_status(task):
         amount = milestone_amount(milestone)
         paid = milestone_paid_amount(milestone)
         outstanding = milestone_outstanding(milestone)
+        incurred = cost_allocations.get(milestone.id, Decimal("0.00"))
+        cost_outstanding = money(amount - incurred)
         triggered = is_milestone_triggered(milestone, approved_progress=approved, today=today)
         row = {
             "id": milestone.id,
@@ -235,6 +262,8 @@ def get_task_financial_status(task):
             "status": milestone.status,
             "paid_amount": as_str(paid),
             "outstanding": as_str(outstanding),
+            "incurred_amount": as_str(incurred),
+            "cost_outstanding": as_str(cost_outstanding),
             "is_triggered": triggered,
             "blocks_task_start": milestone.blocks_task_start,
             "blocks_task_delivery": milestone.blocks_task_delivery,
@@ -244,6 +273,7 @@ def get_task_financial_status(task):
         milestone_rows.append(row)
         total_amount += amount
         total_paid += paid
+        total_incurred += incurred
         if triggered:
             total_eligible += amount
         if milestone.blocks_task_start and outstanding > 0:
@@ -270,7 +300,9 @@ def get_task_financial_status(task):
         "total_eligible": as_str(total_eligible),
         "total_due": as_str(total_eligible),
         "total_paid": as_str(total_paid),
+        "total_incurred": as_str(total_incurred),
         "outstanding": as_str(total_amount - total_paid),
+        "cost_outstanding": as_str(total_amount - total_incurred),
         "approved_progress": str(approved),
         "can_start": can_start,
         "can_deliver": can_deliver,

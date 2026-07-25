@@ -3137,12 +3137,12 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         accessible_ids = accessible_project_ids(self.request.user)
-        plan_exists = TaskFinancialPlan.objects.filter(cost_transaction_id=OuterRef('pk'))
-        unavailable_plan_exists = plan_exists.exclude(status=TaskFinancialPlan.STATUS_CANCELLED)
         queryset = super().get_queryset().select_related(
             'project',
             'revision',
             'task',
+            'financial_plan',
+            'financial_plan__task',
             'assignment',
             'assignment__resource',
             'resource',
@@ -3150,8 +3150,7 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
             'resource_rate__resource',
             'budget_allocation',
         ).annotate(
-            _has_financial_plan=Exists(plan_exists),
-            _has_unavailable_financial_plan=Exists(unavailable_plan_exists),
+            _has_financial_plan=Exists(TaskFinancialPlan.objects.filter(pk=OuterRef('financial_plan_id'))),
         )
         queryset = queryset.filter(project_id__in=accessible_ids)
 
@@ -3171,11 +3170,10 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
         )
         if available is True:
             queryset = queryset.filter(
-                transaction_type='COST',
-                _has_unavailable_financial_plan=False,
+                financial_plan__isnull=True,
             )
         elif available is False:
-            queryset = queryset.filter(_has_unavailable_financial_plan=True)
+            queryset = queryset.filter(financial_plan__isnull=False)
         return queryset
 
     def _allocation_remaining(self, allocation):
@@ -3342,11 +3340,7 @@ class TaskFinancialPlanViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = TaskFinancialPlan.objects.select_related(
             'task', 'task__project', 'created_by',
-            'cost_transaction', 'cost_transaction__project', 'cost_transaction__task',
-            'cost_transaction__assignment', 'cost_transaction__assignment__resource',
-            'cost_transaction__resource', 'cost_transaction__resource_rate',
-            'cost_transaction__resource_rate__resource',
-        ).prefetch_related('milestones__transactions')
+        ).prefetch_related('milestones__transactions', 'cost_transactions')
         queryset = queryset.filter(task__project_id__in=accessible_project_ids(self.request.user))
         task_id = self.request.query_params.get('task_id')
         if task_id:

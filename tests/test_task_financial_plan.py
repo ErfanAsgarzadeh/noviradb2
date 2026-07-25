@@ -4,7 +4,6 @@ from decimal import Decimal
 import pytest
 from django.urls import reverse
 from django.core.exceptions import ValidationError
-from django.db.models.deletion import ProtectedError
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -40,7 +39,7 @@ def financial_setup():
     return {"admin": admin, "project": project, "revision": revision, "task": task, "task_version": task_version, "reviewer": reviewer}
 
 
-def make_cost_transaction(task, revision, user, amount="100000000.00", resource_type=Resource.COST, transaction_type="COST", project=None):
+def make_cost_transaction(task, revision, user, amount="100000000.00", resource_type=Resource.COST, transaction_type="COST", project=None, financial_plan=None):
     resource = Resource.objects.create(
         code=f"RES-{Resource.objects.count() + 1}",
         name=f"{resource_type} Resource {Resource.objects.count() + 1}",
@@ -61,6 +60,8 @@ def make_cost_transaction(task, revision, user, amount="100000000.00", resource_
         "transaction_date": timezone.localdate(),
         "created_by": user,
     }
+    if financial_plan is not None:
+        payload["financial_plan"] = financial_plan
     if transaction_type == "COST":
         payload["amount"] = Decimal(amount)
     else:
@@ -73,14 +74,9 @@ def make_cost_transaction(task, revision, user, amount="100000000.00", resource_
     return CostTransaction.objects.create(**payload)
 
 
-def make_plan(task, user, amount="100000000.00", direction=TaskFinancialPlan.DIRECTION_PAYABLE, cost_transaction="auto"):
-    if direction == TaskFinancialPlan.DIRECTION_PAYABLE and cost_transaction == "auto":
-        cost_transaction = make_cost_transaction(task, task.project.current_execution_revision, user, amount=amount)
-    elif cost_transaction == "auto":
-        cost_transaction = None
+def make_plan(task, user, amount="100000000.00", direction=TaskFinancialPlan.DIRECTION_PAYABLE):
     return TaskFinancialPlan.objects.create(
         task=task,
-        cost_transaction=cost_transaction,
         direction=direction,
         contract_amount=Decimal(amount),
         currency="IRR",
@@ -88,16 +84,13 @@ def make_plan(task, user, amount="100000000.00", direction=TaskFinancialPlan.DIR
     )
 
 
-def plan_payload(task, amount="100000000.00", direction=TaskFinancialPlan.DIRECTION_PAYABLE, cost_transaction=None):
-    payload = {
+def plan_payload(task, amount="100000000.00", direction=TaskFinancialPlan.DIRECTION_PAYABLE):
+    return {
         "task": str(task.id),
         "direction": direction,
         "contract_amount": amount,
         "currency": "IRR",
     }
-    if cost_transaction is not None:
-        payload["cost_transaction"] = cost_transaction.id
-    return payload
 
 
 def assert_plan_payload_invalid(payload, error_key):
@@ -137,6 +130,38 @@ def add_30_30_40(plan):
     return advance, middle, final
 
 
+def add_30_40_30(plan):
+    first = PaymentMilestone.objects.create(
+        financial_plan=plan,
+        title="Advance",
+        sequence=1,
+        trigger_type=PaymentMilestone.TRIGGER_BEFORE_START,
+        amount_type=PaymentMilestone.AMOUNT_PERCENTAGE,
+        percentage=Decimal("30.00"),
+        blocks_task_start=True,
+    )
+    second = PaymentMilestone.objects.create(
+        financial_plan=plan,
+        title="Progress",
+        sequence=2,
+        trigger_type=PaymentMilestone.TRIGGER_APPROVED_PROGRESS,
+        amount_type=PaymentMilestone.AMOUNT_PERCENTAGE,
+        percentage=Decimal("40.00"),
+        progress_threshold=Decimal("50.00"),
+        blocks_progress_after_threshold=True,
+    )
+    third = PaymentMilestone.objects.create(
+        financial_plan=plan,
+        title="Final",
+        sequence=3,
+        trigger_type=PaymentMilestone.TRIGGER_BEFORE_DELIVERY,
+        amount_type=PaymentMilestone.AMOUNT_PERCENTAGE,
+        percentage=Decimal("30.00"),
+        blocks_task_delivery=True,
+    )
+    return first, second, third
+
+
 @pytest.mark.django_db
 class TestTaskFinancialPlanService:
     def test_create_payable_and_receivable_plans(self, financial_setup):
@@ -148,168 +173,26 @@ class TestTaskFinancialPlanService:
         assert receivable.direction == "receivable"
 
 
-    def test_payable_plan_requires_valid_cost_transaction(self, financial_setup):
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
-        plan = make_plan(financial_setup["task"], financial_setup["admin"], cost_transaction=tx)
+    def test_payable_and_receivable_plans_do_not_require_cost_transaction(self, financial_setup):
+        payable = make_plan(financial_setup["task"], financial_setup["admin"])
+        other_task, _ = make_task(financial_setup["project"], financial_setup["revision"], title="Task B")
+        receivable = make_plan(other_task, financial_setup["admin"], direction=TaskFinancialPlan.DIRECTION_RECEIVABLE)
 
-        assert plan.cost_transaction == tx
-        assert plan.contract_amount == tx.amount
+        assert payable.cost_transactions.count() == 0
+        assert receivable.cost_transactions.count() == 0
 
-    def test_payable_plan_without_cost_transaction_is_rejected(self, financial_setup):
-        assert_plan_payload_invalid(
-            plan_payload(financial_setup["task"], cost_transaction=None),
-            "cost_transaction",
-        )
-
-    def test_receivable_plan_without_cost_transaction_is_allowed(self, financial_setup):
-        plan = make_plan(
-            financial_setup["task"],
-            financial_setup["admin"],
-            direction=TaskFinancialPlan.DIRECTION_RECEIVABLE,
-            cost_transaction=None,
-        )
-
-        assert plan.cost_transaction is None
-
-    def test_receivable_plan_with_cost_transaction_is_rejected(self, financial_setup):
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
-
-        assert_plan_payload_invalid(
-            plan_payload(
-                financial_setup["task"],
-                direction=TaskFinancialPlan.DIRECTION_RECEIVABLE,
-                cost_transaction=tx,
-            ),
-            "cost_transaction",
-        )
-
-    def test_non_cost_transaction_type_is_rejected(self, financial_setup):
-        tx = make_cost_transaction(
-            financial_setup["task"],
-            financial_setup["revision"],
-            financial_setup["admin"],
-            resource_type=Resource.LABOR,
-            transaction_type="LABOR",
-        )
-
-        assert_plan_payload_invalid(plan_payload(financial_setup["task"], cost_transaction=tx), "cost_transaction")
-
-    def test_cost_transaction_for_other_task_is_rejected(self, financial_setup):
-        other_task, _ = make_task(financial_setup["project"], financial_setup["revision"], title="Other Task")
-        tx = make_cost_transaction(other_task, financial_setup["revision"], financial_setup["admin"])
-
-        assert_plan_payload_invalid(plan_payload(financial_setup["task"], cost_transaction=tx), "cost_transaction")
-
-    def test_cost_transaction_for_other_project_is_rejected(self, financial_setup):
-        other_project = make_project(creator=financial_setup["admin"], scope="intra_unit")
-        other_revision = make_revision(other_project, creator=financial_setup["admin"], approved=True)
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
-        CostTransaction.objects.filter(pk=tx.pk).update(project=other_project, revision=other_revision)
-        tx.refresh_from_db()
-
-        assert_plan_payload_invalid(plan_payload(financial_setup["task"], cost_transaction=tx), "cost_transaction")
-
-    def test_assignment_for_other_task_is_rejected(self, financial_setup):
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
-        other_task, _ = make_task(financial_setup["project"], financial_setup["revision"], title="Other Task")
-        tx.assignment.task = other_task
-        tx.assignment.save()
-
-        assert_plan_payload_invalid(plan_payload(financial_setup["task"], cost_transaction=tx), "cost_transaction")
-
-    def test_non_cost_resource_is_rejected_for_cost_transaction(self, financial_setup):
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
-        tx.resource.resource_type = Resource.LABOR
-        tx.resource.save()
-
-        assert_plan_payload_invalid(plan_payload(financial_setup["task"], cost_transaction=tx), "cost_transaction")
-
-    def test_contract_amount_must_equal_cost_transaction_amount(self, financial_setup):
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
-
-        assert_plan_payload_invalid(
-            plan_payload(financial_setup["task"], amount="99999999.99", cost_transaction=tx),
-            "contract_amount",
-        )
-        assert_plan_payload_invalid(
-            plan_payload(financial_setup["task"], amount="100000000.01", cost_transaction=tx),
-            "contract_amount",
-        )
-        serializer = TaskFinancialPlanSerializer(data=plan_payload(financial_setup["task"], cost_transaction=tx))
-        assert serializer.is_valid(), serializer.errors
-
-    def test_cost_transaction_cannot_be_reused_by_active_plan(self, financial_setup):
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
-        first = make_plan(financial_setup["task"], financial_setup["admin"], cost_transaction=tx)
-        second = TaskFinancialPlan.objects.create(
-            task=financial_setup["task"],
-            cost_transaction=tx,
-            direction=TaskFinancialPlan.DIRECTION_PAYABLE,
-            contract_amount=tx.amount,
-            currency="IRR",
-            created_by=financial_setup["admin"],
-        )
-        add_30_30_40(first)
-        add_30_30_40(second)
-        activate_plan(first)
-
-        with pytest.raises(Exception):
-            activate_plan(second)
-
-    def test_legacy_null_cost_transaction_plan_can_be_read_serialized_and_not_activated(self, financial_setup):
-        TaskFinancialPlan.objects.bulk_create([
-            TaskFinancialPlan(
-                task=financial_setup["task"],
-                direction=TaskFinancialPlan.DIRECTION_PAYABLE,
-                contract_amount=Decimal("100000000.00"),
-                currency="IRR",
-                created_by=financial_setup["admin"],
-            )
-        ])
-
-        plan = TaskFinancialPlan.objects.get(cost_transaction__isnull=True)
-        data = TaskFinancialPlanSerializer(plan).data
-
-        assert plan.direction == TaskFinancialPlan.DIRECTION_PAYABLE
-        assert data["cost_transaction_amount"] is None
-        assert data["cost_transaction_type"] is None
-        assert data["cost_transaction_date"] is None
-        assert data["cost_transaction_description"] is None
-        assert data["cost_transaction_resource_name"] is None
-        with pytest.raises(Exception):
-            activate_plan(plan)
-
-    def test_linked_cost_transaction_delete_is_protected(self, financial_setup):
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
-        make_plan(financial_setup["task"], financial_setup["admin"], cost_transaction=tx)
-
-        with pytest.raises(ProtectedError):
-            tx.delete()
-
-    def test_plan_with_payment_transaction_cannot_change_cost_transaction(self, financial_setup):
-        plan = make_plan(financial_setup["task"], financial_setup["admin"])
-        advance, _, _ = add_30_30_40(plan)
+    def test_cost_transaction_link_allocates_actual_cost_across_30_40_30_milestones(self, financial_setup):
+        plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="100.00")
+        add_30_40_30(plan)
         activate_plan(plan)
-        register_transaction(advance, PaymentTransaction.TYPE_PAYMENT, Decimal("30000000.00"), timezone.localdate(), financial_setup["admin"])
-        other_tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="100000000.00")
 
-        serializer = TaskFinancialPlanSerializer(plan, data={"cost_transaction": other_tx.id}, partial=True)
+        make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="75.00", financial_plan=plan)
 
-        assert serializer.is_valid() is False
-        assert "cost_transaction" in serializer.errors
-
-    def test_serializer_returns_cost_transaction_read_only_fields(self, financial_setup):
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
-        plan = make_plan(financial_setup["task"], financial_setup["admin"], cost_transaction=tx)
-
-        data = TaskFinancialPlanSerializer(plan).data
-
-        assert data["cost_transaction"] == tx.id
-        assert data["cost_transaction_amount"] == "100000000.00"
-        assert data["cost_transaction_type"] == "COST"
-        assert data["cost_transaction_date"] == timezone.localdate().isoformat()
-        assert data["cost_transaction_description"] == ""
-        assert data["cost_transaction_resource_name"] == tx.resource.name
+        status_payload = get_task_financial_status(financial_setup["task"])
+        assert status_payload["total_incurred"] == "75.00"
+        assert status_payload["cost_outstanding"] == "25.00"
+        assert [row["incurred_amount"] for row in status_payload["milestones"]] == ["30.00", "40.00", "5.00"]
+        assert [row["cost_outstanding"] for row in status_payload["milestones"]] == ["0.00", "0.00", "25.00"]
     def test_activation_requires_complete_milestone_total(self, financial_setup):
         plan = make_plan(financial_setup["task"], financial_setup["admin"])
         PaymentMilestone.objects.create(
@@ -439,17 +322,15 @@ class TestTaskFinancialPlanService:
         register_transaction(advance, PaymentTransaction.TYPE_PAYMENT, Decimal("30000000.00"), timezone.localdate(), financial_setup["admin"])
 
         assert PaymentTransaction.objects.count() == 1
-        assert CostTransaction.objects.count() == 1
+        assert CostTransaction.objects.count() == 0
 
 
 @pytest.mark.django_db
 class TestTaskFinancialPlanApi:
     def test_api_create_activate_and_record_payment(self, financial_setup):
         client = api(financial_setup["admin"])
-        cost_transaction = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
         plan_resp = client.post(reverse("task-financial-plan-list"), {
             "task": str(financial_setup["task"].id),
-            "cost_transaction": cost_transaction.id,
             "direction": "payable",
             "contract_amount": "100000000.00",
             "currency": "IRR",
@@ -488,59 +369,71 @@ def response_rows(response):
 
 @pytest.mark.django_db
 class TestTaskFinancialPlanCostTransactionApi:
-    def test_api_create_payable_with_valid_cost_transaction(self, financial_setup):
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
-
+    def test_api_create_payable_without_cost_transaction(self, financial_setup):
         response = api(financial_setup["admin"]).post(reverse("task-financial-plan-list"), {
             "task": str(financial_setup["task"].id),
-            "cost_transaction": tx.id,
             "direction": TaskFinancialPlan.DIRECTION_PAYABLE,
             "contract_amount": "100000000.00",
             "currency": "IRR",
         }, format="json")
 
         assert response.status_code == status.HTTP_201_CREATED, response.data
-        assert response.data["cost_transaction"] == tx.id
+        assert "cost_transaction" not in response.data
 
-    def test_api_rejects_inaccessible_cost_transaction_injection(self, financial_setup):
-        tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"])
+    def test_api_links_cost_transaction_to_valid_payable_plan(self, financial_setup):
+        plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="100.00")
 
-        response = api(make_member()).post(reverse("task-financial-plan-list"), {
+        response = api(financial_setup["admin"]).post(reverse("cost-transaction-list"), {
+            "project": financial_setup["project"].id,
             "task": str(financial_setup["task"].id),
-            "cost_transaction": tx.id,
-            "direction": TaskFinancialPlan.DIRECTION_PAYABLE,
-            "contract_amount": "100000000.00",
-            "currency": "IRR",
+            "revision": financial_setup["revision"].id,
+            "transaction_type": "COST",
+            "transaction_date": timezone.localdate().isoformat(),
+            "amount": "75.00",
+            "financial_plan": plan.id,
+        }, format="json")
+
+        assert response.status_code == status.HTTP_201_CREATED, response.data
+        tx = CostTransaction.objects.get(pk=response.data["id"])
+        assert tx.financial_plan == plan
+
+    def test_api_rejects_inaccessible_financial_plan_injection(self, financial_setup):
+        plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="100.00")
+
+        response = api(make_member()).post(reverse("cost-transaction-list"), {
+            "project": financial_setup["project"].id,
+            "task": str(financial_setup["task"].id),
+            "revision": financial_setup["revision"].id,
+            "transaction_type": "COST",
+            "transaction_date": timezone.localdate().isoformat(),
+            "amount": "75.00",
+            "financial_plan": plan.id,
         }, format="json")
 
         assert response.status_code in {status.HTTP_400_BAD_REQUEST, status.HTTP_403_FORBIDDEN}
 
-    def test_draft_without_payment_can_change_cost_transaction_with_matching_amount(self, financial_setup):
-        first_tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="100.00")
-        second_tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="125.00")
-        plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="100.00", cost_transaction=first_tx)
+    def test_cost_transaction_rejects_receivable_plan_link(self, financial_setup):
+        plan = make_plan(
+            financial_setup["task"],
+            financial_setup["admin"],
+            direction=TaskFinancialPlan.DIRECTION_RECEIVABLE,
+        )
 
-        response = api(financial_setup["admin"]).patch(reverse("task-financial-plan-detail", kwargs={"pk": plan.id}), {
-            "cost_transaction": second_tx.id,
-            "contract_amount": "125.00",
-        }, format="json")
+        serializer = TaskFinancialPlanSerializer(data=plan_payload(financial_setup["task"]))
+        assert serializer.is_valid(), serializer.errors
 
-        assert response.status_code == status.HTTP_200_OK, response.data
-        plan.refresh_from_db()
-        assert plan.cost_transaction == second_tx
-        assert plan.contract_amount == Decimal("125.00")
-
-    def test_draft_cost_transaction_change_requires_matching_contract_amount(self, financial_setup):
-        first_tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="100.00")
-        second_tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="125.00")
-        plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="100.00", cost_transaction=first_tx)
-
-        response = api(financial_setup["admin"]).patch(reverse("task-financial-plan-detail", kwargs={"pk": plan.id}), {
-            "cost_transaction": second_tx.id,
-        }, format="json")
-
-        assert response.status_code == status.HTTP_400_BAD_REQUEST
-        assert "contract_amount" in response.data
+        tx = CostTransaction(
+            project=financial_setup["project"],
+            revision=financial_setup["revision"],
+            task=financial_setup["task"],
+            transaction_type="COST",
+            transaction_date=timezone.localdate(),
+            amount=Decimal("100.00"),
+            financial_plan=plan,
+            created_by=financial_setup["admin"],
+        )
+        with pytest.raises(ValidationError):
+            tx.full_clean()
 
     def test_plan_with_payment_cannot_change_financial_fields(self, financial_setup):
         plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="100.00")
@@ -553,14 +446,12 @@ class TestTaskFinancialPlanCostTransactionApi:
             fixed_amount=Decimal("100.00"),
         )
         register_transaction(milestone, PaymentTransaction.TYPE_PAYMENT, Decimal("100.00"), timezone.localdate(), financial_setup["admin"])
-        next_tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="100.00")
-
         response = api(financial_setup["admin"]).patch(reverse("task-financial-plan-detail", kwargs={"pk": plan.id}), {
-            "cost_transaction": next_tx.id,
+            "contract_amount": "125.00",
         }, format="json")
 
         assert response.status_code == status.HTTP_400_BAD_REQUEST
-        assert "cost_transaction" in response.data
+        assert "contract_amount" in response.data
 
     def test_receivable_without_cost_transaction_still_works(self, financial_setup):
         response = api(financial_setup["admin"]).post(reverse("task-financial-plan-list"), {
@@ -571,7 +462,7 @@ class TestTaskFinancialPlanCostTransactionApi:
         }, format="json")
 
         assert response.status_code == status.HTTP_201_CREATED, response.data
-        assert response.data["cost_transaction"] is None
+        assert "cost_transaction" not in response.data
 
 
 @pytest.mark.django_db
