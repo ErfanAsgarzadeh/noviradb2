@@ -11,7 +11,7 @@ from django.conf import settings
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from django.db import transaction
-from django.db.models import Q, Sum, Prefetch, F, OuterRef, Subquery
+from django.db.models import Q, Sum, Prefetch, F, OuterRef, Subquery, Exists
 from django.core.exceptions import ValidationError as DjangoValidationError
 from datetime import date, timedelta, datetime
 from decimal import Decimal
@@ -3124,10 +3124,36 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
     serializer_class = CostTransactionSerializer
     permission_classes = [IsAuthenticated]
 
+    @staticmethod
+    def _parse_bool_param(value, name):
+        if value is None or value == '':
+            return None
+        normalized = str(value).strip().lower()
+        if normalized in {'true', '1'}:
+            return True
+        if normalized in {'false', '0'}:
+            return False
+        raise ValidationError({name: 'Use one of: true, 1, false, 0.'})
+
     def get_queryset(self):
-        queryset = super().get_queryset()
-        # ظپغŒظ„طھط± ع©ط±ط¯ظ† ظ‡ط²غŒظ†ظ‡â€Œظ‡ط§ ط¨ط± ط§ط³ط§ط³ ظ¾ط±ظˆعکظ‡â€Œظ‡ط§غŒغŒ ع©ظ‡ ع©ط§ط±ط¨ط± ط¯ط³طھط±ط³غŒ ط¯ط§ط±ط¯
-        queryset = queryset.filter(project_id__in=accessible_project_ids(self.request.user))
+        accessible_ids = accessible_project_ids(self.request.user)
+        plan_exists = TaskFinancialPlan.objects.filter(cost_transaction_id=OuterRef('pk'))
+        unavailable_plan_exists = plan_exists.exclude(status=TaskFinancialPlan.STATUS_CANCELLED)
+        queryset = super().get_queryset().select_related(
+            'project',
+            'revision',
+            'task',
+            'assignment',
+            'assignment__resource',
+            'resource',
+            'resource_rate',
+            'resource_rate__resource',
+            'budget_allocation',
+        ).annotate(
+            _has_financial_plan=Exists(plan_exists),
+            _has_unavailable_financial_plan=Exists(unavailable_plan_exists),
+        )
+        queryset = queryset.filter(project_id__in=accessible_ids)
 
         project_id = self.request.query_params.get('project_id')
         if project_id:
@@ -3138,6 +3164,18 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
         task_id = self.request.query_params.get('task_id')
         if task_id:
             queryset = queryset.filter(task_id=task_id)
+
+        available = self._parse_bool_param(
+            self.request.query_params.get('available_for_financial_plan'),
+            'available_for_financial_plan',
+        )
+        if available is True:
+            queryset = queryset.filter(
+                transaction_type='COST',
+                _has_unavailable_financial_plan=False,
+            )
+        elif available is False:
+            queryset = queryset.filter(_has_unavailable_financial_plan=True)
         return queryset
 
     def _allocation_remaining(self, allocation):
@@ -3302,7 +3340,13 @@ class TaskFinancialPlanViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = TaskFinancialPlan.objects.select_related('task', 'task__project', 'created_by').prefetch_related('milestones__transactions')
+        queryset = TaskFinancialPlan.objects.select_related(
+            'task', 'task__project', 'created_by',
+            'cost_transaction', 'cost_transaction__project', 'cost_transaction__task',
+            'cost_transaction__assignment', 'cost_transaction__assignment__resource',
+            'cost_transaction__resource', 'cost_transaction__resource_rate',
+            'cost_transaction__resource_rate__resource',
+        ).prefetch_related('milestones__transactions')
         queryset = queryset.filter(task__project_id__in=accessible_project_ids(self.request.user))
         task_id = self.request.query_params.get('task_id')
         if task_id:
@@ -3321,6 +3365,9 @@ class TaskFinancialPlanViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         plan = serializer.instance
         require_can_edit_project(self.request.user, plan.task.project)
+        next_task = serializer.validated_data.get('task')
+        if next_task and next_task.project_id != plan.task.project_id:
+            require_can_edit_project(self.request.user, next_task.project)
         next_status = serializer.validated_data.get('status')
         if next_status == TaskFinancialPlan.STATUS_ACTIVE:
             raise ValidationError({'status': 'Use the activate action to activate financial plans.'})
@@ -3437,11 +3484,25 @@ class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = PaymentTransaction.objects.select_related('milestone', 'milestone__financial_plan', 'milestone__financial_plan__task')
+        queryset = PaymentTransaction.objects.select_related(
+            'milestone',
+            'milestone__financial_plan',
+            'milestone__financial_plan__task',
+            'milestone__financial_plan__task__project',
+        )
         queryset = queryset.filter(milestone__financial_plan__task__project_id__in=accessible_project_ids(self.request.user))
         milestone_id = self.request.query_params.get('milestone_id')
         if milestone_id:
             queryset = queryset.filter(milestone_id=milestone_id)
+        financial_plan_id = self.request.query_params.get('financial_plan_id')
+        if financial_plan_id:
+            queryset = queryset.filter(milestone__financial_plan_id=financial_plan_id)
+        task_id = self.request.query_params.get('task_id')
+        if task_id:
+            queryset = queryset.filter(milestone__financial_plan__task_id=task_id)
+        project_id = self.request.query_params.get('project_id')
+        if project_id:
+            queryset = queryset.filter(milestone__financial_plan__task__project_id=project_id)
         return queryset
 class TaskViewSet(viewsets.ReadOnlyModelViewSet):
     """Read-only dropdown tasks scoped to the project's official execution revision."""

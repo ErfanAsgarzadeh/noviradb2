@@ -1,10 +1,12 @@
 # ktcPlanning/serializers.py
 from rest_framework import serializers
 from django.db.models import Sum
+from django.core.exceptions import ValidationError as DjangoValidationError
 from decimal import Decimal
 
 from .models import *
 from .financial_services import get_task_financial_status, milestone_amount, milestone_paid_amount, milestone_outstanding
+from .permissions import accessible_project_ids
 
 SUPPORTED_TASK_FINANCIAL_CURRENCIES = {"IRR", "USD", "EUR"}
 
@@ -1365,7 +1367,7 @@ class UnfundedForecastCostSerializer(serializers.ModelSerializer):
 
 class CostTransactionSerializer(serializers.ModelSerializer):
     # ظپغŒظ„ط¯ظ‡ط§غŒ read-only ع©ظ‡ ط¨ع©ظ†ط¯ ظ…ط­ط§ط³ط¨ظ‡ ظ…غŒâ€Œع©ظ†ط¯
-    amount = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+    amount = serializers.DecimalField(max_digits=16, decimal_places=2, required=False)
     created_by = serializers.PrimaryKeyRelatedField(read_only=True)
     created_at = serializers.DateTimeField(read_only=True)
 
@@ -1374,6 +1376,10 @@ class CostTransactionSerializer(serializers.ModelSerializer):
     expense_type_name = serializers.CharField(source='expense_type.name', read_only=True, default=None)
     task_title = serializers.SerializerMethodField()
     budget_consumptions = BudgetConsumptionSerializer(many=True, read_only=True)
+    effective_resource_id = serializers.SerializerMethodField()
+    effective_resource_name = serializers.SerializerMethodField()
+    effective_resource_type = serializers.SerializerMethodField()
+    has_financial_plan = serializers.SerializerMethodField()
 
     class Meta:
         model = CostTransaction
@@ -1401,14 +1407,46 @@ class CostTransactionSerializer(serializers.ModelSerializer):
             'expense_type_name',
             'task_title',
             'budget_consumptions',
+            'effective_resource_id',
+            'effective_resource_name',
+            'effective_resource_type',
+            'has_financial_plan',
         ]
-        read_only_fields = ['amount', 'created_by', 'created_at', 'budget_consumptions']
+        read_only_fields = ['created_by', 'created_at', 'budget_consumptions', 'effective_resource_id', 'effective_resource_name', 'effective_resource_type', 'has_financial_plan']
 
     def get_task_title(self, obj):
         if not obj.task:
             return None
         tv = obj.task.versions.filter(is_deleted=False).last()
         return tv.title if tv else str(obj.task.id)
+
+
+    def _effective_resource(self, obj):
+        if obj.resource_id:
+            return obj.resource
+        if obj.assignment_id:
+            return obj.assignment.resource
+        if obj.resource_rate_id:
+            return obj.resource_rate.resource
+        return None
+
+    def get_effective_resource_id(self, obj):
+        resource = self._effective_resource(obj)
+        return resource.id if resource else None
+
+    def get_effective_resource_name(self, obj):
+        resource = self._effective_resource(obj)
+        return resource.name if resource else None
+
+    def get_effective_resource_type(self, obj):
+        resource = self._effective_resource(obj)
+        return resource.resource_type if resource else None
+
+    def get_has_financial_plan(self, obj):
+        annotated = getattr(obj, '_has_financial_plan', None)
+        if annotated is not None:
+            return bool(annotated)
+        return obj.financial_plans.exists()
 
     def validate(self, attrs):
         instance = self.instance
@@ -1421,23 +1459,76 @@ class CostTransactionSerializer(serializers.ModelSerializer):
         transaction_type = value('transaction_type')
         quantity = value('quantity')
         task = value('task')
+        project = value('project')
         revision = value('revision')
         assignment = value('assignment')
+        resource = value('resource')
         resource_rate = value('resource_rate')
         budget_allocation = value('budget_allocation')
         expense_type = value('expense_type')
         expense_rate = value('expense_rate')
         unit_rate = value('unit_rate')
+        amount = value('amount')
 
+        if (
+            instance
+            and "transaction_type" in attrs
+            and attrs["transaction_type"] != instance.transaction_type
+        ):
+            raise serializers.ValidationError({'transaction_type': 'Transaction type cannot be changed after creation.'})
         if quantity is not None and quantity <= 0:
             raise serializers.ValidationError({'quantity': 'Quantity must be greater than zero.'})
         if (
             budget_allocation
             and budget_allocation.project_id
-            and value('project')
-            and budget_allocation.project_id != value('project').id
+            and project
+            and budget_allocation.project_id != project.id
         ):
             raise serializers.ValidationError({'budget_allocation': 'Budget allocation must belong to the selected project.'})
+
+
+        if instance and instance.financial_plans.exists():
+            protected_values = {
+                'amount': amount,
+                'task': task,
+                'project': project,
+                'transaction_type': transaction_type,
+            }
+            protected_errors = {
+                field: 'This field cannot be changed because this cost transaction is linked to a financial plan.'
+                for field, new_value in protected_values.items()
+                if field in attrs and new_value != getattr(instance, field)
+            }
+            if protected_errors:
+                raise serializers.ValidationError(protected_errors)
+
+        if transaction_type == 'COST':
+            if amount is None:
+                raise serializers.ValidationError({'amount': 'A direct amount is required for COST transactions.'})
+            if amount <= 0:
+                raise serializers.ValidationError({'amount': 'Amount must be greater than zero.'})
+            if resource_rate:
+                raise serializers.ValidationError({'resource_rate': 'Resource rate is not applicable to COST transactions.'})
+            if 'unit_rate' in attrs and unit_rate is not None:
+                raise serializers.ValidationError({'unit_rate': 'Unit rate is not used for COST transactions.'})
+            if expense_type:
+                raise serializers.ValidationError({'expense_type': 'Expense type is not applicable to COST transactions.'})
+            if expense_rate is not None:
+                raise serializers.ValidationError({'expense_rate': 'Expense rate is not applicable to COST transactions.'})
+            if assignment and task and assignment.task_id != task.id:
+                raise serializers.ValidationError({'assignment': 'Assignment must belong to the selected task.'})
+            if assignment and revision and assignment.revision_id != revision.id:
+                raise serializers.ValidationError({'assignment': 'Assignment must belong to the selected revision.'})
+            if assignment and resource and assignment.resource_id != resource.id:
+                raise serializers.ValidationError({'resource': 'Resource must match the selected assignment resource.'})
+            effective_resource = assignment.resource if assignment else resource
+            if effective_resource and effective_resource.resource_type != Resource.COST:
+                raise serializers.ValidationError({'resource': 'COST transactions must use a COST resource.'})
+            attrs['quantity'] = None
+            return attrs
+
+        if 'amount' in attrs:
+            raise serializers.ValidationError({'amount': 'Amount is calculated by the backend for rate-based transactions.'})
 
         if transaction_type == 'EXPENSE':
             if not expense_type:
@@ -1454,12 +1545,7 @@ class CostTransactionSerializer(serializers.ModelSerializer):
 
         if not assignment:
             raise serializers.ValidationError({'assignment': 'Assignment is required.'})
-        if transaction_type == 'COST':
-            if unit_rate is None:
-                raise serializers.ValidationError({'unit_rate': 'Unit rate is required for cost resources.'})
-            if unit_rate < 0:
-                raise serializers.ValidationError({'unit_rate': 'Unit rate cannot be negative.'})
-        elif not resource_rate:
+        if not resource_rate:
             raise serializers.ValidationError({'resource_rate': 'ResourceRate is required.'})
         if resource_rate and resource_rate.resource_id != assignment.resource_id:
             raise serializers.ValidationError({'resource_rate': 'ResourceRate must belong to Assignment resource.'})
@@ -1469,7 +1555,6 @@ class CostTransactionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'assignment': 'Assignment must belong to the selected revision.'})
 
         return attrs
-
 
 class PaymentTransactionSerializer(serializers.ModelSerializer):
     created_by = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -1592,14 +1677,50 @@ class TaskFinancialPlanSerializer(serializers.ModelSerializer):
     milestones = PaymentMilestoneSerializer(many=True, read_only=True)
     financial_status = serializers.SerializerMethodField()
     created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    cost_transaction_amount = serializers.SerializerMethodField()
+    cost_transaction_type = serializers.SerializerMethodField()
+    cost_transaction_date = serializers.SerializerMethodField()
+    cost_transaction_description = serializers.SerializerMethodField()
+    cost_transaction_resource_name = serializers.SerializerMethodField()
 
     class Meta:
         model = TaskFinancialPlan
         fields = [
-            'id', 'task', 'direction', 'contract_amount', 'currency', 'status',
+            'id', 'task', 'cost_transaction', 'cost_transaction_amount', 'cost_transaction_type',
+            'cost_transaction_date', 'cost_transaction_description', 'cost_transaction_resource_name',
+            'direction', 'contract_amount', 'currency', 'status',
             'description', 'created_by', 'created_at', 'updated_at', 'milestones', 'financial_status',
         ]
-        read_only_fields = ['id', 'created_by', 'created_at', 'updated_at', 'financial_status']
+        read_only_fields = [
+            'id', 'created_by', 'created_at', 'updated_at', 'financial_status',
+            'cost_transaction_amount', 'cost_transaction_type', 'cost_transaction_date',
+            'cost_transaction_description', 'cost_transaction_resource_name',
+        ]
+
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get('request') if self.context else None
+        if request and 'cost_transaction' in self.fields:
+            self.fields['cost_transaction'].queryset = CostTransaction.objects.filter(
+                project_id__in=accessible_project_ids(request.user)
+            )
+
+    def get_cost_transaction_amount(self, obj):
+        return str(obj.cost_transaction.amount) if obj.cost_transaction_id else None
+
+    def get_cost_transaction_type(self, obj):
+        return obj.cost_transaction.transaction_type if obj.cost_transaction_id else None
+
+    def get_cost_transaction_date(self, obj):
+        return obj.cost_transaction.transaction_date.isoformat() if obj.cost_transaction_id else None
+
+    def get_cost_transaction_description(self, obj):
+        return obj.cost_transaction.description if obj.cost_transaction_id else None
+
+    def get_cost_transaction_resource_name(self, obj):
+        resource = obj.effective_cost_resource()
+        return resource.name if resource else None
 
     def get_financial_status(self, obj):
         if obj.status == TaskFinancialPlan.STATUS_ACTIVE:
@@ -1617,11 +1738,56 @@ class TaskFinancialPlanSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Supported currencies are IRR, USD, and EUR.')
         return normalized
 
+    @staticmethod
+    def _as_serializer_error(error):
+        if hasattr(error, 'message_dict'):
+            return {key: list(value) for key, value in error.message_dict.items()}
+        return {'non_field_errors': list(error.messages)}
+
     def validate(self, attrs):
-        status = attrs.get('status', getattr(self.instance, 'status', TaskFinancialPlan.STATUS_DRAFT))
+        instance = self.instance
+        status = attrs.get('status', getattr(instance, 'status', TaskFinancialPlan.STATUS_DRAFT))
         if status == TaskFinancialPlan.STATUS_ACTIVE:
             raise serializers.ValidationError({'status': 'Create or update the plan as draft, add milestones, then use activate.'})
+
+        task = attrs.get('task', getattr(instance, 'task', None))
+        direction = attrs.get('direction', getattr(instance, 'direction', TaskFinancialPlan.DIRECTION_PAYABLE))
+        contract_amount = attrs.get('contract_amount', getattr(instance, 'contract_amount', None))
+        cost_transaction = attrs.get('cost_transaction', getattr(instance, 'cost_transaction', None))
+
+        protected = {'task', 'cost_transaction', 'direction', 'contract_amount'}
+        if instance and PaymentTransaction.objects.filter(milestone__financial_plan=instance).exists():
+            changed = [field for field in protected if field in attrs and attrs[field] != getattr(instance, field)]
+            if changed:
+                raise serializers.ValidationError({field: 'Financial plans with payment transactions cannot change this field.' for field in changed})
+
+        if instance and instance.status == TaskFinancialPlan.STATUS_ACTIVE:
+            changed = [field for field in protected if field in attrs and attrs[field] != getattr(instance, field)]
+            if changed:
+                raise serializers.ValidationError({field: 'Active financial plans cannot change this field.' for field in changed})
+
+        if cost_transaction:
+            conflicting_plans = TaskFinancialPlan.objects.filter(cost_transaction=cost_transaction).exclude(status=TaskFinancialPlan.STATUS_CANCELLED)
+            if instance and instance.pk:
+                conflicting_plans = conflicting_plans.exclude(pk=instance.pk)
+            if conflicting_plans.exists():
+                raise serializers.ValidationError({'cost_transaction': 'Selected cost transaction is already linked to another financial plan.'})
+
+        require_payable_cost_transaction = instance is None or bool(protected.intersection(attrs.keys()))
+        try:
+            TaskFinancialPlan.validate_cost_transaction_values(
+                task=task,
+                direction=direction,
+                contract_amount=contract_amount,
+                cost_transaction=cost_transaction,
+                instance=instance,
+                require_payable_cost_transaction=require_payable_cost_transaction,
+                check_active_conflict=False,
+            )
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(self._as_serializer_error(exc))
         return attrs
+
 class TaskDropdownSerializer(serializers.ModelSerializer):
     name = serializers.SerializerMethodField()
     code = serializers.SerializerMethodField()
@@ -1699,6 +1865,4 @@ class ResourceLevelingPlanSerializer(serializers.ModelSerializer):
 
     def get_resourceCount(self, obj):
         return obj.resource_usages.values("resource_id").distinct().count()
-
-
 

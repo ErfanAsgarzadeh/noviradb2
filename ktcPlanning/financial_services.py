@@ -4,6 +4,7 @@ from django.db import transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
+from django.core.exceptions import ValidationError as DjangoValidationError
 
 from .models import PaymentMilestone, PaymentTransaction, TaskFinancialPlan, TaskReportLog
 
@@ -131,12 +132,20 @@ def validate_plan_milestones(plan):
 
 def activate_plan(plan):
     with transaction.atomic():
-        locked_plan = TaskFinancialPlan.objects.select_for_update().get(pk=plan.pk)
+        locked_plan = TaskFinancialPlan.objects.select_for_update(of=("self",)).select_related("task", "task__project", "cost_transaction", "cost_transaction__project", "cost_transaction__task", "cost_transaction__revision", "cost_transaction__assignment", "cost_transaction__assignment__resource", "cost_transaction__assignment__revision", "cost_transaction__assignment__revision__project", "cost_transaction__resource", "cost_transaction__resource_rate", "cost_transaction__resource_rate__resource").get(pk=plan.pk)
         if TaskFinancialPlan.objects.select_for_update().filter(
             task=locked_plan.task,
             status=TaskFinancialPlan.STATUS_ACTIVE,
         ).exclude(pk=locked_plan.pk).exists():
             raise ValidationError({"task": "Only one active financial plan is allowed for each task."})
+        try:
+            locked_plan.validate_cost_transaction_link(
+                require_payable_cost_transaction=True,
+                check_active_conflict=True,
+            )
+        except DjangoValidationError as exc:
+            detail = exc.message_dict if hasattr(exc, "message_dict") else {"detail": exc.messages}
+            raise ValidationError(detail)
         validate_plan_milestones(locked_plan)
         locked_plan.status = TaskFinancialPlan.STATUS_ACTIVE
         locked_plan.save(update_fields=["status", "updated_at"])

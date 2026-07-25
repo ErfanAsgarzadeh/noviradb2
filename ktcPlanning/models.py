@@ -1582,7 +1582,9 @@ class CostTransaction(models.Model):
     quantity = models.DecimalField(
         max_digits=14,
         decimal_places=2,
-        default=1
+        default=1,
+        null=True,
+        blank=True
     )
 
     expense_rate = models.DecimalField(
@@ -1632,7 +1634,30 @@ class CostTransaction(models.Model):
         ):
             raise ValidationError("Budget allocation must belong to the selected project.")
 
-        if self.transaction_type == "EXPENSE":
+        if self.transaction_type == "COST":
+            if self.amount is None:
+                raise ValidationError({"amount": "A direct amount is required for COST transactions."})
+            if self.amount <= 0:
+                raise ValidationError({"amount": "Amount must be greater than zero."})
+            if self.resource_rate:
+                raise ValidationError({"resource_rate": "Resource rate is not applicable to COST transactions."})
+            if self.unit_rate is not None:
+                raise ValidationError({"unit_rate": "Unit rate is not used for COST transactions."})
+            if self.expense_type:
+                raise ValidationError({"expense_type": "Expense type is not applicable to COST transactions."})
+            if self.expense_rate is not None:
+                raise ValidationError({"expense_rate": "Expense rate is not applicable to COST transactions."})
+            if self.assignment_id and self.task_id and self.assignment.task_id != self.task_id:
+                raise ValidationError({"assignment": "Assignment must belong to the selected task."})
+            if self.assignment_id and self.revision_id and self.assignment.revision_id != self.revision_id:
+                raise ValidationError({"assignment": "Assignment must belong to the selected revision."})
+            if self.assignment_id and self.resource_id and self.resource_id != self.assignment.resource_id:
+                raise ValidationError({"resource": "Resource must match the selected assignment resource."})
+            effective_resource = self.assignment.resource if self.assignment_id else self.resource
+            if effective_resource and effective_resource.resource_type != Resource.COST:
+                raise ValidationError({"resource": "COST transactions must use a COST resource."})
+
+        elif self.transaction_type == "EXPENSE":
 
             if not self.expense_type:
                 raise ValidationError("ExpenseType is required.")
@@ -1654,10 +1679,7 @@ class CostTransaction(models.Model):
             if not self.assignment:
                 raise ValidationError("Assignment is required.")
 
-            if self.transaction_type == "COST" and (self.unit_rate is None or self.unit_rate < 0):
-                raise ValidationError("Unit rate is required for cost resources.")
-
-            if self.transaction_type != "COST" and not self.resource_rate:
+            if not self.resource_rate:
                 raise ValidationError("ResourceRate is required.")
 
             if self.resource_rate and self.resource_rate.resource != self.assignment.resource:
@@ -1676,6 +1698,21 @@ class CostTransaction(models.Model):
 
     def save(self, *args, **kwargs):
 
+        if self.transaction_type == "COST":
+            if self.amount is None:
+                raise ValidationError({"amount": "A direct amount is required for COST transactions."})
+            self.amount = Decimal(self.amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if self.assignment:
+                if not self.task_id:
+                    self.task = self.assignment.task
+                if not self.revision_id:
+                    self.revision = self.assignment.revision
+                if not self.resource_id:
+                    self.resource = self.assignment.resource
+            self.full_clean()
+            super().save(*args, **kwargs)
+            return
+
         if self.transaction_type == "EXPENSE":
             if self.expense_rate is None:
                 raise ValidationError("Expense rate is required.")
@@ -1692,18 +1729,14 @@ class CostTransaction(models.Model):
                 if not self.revision_id:
                     self.revision = self.assignment.revision
                 self.resource = self.assignment.resource
-            if self.transaction_type == "COST":
-                if self.unit_rate is None:
-                    raise ValidationError("Unit rate is required for cost resources.")
-                rate = self.unit_rate
-                self.resource_rate = None
-            else:
-                if not self.resource_rate:
-                    raise ValidationError("ResourceRate is required.")
-                rate = self.resource_rate.regular_rate
-                if self.unit_rate is None:
-                    self.unit_rate = rate
+            if not self.resource_rate:
+                raise ValidationError("ResourceRate is required.")
+            rate = self.resource_rate.regular_rate
+            if self.unit_rate is None:
+                self.unit_rate = rate
 
+        if self.quantity is None:
+            raise ValidationError({"quantity": "Quantity is required for rate-based transactions."})
         self.amount = (self.quantity * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         self.full_clean()
 
@@ -1760,6 +1793,13 @@ class TaskFinancialPlan(models.Model):
     ]
 
     task = models.ForeignKey(Task, on_delete=models.PROTECT, related_name="financial_plans")
+    cost_transaction = models.ForeignKey(
+        "CostTransaction",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="financial_plans",
+    )
     direction = models.CharField(max_length=16, choices=DIRECTION_CHOICES)
     contract_amount = models.DecimalField(max_digits=18, decimal_places=2)
     currency = models.CharField(max_length=8, default="IRR")
@@ -1781,6 +1821,99 @@ class TaskFinancialPlan(models.Model):
         super().clean()
         if self.contract_amount is not None and self.contract_amount <= 0:
             raise ValidationError("Contract amount must be greater than zero.")
+        self.validate_cost_transaction_link()
+
+    @staticmethod
+    def effective_resource_for_transaction(transaction):
+        if not transaction:
+            return None
+        if transaction.resource_id:
+            return transaction.resource
+        if transaction.assignment_id:
+            return transaction.assignment.resource
+        if transaction.resource_rate_id:
+            return transaction.resource_rate.resource
+        return None
+
+    def effective_cost_resource(self):
+        return self.effective_resource_for_transaction(self.cost_transaction)
+
+    @classmethod
+    def validate_cost_transaction_values(
+        cls,
+        *,
+        task,
+        direction,
+        contract_amount,
+        cost_transaction,
+        instance=None,
+        require_payable_cost_transaction=True,
+        check_active_conflict=False,
+    ):
+        errors = {}
+
+        if direction == cls.DIRECTION_RECEIVABLE:
+            if cost_transaction:
+                errors["cost_transaction"] = "Receivable financial plans cannot be linked to a cost transaction."
+            if errors:
+                raise ValidationError(errors)
+            return
+
+        if direction == cls.DIRECTION_PAYABLE and not cost_transaction:
+            if require_payable_cost_transaction:
+                errors["cost_transaction"] = "Payable financial plans require a cost transaction."
+            if errors:
+                raise ValidationError(errors)
+            return
+
+        if not cost_transaction:
+            return
+
+        if cost_transaction.transaction_type != "COST":
+            errors["cost_transaction"] = "Selected cost transaction must have transaction type COST."
+        if task and cost_transaction.task_id != task.id:
+            errors["cost_transaction"] = "Selected cost transaction must belong to the same task."
+        if task and cost_transaction.project_id != task.project_id:
+            errors["cost_transaction"] = "Selected cost transaction must belong to the same project."
+        if contract_amount is not None and cost_transaction.amount != contract_amount:
+            errors["contract_amount"] = "Contract amount must equal the selected cost transaction amount."
+        if cost_transaction.assignment_id:
+            if task and cost_transaction.assignment.task_id != task.id:
+                errors["cost_transaction"] = "Selected cost transaction assignment must belong to the same task."
+            if cost_transaction.revision_id and cost_transaction.assignment.revision_id != cost_transaction.revision_id:
+                errors["cost_transaction"] = "Selected cost transaction assignment revision must match the cost transaction revision."
+            if cost_transaction.assignment.revision.project_id != cost_transaction.project_id:
+                errors["cost_transaction"] = "Selected cost transaction assignment must belong to the same project."
+        if cost_transaction.revision_id and cost_transaction.revision.project_id != cost_transaction.project_id:
+            errors["cost_transaction"] = "Selected cost transaction revision must belong to the same project."
+
+        resource = cls.effective_resource_for_transaction(cost_transaction)
+        if resource and resource.resource_type != Resource.COST:
+            errors["cost_transaction"] = "Selected cost transaction must use a COST resource."
+
+        if check_active_conflict:
+            conflicting_plans = cls.objects.filter(
+                cost_transaction=cost_transaction,
+                status=cls.STATUS_ACTIVE,
+            )
+            if instance and instance.pk:
+                conflicting_plans = conflicting_plans.exclude(pk=instance.pk)
+            if conflicting_plans.exists():
+                errors["cost_transaction"] = "Selected cost transaction is already linked to another active financial plan."
+
+        if errors:
+            raise ValidationError(errors)
+
+    def validate_cost_transaction_link(self, require_payable_cost_transaction=True, check_active_conflict=False):
+        self.validate_cost_transaction_values(
+            task=self.task,
+            direction=self.direction,
+            contract_amount=self.contract_amount,
+            cost_transaction=self.cost_transaction,
+            instance=self,
+            require_payable_cost_transaction=require_payable_cost_transaction,
+            check_active_conflict=check_active_conflict,
+        )
 
     def __str__(self):
         return f"{self.task_id} - {self.direction} - {self.contract_amount} {self.currency}"
@@ -2076,4 +2209,3 @@ class UnfundedForecastCost(models.Model):
 
     def __str__(self):
         return f"{self.title} - {self.amount} - {self.forecast_date}"
-
