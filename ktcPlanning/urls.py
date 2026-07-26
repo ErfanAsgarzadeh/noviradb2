@@ -10,7 +10,8 @@ from .views import (
     ResourceSkillMappingViewSet, ResourceViewSet, ResourceSkillViewSet, ResourceRoleViewSet, PersonalTaskViewSet,
     VarianceReportViewSet, CalendarViewSet, ProjectViewerViewSet, SystemSettingsView, ExpenseTypeViewSet,
     UnitOfMeasureViewSet, FundingSourceViewSet, BudgetAllocationViewSet, BudgetBorrowViewSet, UnfundedForecastCostViewSet,
-    CostTransactionViewSet, TaskFinancialPlanViewSet, PaymentMilestoneViewSet, PaymentTransactionViewSet, TaskViewSet, ResourceLevelingPlanViewSet
+    CostTransactionViewSet, TaskDeliveryAttachmentViewSet, TaskDeliveryViewSet, TaskFinancialPlanViewSet, PaymentMilestoneViewSet, PaymentTransactionViewSet, TaskViewSet, ResourceLevelingPlanViewSet,
+    FinancialControlConvertView, FinancialControlExchangeRateView, FinancialControlGenerateCostSnapshotsView, FinancialControlView
 )
 
 # ایجاد یک نمونه از روتور پیش‌فرض DRF
@@ -58,6 +59,8 @@ router.register(r'budget-allocations', BudgetAllocationViewSet, basename='budget
 router.register(r'budget-borrows', BudgetBorrowViewSet, basename='budget-borrow')
 router.register(r'unfunded-forecast-costs', UnfundedForecastCostViewSet, basename='unfunded-forecast-cost')
 router.register(r'cost-transactions', CostTransactionViewSet, basename='cost-transaction')
+router.register(r'task-deliveries', TaskDeliveryViewSet, basename='task-delivery')
+router.register(r'task-delivery-attachments', TaskDeliveryAttachmentViewSet, basename='task-delivery-attachment')
 router.register(r'task-financial-plans', TaskFinancialPlanViewSet, basename='task-financial-plan')
 router.register(r'payment-milestones', PaymentMilestoneViewSet, basename='payment-milestone')
 router.register(r'payment-transactions', PaymentTransactionViewSet, basename='payment-transaction')
@@ -65,6 +68,10 @@ router.register(r'tasks', TaskViewSet, basename='task')
 router.register(r'resource-leveling-plans', ResourceLevelingPlanViewSet, basename='resource-leveling-plan')
 # مسیرهای نهایی اپلیکیشن
 urlpatterns = [
+    path('financial-control/', FinancialControlView.as_view(), name='financial-control'),
+    path('financial-control/convert/', FinancialControlConvertView.as_view(), name='financial-control-convert'),
+    path('financial-control/exchange-rates/', FinancialControlExchangeRateView.as_view(), name='financial-control-exchange-rate'),
+    path('financial-control/generate-cost-snapshots/', FinancialControlGenerateCostSnapshotsView.as_view(), name='financial-control-generate-cost-snapshots'),
     path('revisions/<int:revision_id>/resource-histogram/', ResourceHistogramView.as_view(), name='resource-histogram'),
     path('', include(router.urls)),
     path("import-msp/", ImportMSPView.as_view(), name="import-msp"),

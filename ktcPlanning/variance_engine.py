@@ -1,11 +1,12 @@
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from django.db.models import Q, Sum
 from django.utils import timezone
 from django.db import transaction
 
 from ktcPlanning.models import (
-    Project, Revision, TaskVersion, VarianceReport, Calendar, Assignment, TaskReportLog
+    Project, Revision, TaskVersion, VarianceReport, Calendar, Assignment, TaskReportLog,
+    BudgetAllocation, CostTransaction
 )
 # فرض می‌کنیم CalendarEngine در مسیر زیر قرار دارد
 from ktcPlanning.calendar import CalendarEngine
@@ -15,6 +16,30 @@ from ktcPlanning.revision_policy import (
 
 logger = logging.getLogger(__name__)
 
+MONEY_QUANT = Decimal('0.01')
+RATIO_QUANT = Decimal('0.0001')
+PERCENT_QUANT = Decimal('0.01')
+
+
+def _money(value):
+    return (value or Decimal('0.00')).quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _ratio(value):
+    if value is None:
+        return None
+    return value.quantize(RATIO_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _percent(value):
+    return (value or Decimal('0.00')).quantize(PERCENT_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _decimal_string(value):
+    if value is None:
+        return None
+    return str(value)
+
 
 class EVMEngine:
     def __init__(self, project_id, data_datetime=None):
@@ -22,7 +47,7 @@ class EVMEngine:
         self.project = Project.objects.select_related(
             'active_baseline_revision', 'current_execution_revision'
         ).get(pk=project_id, is_deleted=False)
-        self.data_datetime = data_datetime or self.project.current_data_date or timezone.now()
+        self.data_datetime = data_datetime or timezone.now()
         self.baseline_rev = get_official_revision(
             self.project, ROLE_BASELINE, required=False
         )
@@ -34,10 +59,16 @@ class EVMEngine:
         self._load_calendars()
     def _load_calendars(self):
         """لود کردن تقویم پیش‌فرض و تمامی تقویم‌های اختصاصی تسک‌ها در حافظه"""
-        default_cal = Calendar.objects.filter(
-            project_id=self.project_id,
-            is_default=True
-        ).prefetch_related("intervals", "exceptions").first()
+        default_cal = None
+        if self.project.calendar_id:
+            default_cal = Calendar.objects.filter(
+                pk=self.project.calendar_id,
+            ).prefetch_related("intervals", "exceptions").first()
+        if not default_cal:
+            default_cal = Calendar.objects.filter(
+                project_id=self.project_id,
+                is_default=True
+            ).prefetch_related("intervals", "exceptions").first()
 
         if default_cal:
             self._default_cal_engine = CalendarEngine(default_cal)
@@ -57,6 +88,15 @@ class EVMEngine:
         if calendar_id and calendar_id in self._cal_engines:
             return self._cal_engines[calendar_id]
         return self._default_cal_engine
+
+    def _working_hours_between(self, cal_engine, start, finish):
+        if finish <= start:
+            return 0.0
+        local_start = timezone.localtime(start) if timezone.is_aware(start) else start
+        local_finish = timezone.localtime(finish) if timezone.is_aware(finish) else finish
+        if cal_engine:
+            return cal_engine.working_hours_between(local_start, local_finish)
+        return (local_finish - local_start).total_seconds() / 3600.0
 
     def _calculate_task_pv(self, baseline_tv):
         """
@@ -82,13 +122,10 @@ class EVMEngine:
 
         if cal_engine:
             # محاسبه ساعت کاری بین شروع برنامه‌ریزی شده و لحظه الان
-            passed_hours = cal_engine.working_hours_between(
-                baseline_tv.planned_start,
-                self.data_datetime
-            )
+            passed_hours = self._working_hours_between(cal_engine, baseline_tv.planned_start, self.data_datetime)
         else:
             # فال‌بک سیستم در صورت نبود هیچ تقویمی (اختلاف زمانی خام)
-            passed_hours = (self.data_datetime - baseline_tv.planned_start).total_seconds() / 3600.0
+            passed_hours = self._working_hours_between(None, baseline_tv.planned_start, self.data_datetime)
 
         # تبدیل به دسیمال و اطمینان از اینکه PV از BAC تجاوز نکند
         pv = Decimal(passed_hours)
@@ -139,11 +176,179 @@ class EVMEngine:
             return Decimal('0.00')
 
         cal_engine = self._get_engine(task_version.calendar_id)
-        if cal_engine:
-            hours = cal_engine.working_hours_between(actual.actual_start, actual_end)
-        else:
-            hours = (actual_end - actual.actual_start).total_seconds() / 3600.0
+        hours = self._working_hours_between(cal_engine, actual.actual_start, actual_end)
         return Decimal(str(hours))
+
+    def _planned_progress_for_cost(self, task_version):
+        warnings = []
+        if not task_version or not task_version.planned_start or not task_version.planned_finish:
+            return Decimal('0.00'), False, ["Missing planned start or finish date."]
+
+        planned_start = task_version.planned_start
+        planned_finish = task_version.planned_finish
+        if self.data_datetime >= planned_finish:
+            return Decimal('1.00'), True, warnings
+        if self.data_datetime <= planned_start:
+            return Decimal('0.00'), True, warnings
+
+        total_hours = None
+        elapsed_hours = None
+        cal_engine = self._get_engine(task_version.calendar_id)
+        if cal_engine:
+            total_hours = Decimal(str(self._working_hours_between(cal_engine, planned_start, planned_finish)))
+            elapsed_hours = Decimal(str(self._working_hours_between(cal_engine, planned_start, self.data_datetime)))
+
+        if not total_hours or total_hours <= Decimal('0.00'):
+            total_seconds = Decimal(str(self._working_hours_between(None, planned_start, planned_finish)))
+            elapsed_seconds = Decimal(str(self._working_hours_between(None, planned_start, self.data_datetime)))
+            if total_seconds <= Decimal('0.00'):
+                warnings.append("Schedule duration is zero or negative.")
+                return Decimal('1.00'), True, warnings
+            total_hours = total_seconds
+            elapsed_hours = elapsed_seconds
+
+        planned_progress = elapsed_hours / total_hours
+        planned_progress = max(Decimal('0.00'), min(planned_progress, Decimal('1.00')))
+        return planned_progress, True, warnings
+
+    def _cost_metrics(self, bac, pv, ev, ac):
+        sv = ev - pv
+        cv = ev - ac
+        cpi = ev / ac if ac > Decimal('0.00') else None
+        spi = ev / pv if pv > Decimal('0.00') else None
+        eac = bac / cpi if cpi and cpi > Decimal('0.00') else None
+        etc = eac - ac if eac is not None else None
+        vac = bac - eac if eac is not None else None
+        tcpi_denominator = bac - ac
+        tcpi_bac = (bac - ev) / tcpi_denominator if tcpi_denominator > Decimal('0.00') else None
+        action_required = bool(
+            cv < Decimal('0.00')
+            or sv < Decimal('0.00')
+            or (cpi is not None and cpi < Decimal('1.00'))
+            or (spi is not None and spi < Decimal('1.00'))
+        )
+        return {
+            'schedule_variance': _money(sv),
+            'cost_variance': _money(cv),
+            'cpi': _ratio(cpi),
+            'spi': _ratio(spi),
+            'estimate_at_completion': _money(eac) if eac is not None else None,
+            'estimate_to_complete': _money(etc) if etc is not None else None,
+            'variance_at_completion': _money(vac) if vac is not None else None,
+            'tcpi_bac': _ratio(tcpi_bac),
+            'action_required': action_required,
+        }
+
+    def run_cost_task_variances(self, revision_id=None, currency=None, task_ids=None):
+        scope_revision = self.current_rev
+        if revision_id:
+            scope_revision = Revision.objects.get(pk=revision_id, project_id=self.project_id)
+
+        active_tvs = list(TaskVersion.objects.filter(
+            revision=scope_revision,
+            is_deleted=False,
+        ).select_related('task', 'wbs_node'))
+        if task_ids is not None:
+            task_id_set = {str(item) for item in task_ids}
+            active_tvs = [tv for tv in active_tvs if str(tv.task_id) in task_id_set]
+        active_task_ids = [tv.task_id for tv in active_tvs]
+
+        baseline_tvs = {}
+        if self.baseline_rev:
+            baseline_tvs = {
+                tv.task_id: tv for tv in TaskVersion.objects.filter(
+                    revision=self.baseline_rev,
+                    is_deleted=False,
+                ).select_related('wbs_node')
+            }
+
+        approved_budgets = BudgetAllocation.objects.filter(
+            project_id=self.project_id,
+            scope_type='TASK',
+            task_id__in=active_task_ids,
+            status='APPROVED',
+            funding_source__status='APPROVED',
+            is_borrow_sink=False,
+        ).exclude(cost_type='RESERVE')
+        if currency:
+            approved_budgets = approved_budgets.filter(funding_source__currency=str(currency).upper())
+        approved_budgets = approved_budgets.values('task_id').annotate(total_bac=Sum('allocated_amount'))
+        bac_by_task = {
+            item['task_id']: item['total_bac'] or Decimal('0.00')
+            for item in approved_budgets
+        }
+
+        actual_costs = CostTransaction.objects.filter(
+            project_id=self.project_id,
+            task_id__in=active_task_ids,
+            transaction_date__lte=self.data_datetime.date(),
+            transaction_type__in=['LABOR', 'MATERIAL', 'EQUIPMENT', 'EXPENSE', 'SUBCONTRACT', 'COST'],
+        )
+        if currency:
+            actual_costs = actual_costs.filter(currency=str(currency).upper())
+        actual_costs = actual_costs.values('task_id').annotate(total_ac=Sum('amount'))
+        ac_by_task = {
+            item['task_id']: item['total_ac'] or Decimal('0.00')
+            for item in actual_costs
+        }
+
+        progress_by_task = self._progress_as_of(active_task_ids)
+        rows = []
+        for task_version in active_tvs:
+            warnings = []
+            task = task_version.task
+            bac = _money(bac_by_task.get(task.id, Decimal('0.00')))
+            schedule_task_version = baseline_tvs.get(task.id)
+            if not schedule_task_version:
+                schedule_task_version = task_version
+                warnings.append("Baseline task version not found; current task schedule was used for planned progress.")
+
+            planned_progress, has_schedule, schedule_warnings = self._planned_progress_for_cost(schedule_task_version)
+            warnings.extend(schedule_warnings)
+            approved_progress = max(Decimal('0.00'), min(progress_by_task.get(task.id, Decimal('0.00')), Decimal('1.00')))
+            pv = _money(bac * planned_progress)
+            ev = _money(bac * approved_progress)
+            ac = _money(ac_by_task.get(task.id, Decimal('0.00')))
+            metrics = self._cost_metrics(bac, pv, ev, ac)
+
+            if task.id not in progress_by_task:
+                warnings.append("No approved physical progress report as of status date.")
+            if bac == Decimal('0.00'):
+                warnings.append("No approved task-level budget allocation.")
+
+            rows.append({
+                'id': f'cost-{task.id}',
+                'task': task.id,
+                'revision': scope_revision.id,
+                'report_date': self.data_datetime.date().isoformat(),
+                'budget_at_completion': _decimal_string(bac),
+                'planned_value': _decimal_string(pv),
+                'earned_value': _decimal_string(ev),
+                'actual_cost': _decimal_string(ac),
+                'spi': _decimal_string(metrics['spi']),
+                'cpi': _decimal_string(metrics['cpi']),
+                'schedule_variance': _decimal_string(metrics['schedule_variance']),
+                'cost_variance': _decimal_string(metrics['cost_variance']),
+                'estimate_at_completion': _decimal_string(metrics['estimate_at_completion']),
+                'estimate_to_complete': _decimal_string(metrics['estimate_to_complete']),
+                'variance_at_completion': _decimal_string(metrics['variance_at_completion']),
+                'tcpi_bac': _decimal_string(metrics['tcpi_bac']),
+                'action_required': metrics['action_required'],
+                'task_name': task_version.title,
+                'task_code': task_version.wbs_node.wbs_code if task_version.wbs_node_id else 'N/A',
+                'wbs_node_id': task_version.wbs_node_id,
+                'dimension': 'cost',
+                'status_date': self.data_datetime.date().isoformat(),
+                'approved_progress_percent': _decimal_string(_percent(approved_progress * Decimal('100'))),
+                'planned_progress_percent': _decimal_string(_percent(planned_progress * Decimal('100'))),
+                'budget_source': 'approved_task_budget_allocations',
+                'actual_cost_source': 'cost_transactions',
+                'has_approved_budget': bac > Decimal('0.00'),
+                'has_schedule': has_schedule,
+                'has_actual_cost': ac > Decimal('0.00'),
+                'warnings': warnings,
+            })
+        return rows
     def collect_evm_data_dates(self):
         """
         Build the daily timeline that should be recalculated for EVM charts:
@@ -207,6 +412,7 @@ class EVMEngine:
         VarianceReport.objects.filter(
             task__project_id=self.project_id,
             revision=self.current_rev,
+            dimension=VarianceReport.DIMENSION_EFFORT,
         ).exclude(report_date__in=target_report_dates).delete()
 
         total_snapshots = 0
@@ -268,7 +474,8 @@ class EVMEngine:
             snap.task_id: snap for snap in VarianceReport.objects.filter(
                 task__project_id=self.project_id,  # آپدیت شده بر اساس معماری جدید
                 report_date=self.data_datetime.date(),
-                revision=self.current_rev
+                revision=self.current_rev,
+                dimension=VarianceReport.DIMENSION_EFFORT,
             )
         }
 
@@ -292,8 +499,11 @@ class EVMEngine:
             # --- 3. Earned Value (EV) ---
             actual_progress = progress_dict.get(task.id, Decimal('0.00'))
             if actual_progress == Decimal('0.00') and hasattr(current_tv, 'actual') and current_tv.actual:
+                actual_start = current_tv.actual.actual_start
                 actual_finish = current_tv.actual.actual_finish
-                if actual_finish and actual_finish <= self.data_datetime:
+                if actual_start and actual_start <= self.data_datetime:
+                    actual_progress = Decimal(current_tv.actual.progress or 0) / Decimal('100.0')
+                elif actual_finish and actual_finish <= self.data_datetime:
                     actual_progress = Decimal(current_tv.actual.progress or 0) / Decimal('100.0')
 
             ev = bac * min(actual_progress, Decimal('1.00'))
@@ -341,6 +551,7 @@ class EVMEngine:
                         task=task,
                         revision=self.current_rev,
                         report_date=self.data_datetime.date(),
+                        dimension=VarianceReport.DIMENSION_EFFORT,
                         **snapshot_data
                     )
                 )

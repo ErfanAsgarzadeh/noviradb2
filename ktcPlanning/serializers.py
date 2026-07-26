@@ -1,20 +1,67 @@
 # ktcPlanning/serializers.py
 from rest_framework import serializers
 from django.db.models import Sum
+from django.utils import timezone
+from django.utils.text import get_valid_filename
 from decimal import Decimal
+import os
 
 from .models import *
+from .calendar import CalendarEngine
 from .financial_services import (
+    cost_transaction_allocated_amount,
+    cost_transaction_unallocated_amount,
+    evaluate_milestone_eligibility,
+    get_task_delivery_attachment_capabilities,
+    get_task_delivery_capabilities,
     get_task_financial_status,
     milestone_amount,
+    milestone_cost_allocated_amount,
+    milestone_cost_remaining_capacity,
     milestone_cost_outstanding,
     milestone_incurred_amount,
     milestone_paid_amount,
     milestone_outstanding,
+    recognized_cost_summary,
 )
 from .permissions import accessible_project_ids
+from .validators import MAX_UPLOAD_SIZE_BYTES, validate_chat_file
 
 SUPPORTED_TASK_FINANCIAL_CURRENCIES = {"IRR", "USD", "EUR"}
+TASK_DELIVERY_ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "png", "jpg", "jpeg"}
+TASK_DELIVERY_ALLOWED_CONTENT_TYPES = {
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "image/png",
+    "image/jpeg",
+}
+
+
+def _calendar_for_task_version(task_version):
+    project = getattr(task_version.revision, 'project', None)
+    return (
+        task_version.calendar
+        or getattr(project, 'calendar', None)
+        or Calendar.objects.filter(project=project, is_default=True).first()
+        or Calendar.objects.filter(project=project).first()
+    )
+
+
+def actual_working_hours_for_task_version(task_version, actual=None) -> float:
+    actual = actual or getattr(task_version, 'actual', None)
+    if not actual or not actual.actual_start or not actual.actual_finish:
+        return 0.0
+
+    calendar = _calendar_for_task_version(task_version)
+    start = timezone.localtime(actual.actual_start) if timezone.is_aware(actual.actual_start) else actual.actual_start
+    finish = timezone.localtime(actual.actual_finish) if timezone.is_aware(actual.actual_finish) else actual.actual_finish
+    if calendar:
+        return round(CalendarEngine(calendar).working_hours_between(start, finish), 4)
+
+    return round((finish - start).total_seconds() / 3600, 4)
 
 
 # =========================================================
@@ -377,6 +424,7 @@ class ActivityNodeSerializer(serializers.ModelSerializer):
             'actualStart': actual.actual_start.strftime("%Y-%m-%dT%H:%M") if (actual and actual.actual_start) else '',
             'actualFinish': actual.actual_finish.strftime("%Y-%m-%dT%H:%M") if (actual and actual.actual_finish) else '',
             'progress': float(actual.progress) if actual else 0,
+            'actualWorkHours': actual_working_hours_for_task_version(instance, actual),
         }
 
         data['duration'] = float(instance.duration_hours) if instance.duration_hours else 0
@@ -875,6 +923,18 @@ class VarianceReportSerializer(serializers.ModelSerializer):
         model = VarianceReport
         fields = '__all__'
 
+    def validate(self, attrs):
+        instance = self.instance
+        dimension = attrs.get('dimension', getattr(instance, 'dimension', VarianceReport.DIMENSION_EFFORT))
+        currency = attrs.get('currency', getattr(instance, 'currency', None))
+        if dimension == VarianceReport.DIMENSION_COST and not currency:
+            raise serializers.ValidationError({'currency': 'Currency is required for cost variance reports.'})
+        if dimension == VarianceReport.DIMENSION_EFFORT and currency:
+            raise serializers.ValidationError({'currency': 'Currency is only applicable to cost variance reports.'})
+        if currency:
+            attrs['currency'] = str(currency).upper()
+        return attrs
+
     def get_task_name(self, obj):
         # ظ¾غŒط¯ط§ ع©ط±ط¯ظ† ط¹ظ†ظˆط§ظ† طھط³ع© ط¯ط± ظ‡ظ…ط§ظ† ط±غŒظˆغŒعکظ†غŒ ع©ظ‡ ع¯ط²ط§ط±ط´ ط¨ط±ط§غŒ ط¢ظ† ط«ط¨طھ ط´ط¯ظ‡
         tv = obj.task.versions.filter(revision=obj.revision).first()
@@ -1371,6 +1431,27 @@ class UnfundedForecastCostSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class CostTransactionMilestoneAllocationSerializer(serializers.ModelSerializer):
+    milestone_id = serializers.IntegerField(source='milestone.id', read_only=True)
+    milestone_sequence = serializers.IntegerField(source='milestone.sequence', read_only=True)
+    milestone_title = serializers.CharField(source='milestone.title', read_only=True)
+    milestone_capacity = serializers.SerializerMethodField()
+    milestone_total_allocated = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CostTransactionMilestoneAllocation
+        fields = [
+            'id', 'milestone_id', 'milestone_sequence', 'milestone_title',
+            'allocated_amount', 'milestone_capacity', 'milestone_total_allocated',
+        ]
+
+    def get_milestone_capacity(self, obj):
+        return str(milestone_amount(obj.milestone))
+
+    def get_milestone_total_allocated(self, obj):
+        return str(milestone_cost_allocated_amount(obj.milestone))
+
+
 class CostTransactionSerializer(serializers.ModelSerializer):
     # ظپغŒظ„ط¯ظ‡ط§غŒ read-only ع©ظ‡ ط¨ع©ظ†ط¯ ظ…ط­ط§ط³ط¨ظ‡ ظ…غŒâ€Œع©ظ†ط¯
     amount = serializers.DecimalField(max_digits=16, decimal_places=2, required=False)
@@ -1387,6 +1468,9 @@ class CostTransactionSerializer(serializers.ModelSerializer):
     effective_resource_type = serializers.SerializerMethodField()
     has_financial_plan = serializers.SerializerMethodField()
     financial_plan_title = serializers.SerializerMethodField()
+    allocated_amount = serializers.SerializerMethodField()
+    unallocated_amount = serializers.SerializerMethodField()
+    milestone_allocations = CostTransactionMilestoneAllocationSerializer(many=True, read_only=True)
 
     class Meta:
         model = CostTransaction
@@ -1403,6 +1487,7 @@ class CostTransactionSerializer(serializers.ModelSerializer):
             'financial_plan',
             'transaction_type',
             'transaction_date',
+            'currency',
             'quantity',
             'unit_rate',       # ط¨ط±ط§غŒ non-EXPENSE
             'expense_rate',    # ط¨ط±ط§غŒ EXPENSE
@@ -1420,8 +1505,11 @@ class CostTransactionSerializer(serializers.ModelSerializer):
             'effective_resource_type',
             'has_financial_plan',
             'financial_plan_title',
+            'allocated_amount',
+            'unallocated_amount',
+            'milestone_allocations',
         ]
-        read_only_fields = ['created_by', 'created_at', 'budget_consumptions', 'effective_resource_id', 'effective_resource_name', 'effective_resource_type', 'has_financial_plan', 'financial_plan_title']
+        read_only_fields = ['created_by', 'created_at', 'budget_consumptions', 'effective_resource_id', 'effective_resource_name', 'effective_resource_type', 'has_financial_plan', 'financial_plan_title', 'allocated_amount', 'unallocated_amount', 'milestone_allocations']
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1470,6 +1558,12 @@ class CostTransactionSerializer(serializers.ModelSerializer):
             return None
         return f"{obj.financial_plan.task_id} - {obj.financial_plan.direction} - {obj.financial_plan.contract_amount} {obj.financial_plan.currency}"
 
+    def get_allocated_amount(self, obj):
+        return str(cost_transaction_allocated_amount(obj))
+
+    def get_unallocated_amount(self, obj):
+        return str(cost_transaction_unallocated_amount(obj))
+
     def validate(self, attrs):
         instance = self.instance
 
@@ -1492,6 +1586,19 @@ class CostTransactionSerializer(serializers.ModelSerializer):
         unit_rate = value('unit_rate')
         amount = value('amount')
         financial_plan = value('financial_plan')
+        if attrs.get('currency'):
+            attrs['currency'] = str(attrs['currency']).upper()
+
+        if instance and instance.milestone_allocations.exists():
+            if 'financial_plan' in attrs and attrs['financial_plan'] != instance.financial_plan:
+                raise serializers.ValidationError({'financial_plan': 'Cost transactions with milestone allocations cannot change financial plan.'})
+            if 'amount' in attrs and attrs['amount'] < cost_transaction_allocated_amount(instance):
+                raise serializers.ValidationError({'amount': 'Amount cannot be less than existing milestone allocations.'})
+        if instance and (instance.financial_plan_id or instance.milestone_allocations.exists()):
+            if 'task' in attrs and attrs['task'] != instance.task:
+                raise serializers.ValidationError({'task': 'Cost transactions linked to a financial plan cannot change task.'})
+            if 'project' in attrs and attrs['project'] != instance.project:
+                raise serializers.ValidationError({'project': 'Cost transactions linked to a financial plan cannot change project.'})
 
         if (
             instance
@@ -1585,13 +1692,15 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
     task_title = serializers.CharField(source='milestone.financial_plan.task.title', read_only=True)
     milestone_title = serializers.CharField(source='milestone.title', read_only=True)
     milestone_sequence = serializers.IntegerField(source='milestone.sequence', read_only=True)
-    currency = serializers.CharField(source='milestone.financial_plan.currency', read_only=True)
+    plan_currency = serializers.CharField(source='milestone.financial_plan.currency', read_only=True)
+    effective_currency = serializers.SerializerMethodField()
 
     class Meta:
         model = PaymentTransaction
         fields = [
             'id', 'milestone', 'financial_plan', 'project', 'task', 'task_title',
-            'milestone_title', 'milestone_sequence', 'currency', 'transaction_type',
+            'milestone_title', 'milestone_sequence', 'currency', 'plan_currency',
+            'effective_currency', 'transaction_type',
             'amount', 'transaction_date', 'reference_number', 'description',
             'created_by', 'created_at',
         ]
@@ -1605,11 +1714,17 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'amount': 'Payment and refund amounts must be greater than zero.'})
         if transaction_type == PaymentTransaction.TYPE_ADJUSTMENT and amount == 0:
             raise serializers.ValidationError({'amount': 'Adjustment amount cannot be zero.'})
+        if attrs.get('currency'):
+            attrs['currency'] = str(attrs['currency']).upper()
         return attrs
+
+    def get_effective_currency(self, obj):
+        return obj.currency or obj.milestone.financial_plan.currency
 
 
 class PlanPaymentAllocationSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=18, decimal_places=2)
+    currency = serializers.CharField(max_length=8, required=False, allow_blank=True)
     transaction_date = serializers.DateField()
     reference_number = serializers.CharField(max_length=100, required=False, allow_blank=True)
     description = serializers.CharField(required=False, allow_blank=True)
@@ -1619,12 +1734,21 @@ class PlanPaymentAllocationSerializer(serializers.Serializer):
             raise serializers.ValidationError('Payment amount must be greater than zero.')
         return value
 
+    def validate_currency(self, value):
+        return str(value).upper() if value else value
+
 class PaymentMilestoneSerializer(serializers.ModelSerializer):
     calculated_amount = serializers.SerializerMethodField()
     paid_amount = serializers.SerializerMethodField()
     outstanding = serializers.SerializerMethodField()
     incurred_amount = serializers.SerializerMethodField()
     cost_outstanding = serializers.SerializerMethodField()
+    cost_allocated_amount = serializers.SerializerMethodField()
+    cost_remaining_capacity = serializers.SerializerMethodField()
+    cost_allocation_status = serializers.SerializerMethodField()
+    eligible_for_cost_allocation = serializers.SerializerMethodField()
+    eligibility_reason = serializers.SerializerMethodField()
+    eligibility_detail = serializers.SerializerMethodField()
     transactions = PaymentTransactionSerializer(many=True, read_only=True)
 
     class Meta:
@@ -1633,11 +1757,14 @@ class PaymentMilestoneSerializer(serializers.ModelSerializer):
             'id', 'financial_plan', 'title', 'sequence', 'trigger_type', 'amount_type',
             'percentage', 'fixed_amount', 'progress_threshold', 'due_date',
             'blocks_task_start', 'blocks_task_delivery', 'blocks_progress_after_threshold',
+            'manual_approved', 'manual_approved_at', 'manual_approved_by',
             'status', 'description', 'calculated_amount', 'paid_amount', 'outstanding',
             'incurred_amount', 'cost_outstanding',
+            'cost_allocated_amount', 'cost_remaining_capacity', 'cost_allocation_status',
+            'eligible_for_cost_allocation', 'eligibility_reason', 'eligibility_detail',
             'transactions', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['status', 'calculated_amount', 'paid_amount', 'outstanding', 'incurred_amount', 'cost_outstanding', 'transactions', 'created_at', 'updated_at']
+        read_only_fields = ['status', 'manual_approved', 'manual_approved_at', 'manual_approved_by', 'calculated_amount', 'paid_amount', 'outstanding', 'incurred_amount', 'cost_outstanding', 'cost_allocated_amount', 'cost_remaining_capacity', 'cost_allocation_status', 'eligible_for_cost_allocation', 'eligibility_reason', 'eligibility_detail', 'transactions', 'created_at', 'updated_at']
 
     def get_calculated_amount(self, obj):
         return str(milestone_amount(obj))
@@ -1653,6 +1780,35 @@ class PaymentMilestoneSerializer(serializers.ModelSerializer):
 
     def get_cost_outstanding(self, obj):
         return str(milestone_cost_outstanding(obj))
+
+    def get_cost_allocated_amount(self, obj):
+        return str(milestone_cost_allocated_amount(obj))
+
+    def get_cost_remaining_capacity(self, obj):
+        return str(milestone_cost_remaining_capacity(obj))
+
+    def get_cost_allocation_status(self, obj):
+        remaining = milestone_cost_remaining_capacity(obj)
+        allocated = milestone_cost_allocated_amount(obj)
+        if remaining <= 0:
+            return 'full'
+        if allocated > 0:
+            return 'partial'
+        return 'empty'
+
+    def get_eligible_for_cost_allocation(self, obj):
+        return evaluate_milestone_eligibility(obj)['eligible']
+
+    def get_eligibility_reason(self, obj):
+        return evaluate_milestone_eligibility(obj)['reason']
+
+    def get_eligibility_detail(self, obj):
+        return evaluate_milestone_eligibility(obj)
+
+    def _candidate_capacity(self, financial_plan, amount_type, percentage, fixed_amount):
+        if amount_type == PaymentMilestone.AMOUNT_FIXED:
+            return fixed_amount or Decimal('0.00')
+        return Decimal(financial_plan.contract_amount) * Decimal(percentage or 0) / Decimal('100')
 
     def validate(self, attrs):
         instance = self.instance
@@ -1672,6 +1828,18 @@ class PaymentMilestoneSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({'sequence': 'This sequence is already used in this financial plan. Use the next available number.'})
         if instance and instance.transactions.exists() and {'amount_type', 'percentage', 'fixed_amount', 'financial_plan'}.intersection(attrs.keys()):
             raise serializers.ValidationError({'milestone': 'Milestone with transactions cannot change financial amount fields.'})
+        if instance and instance.cost_allocations.exists():
+            if 'sequence' in attrs and attrs['sequence'] != instance.sequence:
+                raise serializers.ValidationError({'sequence': 'Milestones with cost allocations cannot change sequence.'})
+            if 'financial_plan' in attrs and attrs['financial_plan'] != instance.financial_plan:
+                raise serializers.ValidationError({'financial_plan': 'Milestones with cost allocations cannot change financial plan.'})
+            trigger_fields = {'trigger_type', 'progress_threshold', 'due_date', 'blocks_task_start', 'blocks_task_delivery', 'blocks_progress_after_threshold'}
+            changed_trigger_fields = [
+                field for field in trigger_fields
+                if field in attrs and attrs[field] != getattr(instance, field)
+            ]
+            if changed_trigger_fields:
+                raise serializers.ValidationError({field: 'Milestones with cost allocations cannot change trigger fields.' for field in changed_trigger_fields})
         if amount_type == PaymentMilestone.AMOUNT_PERCENTAGE:
             if percentage is None:
                 raise serializers.ValidationError({'percentage': 'Percentage is required.'})
@@ -1699,6 +1867,232 @@ class PaymentMilestoneSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({'progress_threshold': 'Progress threshold must be between 0 and 100.'})
         if trigger_type == PaymentMilestone.TRIGGER_FIXED_DATE and due_date is None:
             raise serializers.ValidationError({'due_date': 'Due date is required.'})
+        if instance and instance.cost_allocations.exists() and {'amount_type', 'percentage', 'fixed_amount'}.intersection(attrs.keys()):
+            allocated = milestone_cost_allocated_amount(instance)
+            new_capacity = self._candidate_capacity(financial_plan, amount_type, percentage, fixed_amount)
+            if new_capacity < allocated:
+                raise serializers.ValidationError({'allocated_amount': 'Milestone capacity cannot be reduced below existing cost allocations.'})
+        return attrs
+
+
+class TaskDeliveryAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_name = serializers.SerializerMethodField()
+    download_url = serializers.SerializerMethodField()
+    capabilities = serializers.SerializerMethodField()
+    file = serializers.FileField(write_only=True, required=True)
+
+    class Meta:
+        model = TaskDeliveryAttachment
+        fields = [
+            'id', 'delivery', 'file', 'original_filename', 'content_type', 'size_bytes',
+            'description', 'uploaded_by', 'uploaded_by_name', 'created_at', 'download_url',
+            'capabilities',
+        ]
+        read_only_fields = [
+            'id', 'delivery', 'original_filename', 'content_type', 'size_bytes',
+            'uploaded_by', 'uploaded_by_name', 'created_at', 'download_url', 'capabilities',
+        ]
+
+    @staticmethod
+    def _safe_filename(filename):
+        name = os.path.basename(filename or '').strip()
+        return get_valid_filename(name)[:255] or 'evidence'
+
+    @staticmethod
+    def _user_name(user):
+        if not user:
+            return None
+        return getattr(user, 'username', None) or str(user)
+
+    def get_uploaded_by_name(self, obj):
+        return self._user_name(obj.uploaded_by)
+
+    def get_download_url(self, obj):
+        return f"/api/planning/task-delivery-attachments/{obj.id}/download/"
+
+    def get_capabilities(self, obj):
+        request = self.context.get('request')
+        user = request.user if request else None
+        return {
+            "can_delete": get_task_delivery_attachment_capabilities(obj.delivery, user)["can_delete"],
+        }
+
+    def validate_file(self, file):
+        if not file:
+            raise serializers.ValidationError("File is required.")
+        try:
+            validate_chat_file(file)
+        except Exception as exc:
+            messages = getattr(exc, 'messages', None) or [str(exc)]
+            raise serializers.ValidationError(messages)
+        if getattr(file, 'size', 0) > MAX_UPLOAD_SIZE_BYTES:
+            raise serializers.ValidationError("File is too large.")
+        name = self._safe_filename(getattr(file, 'name', ''))
+        ext = os.path.splitext(name)[1].lstrip('.').lower()
+        if ext not in TASK_DELIVERY_ALLOWED_EXTENSIONS:
+            raise serializers.ValidationError("File type is not allowed for delivery evidence.")
+        content_type = (getattr(file, 'content_type', '') or '').lower()
+        if content_type and content_type not in TASK_DELIVERY_ALLOWED_CONTENT_TYPES:
+            raise serializers.ValidationError("Content type is not allowed for delivery evidence.")
+        if ext in {'jpg', 'jpeg'} and content_type and content_type != 'image/jpeg':
+            raise serializers.ValidationError("File extension and content type do not match.")
+        expected_by_ext = {
+            'png': {'image/png'},
+            'pdf': {'application/pdf'},
+            'doc': {'application/msword', 'application/octet-stream'},
+            'docx': {'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/octet-stream'},
+            'xls': {'application/vnd.ms-excel', 'application/octet-stream'},
+            'xlsx': {'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/octet-stream'},
+        }
+        if content_type and ext in expected_by_ext and content_type not in expected_by_ext[ext]:
+            raise serializers.ValidationError("File extension and content type do not match.")
+        return file
+
+    def create(self, validated_data):
+        file = validated_data['file']
+        request = self.context.get('request')
+        return TaskDeliveryAttachment.objects.create(
+            delivery=self.context['delivery'],
+            file=file,
+            original_filename=self._safe_filename(getattr(file, 'name', '')),
+            content_type=getattr(file, 'content_type', '') or '',
+            size_bytes=getattr(file, 'size', 0) or 0,
+            description=validated_data.get('description', ''),
+            uploaded_by=request.user if request else None,
+        )
+
+
+class TaskDeliverySerializer(serializers.ModelSerializer):
+    project_name = serializers.CharField(source='project.name', read_only=True)
+    task_title = serializers.SerializerMethodField()
+    task_code = serializers.SerializerMethodField()
+    submitted_by_name = serializers.SerializerMethodField()
+    approved_by_name = serializers.SerializerMethodField()
+    rejected_by_name = serializers.SerializerMethodField()
+    cancelled_by_name = serializers.SerializerMethodField()
+    capabilities = serializers.SerializerMethodField()
+    attachment_capabilities = serializers.SerializerMethodField()
+    attachment_count = serializers.SerializerMethodField()
+    has_attachments = serializers.SerializerMethodField()
+    attachments = serializers.SerializerMethodField()
+    created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = TaskDelivery
+        fields = [
+            'id', 'project', 'task', 'status', 'delivery_reference', 'description',
+            'project_name', 'task_title', 'task_code',
+            'created_by', 'submitted_at', 'submitted_by', 'submitted_by_name',
+            'approved_at', 'approved_by', 'approved_by_name',
+            'rejected_at', 'rejected_by', 'rejected_by_name', 'rejection_reason',
+            'cancelled_at', 'cancelled_by', 'cancelled_by_name',
+            'created_at', 'updated_at', 'capabilities',
+            'attachment_capabilities', 'attachment_count', 'has_attachments', 'attachments',
+        ]
+        read_only_fields = [
+            'id', 'status', 'created_by',
+            'project_name', 'task_title', 'task_code',
+            'submitted_at', 'submitted_by', 'submitted_by_name',
+            'approved_at', 'approved_by', 'approved_by_name',
+            'rejected_at', 'rejected_by', 'rejected_by_name', 'rejection_reason',
+            'cancelled_at', 'cancelled_by', 'cancelled_by_name',
+            'created_at', 'updated_at', 'capabilities',
+            'attachment_capabilities', 'attachment_count', 'has_attachments', 'attachments',
+        ]
+        extra_kwargs = {'project': {'required': False}}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get('request')
+        if request:
+            project_ids = accessible_project_ids(request.user)
+            self.fields['project'].queryset = Project.objects.filter(id__in=project_ids)
+            self.fields['task'].queryset = Task.objects.filter(project_id__in=project_ids)
+
+    @staticmethod
+    def _user_name(user):
+        if not user:
+            return None
+        return getattr(user, 'username', None) or str(user)
+
+    @staticmethod
+    def _task_version(obj):
+        task = obj.task
+        project = obj.project
+        revision_ids = [
+            project.current_execution_revision_id,
+            project.working_revision_id,
+            project.current_forecast_revision_id,
+            project.active_baseline_revision_id,
+        ]
+        for revision_id in revision_ids:
+            if revision_id:
+                version = task.versions.filter(revision_id=revision_id, is_deleted=False).select_related('wbs_node').first()
+                if version:
+                    return version
+        return task.versions.filter(is_deleted=False).select_related('wbs_node').order_by('-revision_id').first()
+
+    def get_task_title(self, obj):
+        version = self._task_version(obj)
+        return version.title if version else str(obj.task_id)
+
+    def get_task_code(self, obj):
+        version = self._task_version(obj)
+        if version and version.wbs_node:
+            return version.wbs_node.wbs_code
+        return ""
+
+    def get_submitted_by_name(self, obj):
+        return self._user_name(obj.submitted_by)
+
+    def get_approved_by_name(self, obj):
+        return self._user_name(obj.approved_by)
+
+    def get_rejected_by_name(self, obj):
+        return self._user_name(obj.rejected_by)
+
+    def get_cancelled_by_name(self, obj):
+        return self._user_name(obj.cancelled_by)
+
+    def get_capabilities(self, obj):
+        request = self.context.get('request')
+        user = request.user if request else None
+        return get_task_delivery_capabilities(obj, user)
+
+    def get_attachment_capabilities(self, obj):
+        request = self.context.get('request')
+        user = request.user if request else None
+        return get_task_delivery_attachment_capabilities(obj, user)
+
+    def get_attachment_count(self, obj):
+        annotated = getattr(obj, '_attachment_count', None)
+        if annotated is not None:
+            return annotated
+        if hasattr(obj, '_prefetched_objects_cache') and 'attachments' in obj._prefetched_objects_cache:
+            return len(obj.attachments.all())
+        return obj.attachments.count()
+
+    def get_has_attachments(self, obj):
+        return self.get_attachment_count(obj) > 0
+
+    def get_attachments(self, obj):
+        if not self.context.get('include_delivery_attachments'):
+            return []
+        return TaskDeliveryAttachmentSerializer(obj.attachments.all(), many=True, context=self.context).data
+
+    def validate(self, attrs):
+        task = attrs.get('task', getattr(self.instance, 'task', None))
+        project = attrs.get('project', getattr(self.instance, 'project', None))
+        if task and not project:
+            attrs['project'] = task.project
+            project = task.project
+        if task and project and task.project_id != project.id:
+            raise serializers.ValidationError({'task': 'Task must belong to the selected project.'})
+        if self.instance and self.instance.status == TaskDelivery.STATUS_APPROVED:
+            protected = {'project', 'task', 'delivery_reference', 'description'}
+            changed = [field for field in protected if field in attrs and attrs[field] != getattr(self.instance, field)]
+            if changed:
+                raise serializers.ValidationError({field: 'Approved deliveries cannot change this field.' for field in changed})
         return attrs
 
 
@@ -1706,25 +2100,58 @@ class TaskFinancialPlanSerializer(serializers.ModelSerializer):
     milestones = PaymentMilestoneSerializer(many=True, read_only=True)
     financial_status = serializers.SerializerMethodField()
     created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    linked_cost_transaction_count = serializers.SerializerMethodField()
+    recognized_cost_amount = serializers.SerializerMethodField()
+    allocated_recognized_cost_amount = serializers.SerializerMethodField()
+    unallocated_recognized_cost_amount = serializers.SerializerMethodField()
 
     class Meta:
         model = TaskFinancialPlan
         fields = [
             'id', 'task', 'direction', 'contract_amount', 'currency', 'status',
             'description', 'created_by', 'created_at', 'updated_at', 'milestones', 'financial_status',
+            'linked_cost_transaction_count', 'recognized_cost_amount',
+            'allocated_recognized_cost_amount', 'unallocated_recognized_cost_amount',
         ]
         read_only_fields = [
             'id', 'created_by', 'created_at', 'updated_at', 'financial_status',
+            'linked_cost_transaction_count', 'recognized_cost_amount',
+            'allocated_recognized_cost_amount', 'unallocated_recognized_cost_amount',
         ]
 
     def get_financial_status(self, obj):
         if obj.status == TaskFinancialPlan.STATUS_ACTIVE:
-            return get_task_financial_status(obj.task)
+            request = self.context.get('request')
+            return get_task_financial_status(obj.task, user=request.user if request else None)
         return None
+
+    def _recognized_summary(self, obj):
+        return recognized_cost_summary(obj)
+
+    def get_linked_cost_transaction_count(self, obj):
+        return self._recognized_summary(obj)['linked_cost_transaction_count']
+
+    def get_recognized_cost_amount(self, obj):
+        return self._recognized_summary(obj)['recognized_cost_amount']
+
+    def get_allocated_recognized_cost_amount(self, obj):
+        return self._recognized_summary(obj)['allocated_recognized_cost_amount']
+
+    def get_unallocated_recognized_cost_amount(self, obj):
+        return self._recognized_summary(obj)['unallocated_recognized_cost_amount']
 
     def validate_contract_amount(self, value):
         if value <= 0:
             raise serializers.ValidationError('Contract amount must be greater than zero.')
+        if self.instance:
+            for milestone in self.instance.milestones.filter(
+                amount_type=PaymentMilestone.AMOUNT_PERCENTAGE,
+                cost_allocations__isnull=False,
+            ).distinct():
+                allocated = milestone_cost_allocated_amount(milestone)
+                capacity = Decimal(value) * Decimal(milestone.percentage or 0) / Decimal('100')
+                if capacity < allocated:
+                    raise serializers.ValidationError('Contract amount cannot reduce milestone capacity below existing cost allocations.')
         return value
 
     def validate_currency(self, value):
@@ -1757,6 +2184,7 @@ class TaskFinancialPlanSerializer(serializers.ModelSerializer):
         return attrs
 
 class TaskDropdownSerializer(serializers.ModelSerializer):
+    project_id = serializers.CharField(read_only=True)
     name = serializers.SerializerMethodField()
     code = serializers.SerializerMethodField()
     wbsNodeId = serializers.SerializerMethodField()
@@ -1764,7 +2192,7 @@ class TaskDropdownSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Task
-        fields = ['id', 'name', 'code', 'wbsNodeId', 'wbsVersionId']
+        fields = ['id', 'project_id', 'name', 'code', 'wbsNodeId', 'wbsVersionId']
 
     @staticmethod
     def _execution_version(obj):

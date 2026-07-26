@@ -168,7 +168,7 @@ if _DB_ENGINE in ('sqlite', 'sqlite3'):
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
+            'NAME': os.environ.get('SQLITE_DB_PATH') or BASE_DIR / 'db.sqlite3',
         }
     }
 else:
@@ -224,7 +224,7 @@ STATIC_URL = 'static/'
 
 # Media files (uploaded by users)
 MEDIA_URL = '/media/'
-MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+MEDIA_ROOT = os.environ.get('MEDIA_ROOT_OVERRIDE') or os.path.join(BASE_DIR, 'media')
 
 MSP_IMPORT_MAX_UPLOAD_MB = int(os.environ.get('MSP_IMPORT_MAX_UPLOAD_MB', '100'))
 FILE_UPLOAD_MAX_MEMORY_SIZE = int(os.environ.get('FILE_UPLOAD_MAX_MEMORY_SIZE', str(10 * 1024 * 1024)))

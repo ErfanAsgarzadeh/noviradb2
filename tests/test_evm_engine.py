@@ -18,6 +18,8 @@ from ktcPlanning.variance_engine import EVMEngine
 from ktcPlanning.models import (
     VarianceReport, TaskActual, TaskVersion, Revision,
     UnitOfMeasure, ExpenseType, CostTransaction, TaskReportLog,
+    FundingSource, BudgetAllocation, TaskFinancialPlan, PaymentMilestone,
+    PaymentTransaction,
 )
 from .factories import (
     make_company_admin, make_project, make_revision,
@@ -42,6 +44,29 @@ def set_task_actual(task_version, progress, actual_start=None):
     ta.updated_by = task_version.task.created_by
     ta.save()
     return ta
+
+
+def make_approved_task_budget(project, revision, task, wbs_node, user, amount=Decimal("1000.00")):
+    source = FundingSource.objects.create(
+        title="Approved source",
+        source_type="INTERNAL_CAPITAL",
+        received_date=timezone.now().date(),
+        total_amount=amount,
+        status="APPROVED",
+        created_by=user,
+    )
+    return BudgetAllocation.objects.create(
+        funding_source=source,
+        project=project,
+        revision=revision,
+        scope_type="TASK",
+        wbs_node=wbs_node,
+        task=task,
+        cost_type="COST",
+        allocated_amount=amount,
+        status="APPROVED",
+        created_by=user,
+    )
 
 
 # ══════════════════════════════════════════════════════════
@@ -170,7 +195,7 @@ class TestEVMCalculation:
             float(self.tv.duration_hours), abs=0.01
         )
 
-    def test_actual_cost_comes_from_cost_transactions(self):
+    def test_effort_actual_cost_prefers_approved_report_hours(self):
         set_task_actual(self.tv, progress=100)
         TaskReportLog.objects.create(
             task=self.task,
@@ -203,7 +228,7 @@ class TestEVMCalculation:
         report = VarianceReport.objects.get(
             task=self.task, revision=self.revision
         )
-        assert report.actual_cost == Decimal("30.00")
+        assert report.actual_cost == Decimal("99.00")
 
 
 # ══════════════════════════════════════════════════════════
@@ -251,3 +276,175 @@ class TestVarianceCalculateEndpoint:
             format="json",
         )
         assert resp.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+@pytest.mark.django_db
+class TestCostEVM:
+
+    def setup_method(self):
+        self.admin = make_company_admin()
+        self.project = make_project(creator=self.admin)
+        self.revision = make_revision(self.project, creator=self.admin, is_baseline=True)
+        self.task, self.tv = make_task(self.project, self.revision, duration_hours=48)
+        self.status_datetime = timezone.now()
+        self.tv.planned_start = self.status_datetime - timedelta(days=1)
+        self.tv.planned_finish = self.status_datetime + timedelta(days=1)
+        self.tv.save()
+        make_approved_task_budget(
+            self.project,
+            self.revision,
+            self.task,
+            self.tv.wbs_node,
+            self.admin,
+            Decimal("1000.00"),
+        )
+        report = make_report(
+            self.task,
+            self.admin,
+            progress=40,
+            approval_status="final_approved",
+        )
+        TaskReportLog.objects.filter(pk=report.pk).update(timestamp=self.status_datetime)
+        CostTransaction.objects.create(
+            project=self.project,
+            revision=self.revision,
+            task=self.task,
+            transaction_type="COST",
+            transaction_date=self.status_datetime.date(),
+            amount=Decimal("600.00"),
+            created_by=self.admin,
+        )
+
+    def test_cost_evm_uses_budget_cost_transactions_and_approved_progress(self):
+        rows = EVMEngine(
+            project_id=self.project.id,
+            data_datetime=self.status_datetime,
+        ).run_cost_task_variances(revision_id=self.revision.id)
+
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["dimension"] == "cost"
+        assert row["budget_at_completion"] == "1000.00"
+        assert row["planned_value"] == "500.00"
+        assert row["earned_value"] == "400.00"
+        assert row["actual_cost"] == "600.00"
+        assert row["cost_variance"] == "-200.00"
+        assert row["schedule_variance"] == "-100.00"
+        assert row["cpi"] == "0.6667"
+        assert row["spi"] == "0.8000"
+        assert row["estimate_at_completion"] == "1500.00"
+        assert row["estimate_to_complete"] == "900.00"
+        assert row["variance_at_completion"] == "-500.00"
+        assert row["tcpi_bac"] == "1.5000"
+        assert row["approved_progress_percent"] == "40.00"
+        assert row["planned_progress_percent"] == "50.00"
+
+    def test_cost_evm_does_not_include_payment_transactions_in_ac(self):
+        plan = TaskFinancialPlan.objects.create(
+            task=self.task,
+            direction=TaskFinancialPlan.DIRECTION_PAYABLE,
+            contract_amount=Decimal("1000.00"),
+            status=TaskFinancialPlan.STATUS_ACTIVE,
+            created_by=self.admin,
+        )
+        milestone = PaymentMilestone.objects.create(
+            financial_plan=plan,
+            title="First",
+            sequence=1,
+            trigger_type=PaymentMilestone.TRIGGER_MANUAL,
+            amount_type=PaymentMilestone.AMOUNT_FIXED,
+            fixed_amount=Decimal("200.00"),
+            status=PaymentMilestone.STATUS_PAID,
+        )
+        PaymentTransaction.objects.create(
+            milestone=milestone,
+            transaction_type=PaymentTransaction.TYPE_PAYMENT,
+            amount=Decimal("200.00"),
+            transaction_date=self.status_datetime.date(),
+            created_by=self.admin,
+        )
+
+        rows = EVMEngine(
+            project_id=self.project.id,
+            data_datetime=self.status_datetime,
+        ).run_cost_task_variances(revision_id=self.revision.id)
+
+        assert rows[0]["actual_cost"] == "600.00"
+
+    def test_cost_evm_ac_uses_transaction_amount_when_partially_allocated(self):
+        from ktcPlanning.financial_services import allocate_cost_transaction_to_milestones
+        from ktcPlanning.models import PaymentMilestone, TaskFinancialPlan
+
+        plan = TaskFinancialPlan.objects.create(
+            task=self.task,
+            direction=TaskFinancialPlan.DIRECTION_PAYABLE,
+            contract_amount=Decimal("300.00"),
+            status=TaskFinancialPlan.STATUS_ACTIVE,
+            created_by=self.admin,
+        )
+        PaymentMilestone.objects.create(
+            financial_plan=plan,
+            title="First",
+            sequence=1,
+            trigger_type=PaymentMilestone.TRIGGER_BEFORE_START,
+            amount_type=PaymentMilestone.AMOUNT_FIXED,
+            fixed_amount=Decimal("300.00"),
+        )
+        tx = CostTransaction.objects.get(task=self.task)
+        tx.financial_plan = plan
+        tx.save()
+        allocate_cost_transaction_to_milestones(tx)
+
+        rows = EVMEngine(
+            project_id=self.project.id,
+            data_datetime=self.status_datetime,
+        ).run_cost_task_variances(revision_id=self.revision.id)
+
+        assert rows[0]["actual_cost"] == "600.00"
+        assert rows[0]["has_actual_cost"] is True
+
+    def test_cost_evm_ac_uses_transaction_amount_without_allocation(self):
+        rows = EVMEngine(
+            project_id=self.project.id,
+            data_datetime=self.status_datetime,
+        ).run_cost_task_variances(revision_id=self.revision.id)
+
+        assert rows[0]["actual_cost"] == "600.00"
+
+    def test_cost_evm_ac_sums_multiple_transactions(self):
+        CostTransaction.objects.create(
+            project=self.project,
+            revision=self.revision,
+            task=self.task,
+            transaction_type="COST",
+            transaction_date=self.status_datetime.date(),
+            amount=Decimal("300.00"),
+            created_by=self.admin,
+        )
+
+        rows = EVMEngine(
+            project_id=self.project.id,
+            data_datetime=self.status_datetime,
+        ).run_cost_task_variances(revision_id=self.revision.id)
+
+        assert rows[0]["actual_cost"] == "900.00"
+
+    def test_cost_evm_endpoint_rejects_invalid_dimension(self):
+        resp = api(self.admin).get(
+            reverse("variance-report-list"),
+            {"revision_id": str(self.revision.id), "dimension": "money"},
+        )
+        assert resp.status_code == status.HTTP_400_BAD_REQUEST
+        assert "dimension" in resp.data
+
+    def test_cost_evm_endpoint_rejects_invalid_status_date(self):
+        resp = api(self.admin).get(
+            reverse("variance-report-list"),
+            {
+                "revision_id": str(self.revision.id),
+                "dimension": "cost",
+                "status_date": "not-a-date",
+            },
+        )
+        assert resp.status_code == status.HTTP_400_BAD_REQUEST
+        assert "status_date" in resp.data

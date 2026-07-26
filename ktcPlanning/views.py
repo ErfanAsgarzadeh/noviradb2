@@ -6,12 +6,12 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.shortcuts import get_object_or_404
-from django.http import FileResponse, HttpResponse
+from django.http import FileResponse, Http404, HttpResponse
 from django.conf import settings
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from django.db import transaction
-from django.db.models import Q, Sum, Prefetch, F, OuterRef, Subquery, Exists
+from django.db.models import Q, Sum, Count, Prefetch, F, OuterRef, Subquery, Exists
 from django.core.exceptions import ValidationError as DjangoValidationError
 from datetime import date, timedelta, datetime
 from decimal import Decimal
@@ -24,8 +24,9 @@ from .cpm import CPMCycleError, CPMEngine
 from .models import Project, Revision, WBSNodeVersion, TaskVersion, Dependency, SubprojectDependency, TaskRole, Task, WBSNode, TaskReportLog, \
     TaskActual, TaskChatMessage, Assignment, Resource, ResourcePool, ResourceRole, ResourceSkill, ResourceSkillMapping, \
     ResourceException, ResourceRate, VarianceReport, Calendar, ProjectViewer, SystemSettings, UnitOfMeasure, \
-    ExpenseType, FundingSource, BudgetAllocation, BudgetBorrow, UnfundedForecastCost, CostTransaction, TaskReportAttachment, BudgetConsumption, TaskFinancialPlan, PaymentMilestone, PaymentTransaction, \
-    GlobalLevelingRun, LevelingPlanProject, TaskLevelingMetrics, ResourceUsage
+    ExpenseType, FundingSource, BudgetAllocation, BudgetBorrow, UnfundedForecastCost, CostTransaction, TaskReportAttachment, BudgetConsumption, TaskFinancialPlan, PaymentMilestone, PaymentTransaction, Currency, ExchangeRate, \
+    TaskDeliveryAttachment, \
+    GlobalLevelingRun, LevelingPlanProject, TaskLevelingMetrics, ResourceUsage, TaskDelivery
 from .serializers import (
     ProjectSerializer,
     RevisionSerializer,
@@ -39,7 +40,7 @@ from .serializers import (
     ResourceExceptionSerializer, ResourceRateSerializer, AssignmentSerializer, VarianceReportSerializer,
     CalendarSerializer, ProjectViewerSerializer, SystemSettingsSerializer, UnitOfMeasureSerializer,
     ExpenseTypeSerializer, FundingSourceSerializer, BudgetAllocationSerializer, BudgetBorrowSerializer, UnfundedForecastCostSerializer,
-    CostTransactionSerializer, TaskDropdownSerializer, ResourceLevelingPlanSerializer, TaskFinancialPlanSerializer, PaymentMilestoneSerializer, PaymentTransactionSerializer, PlanPaymentAllocationSerializer
+    CostTransactionSerializer, TaskDropdownSerializer, ResourceLevelingPlanSerializer, TaskFinancialPlanSerializer, PaymentMilestoneSerializer, PaymentTransactionSerializer, PlanPaymentAllocationSerializer, TaskDeliveryAttachmentSerializer, TaskDeliverySerializer
 )
 
 
@@ -68,7 +69,14 @@ from .msp_exporter import export_revision_to_msp_xml
 from django.db.models import Max
 
 from .variance_engine import EVMEngine
-from .financial_services import activate_plan, allocate_plan_payment, get_task_financial_status, register_transaction, validate_progress_transition, validate_task_delivery, validate_task_start
+from .financial_services import (
+    activate_plan, allocate_cost_transaction_to_milestones, allocate_plan_payment,
+    get_task_delivery_attachment_capabilities, get_task_delivery_capabilities, get_task_financial_status, refresh_plan_cost_allocations, register_transaction,
+    approve_task_delivery, cancel_task_delivery, reject_task_delivery, submit_task_delivery,
+    validate_progress_transition, validate_task_delivery, validate_task_start,
+)
+from .financial_control import build_financial_control_payload
+from .cost_variance_snapshots import generate_cost_variance_reports
 from .permissions import (
     can_create_project, can_edit_project, require_can_create_project,
     require_can_edit_project, is_company_level, is_system_admin,
@@ -84,6 +92,98 @@ from .revision_policy import (
 )
 from django.contrib.auth import get_user_model
 User = get_user_model()
+
+
+class FinancialControlView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        params = dict(request.query_params.items())
+        params["_accessible_project_ids"] = accessible_project_ids(request.user)
+        return Response(build_financial_control_payload(request.user, params))
+
+
+class FinancialControlConvertView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        params = dict(request.data.get("filters") or {})
+        params["currency_mode"] = "converted"
+        params["reporting_currency"] = request.data.get("reporting_currency") or params.get("reporting_currency")
+        params["_manual_rates"] = request.data.get("manual_rates") or []
+        params["_accessible_project_ids"] = accessible_project_ids(request.user)
+        return Response(build_financial_control_payload(request.user, params))
+
+
+class FinancialControlExchangeRateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        role = getattr(request.user, "org_role", "") or ""
+        if not (request.user.is_superuser or request.user.is_staff or role in {"company_admin", "company_pm"}):
+            raise PermissionDenied("You do not have permission to save exchange rates.")
+        source_currency = str(request.data.get("source_currency") or "").upper()
+        target_currency = str(request.data.get("target_currency") or "").upper()
+        rate = request.data.get("rate")
+        effective_date = parse_date(str(request.data.get("effective_date") or ""))
+        if not source_currency or not target_currency:
+            raise ValidationError({"currency": "source_currency and target_currency are required."})
+        if source_currency == target_currency:
+            raise ValidationError({"currency": "source_currency and target_currency must differ."})
+        if effective_date is None:
+            raise ValidationError({"effective_date": "effective_date is required in YYYY-MM-DD format."})
+        try:
+            rate_value = Decimal(str(rate))
+        except Exception as exc:
+            raise ValidationError({"rate": "rate must be numeric."}) from exc
+        if rate_value <= 0:
+            raise ValidationError({"rate": "rate must be greater than zero."})
+        exchange_rate, _ = ExchangeRate.objects.update_or_create(
+            source_currency=source_currency,
+            target_currency=target_currency,
+            effective_date=effective_date,
+            defaults={
+                "rate": rate_value,
+                "source": request.data.get("source") or "manual",
+                "created_by": request.user,
+            },
+        )
+        for code in {source_currency, target_currency}:
+            Currency.objects.get_or_create(code=code, defaults={"name": code, "symbol": code})
+        return Response({
+            "id": exchange_rate.id,
+            "source_currency": exchange_rate.source_currency,
+            "target_currency": exchange_rate.target_currency,
+            "rate": str(exchange_rate.rate),
+            "effective_date": exchange_rate.effective_date.isoformat(),
+            "created_by": exchange_rate.created_by_id,
+            "created_at": exchange_rate.created_at.isoformat(),
+        }, status=status.HTTP_201_CREATED)
+
+
+class FinancialControlGenerateCostSnapshotsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        project_id = request.data.get("project_id")
+        if not project_id:
+            raise ValidationError({"project_id": "project_id is required."})
+        project = get_object_or_404(Project, pk=project_id)
+        require_can_edit_project(request.user, project)
+        currency = str(request.data.get("currency") or "").upper().strip()
+        if not currency:
+            raise ValidationError({"currency": "currency is required."})
+        task_ids = request.data.get("task_ids") or None
+        if task_ids is not None and not isinstance(task_ids, list):
+            raise ValidationError({"task_ids": "task_ids must be a list."})
+        result = generate_cost_variance_reports(
+            project=project,
+            status_date=request.data.get("status_date"),
+            currency=currency,
+            task_ids=task_ids,
+            actor=request.user,
+        )
+        return Response(result, status=status.HTTP_200_OK)
 
 
 def can_approve_budget(user):
@@ -1626,6 +1726,8 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
             task_actual.actual_finish = None
             task_actual.updated_by = user
             task_actual.save()
+            for plan in TaskFinancialPlan.objects.filter(task=report.task).exclude(status=TaskFinancialPlan.STATUS_CANCELLED):
+                refresh_plan_cost_allocations(plan, as_of_date=report.timestamp)
             return
 
         # ظ…ط­ط§ط³ط¨ظ‡ ط®ظˆط¯ع©ط§ط± actual_start/finish
@@ -1645,6 +1747,8 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
 
         task_actual.updated_by = user
         task_actual.save()
+        for plan in TaskFinancialPlan.objects.filter(task=report.task).exclude(status=TaskFinancialPlan.STATUS_CANCELLED):
+            refresh_plan_cost_allocations(plan, as_of_date=report.timestamp)
 class TaskChatMessageViewSet(viewsets.ModelViewSet):
     queryset = TaskChatMessage.objects.all()
     serializer_class = TaskChatMessageSerializer
@@ -2612,6 +2716,10 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
         queryset = queryset.filter(revision__project_id__in=accessible_project_ids(self.request.user))
+        dimension = (self.request.query_params.get('dimension') or VarianceReport.DIMENSION_EFFORT).strip().lower()
+        if dimension not in {VarianceReport.DIMENSION_EFFORT, VarianceReport.DIMENSION_COST}:
+            raise ValidationError({"dimension": "Invalid dimension. Use 'effort' or 'cost'."})
+        queryset = queryset.filter(dimension=dimension)
         revision_id = self.request.query_params.get('revision_id')
         if revision_id:
             queryset = queryset.filter(revision_id=revision_id)
@@ -2644,6 +2752,7 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
         latest_date = VarianceReport.objects.filter(
             task_id=OuterRef('task_id'),
             revision_id=OuterRef('revision_id'),
+            dimension=OuterRef('dimension'),
         ).order_by('-report_date').values('report_date')[:1]
         return queryset.filter(report_date=Subquery(latest_date))
 
@@ -2687,7 +2796,151 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
             'criticalCount': queryset.filter(action_required=True).count(),
         }
 
+    def _parse_evm_dimension(self, request):
+        dimension = (request.query_params.get('dimension') or 'effort').strip().lower()
+        if dimension not in {'effort', 'cost'}:
+            return None, Response(
+                {"dimension": "Invalid dimension. Use 'effort' or 'cost'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return dimension, None
+
+    def _resolve_cost_project_id(self, request):
+        revision_id = request.query_params.get('revision_id')
+        project_id = request.query_params.get('project_id')
+        task_id = request.query_params.get('task_id')
+
+        if project_id:
+            return str(project_id)
+        if revision_id:
+            revision = Revision.objects.filter(pk=revision_id).only('project_id').first()
+            return str(revision.project_id) if revision else None
+        if task_id:
+            task = Task.objects.filter(pk=task_id).only('project_id').first()
+            return str(task.project_id) if task else None
+        return None
+
+    def _cost_series(self, rows):
+        totals = self._cost_summary(rows)
+        dates = sorted({row.get('report_date') for row in rows if row.get('report_date')})
+        return [
+            {
+                'date': date_value,
+                'plannedValue': totals['totalPV'],
+                'earnedValue': totals['totalEV'],
+                'actualCost': totals['totalAC'],
+            }
+            for date_value in dates[:1]
+        ]
+
+    def _cost_summary(self, rows):
+        def as_decimal(value):
+            if value in (None, ''):
+                return Decimal('0.00')
+            return Decimal(str(value))
+
+        total_bac = sum((as_decimal(row.get('budget_at_completion')) for row in rows), Decimal('0.00'))
+        total_pv = sum((as_decimal(row.get('planned_value')) for row in rows), Decimal('0.00'))
+        total_ev = sum((as_decimal(row.get('earned_value')) for row in rows), Decimal('0.00'))
+        total_ac = sum((as_decimal(row.get('actual_cost')) for row in rows), Decimal('0.00'))
+        total_sv = total_ev - total_pv
+        total_cv = total_ev - total_ac
+        return {
+            'totalBAC': float(total_bac),
+            'totalPV': float(total_pv),
+            'totalEV': float(total_ev),
+            'totalAC': float(total_ac),
+            'overallSPI': float((total_ev / total_pv).quantize(Decimal('0.0001'))) if total_pv else None,
+            'overallCPI': float((total_ev / total_ac).quantize(Decimal('0.0001'))) if total_ac else None,
+            'totalSV': float(total_sv),
+            'totalCV': float(total_cv),
+            'criticalCount': sum(1 for row in rows if row.get('action_required')),
+        }
+
+    def _filtered_cost_rows(self, request, rows):
+        revision_id = request.query_params.get('revision_id')
+        task_id = request.query_params.get('task_id')
+        wbs_node_id = request.query_params.get('wbs_node_id')
+        search = (request.query_params.get('search') or '').strip().lower()
+
+        if task_id:
+            rows = [row for row in rows if str(row.get('task')) == str(task_id)]
+        if wbs_node_id:
+            wbs_queryset = WBSNodeVersion.objects.filter(node_id=wbs_node_id, is_deleted=False)
+            if revision_id:
+                wbs_queryset = wbs_queryset.filter(revision_id=revision_id)
+            wbs_version = wbs_queryset.first()
+            if wbs_version:
+                scoped_wbs_ids = set(wbs_version.get_descendants(include_self=True).values_list('id', flat=True))
+                rows = [row for row in rows if row.get('wbs_node_id') in scoped_wbs_ids]
+            else:
+                rows = []
+        if search:
+            rows = [
+                row for row in rows
+                if search in str(row.get('task_name') or '').lower()
+                or search in str(row.get('task_code') or '').lower()
+            ]
+        return rows
+
+    def _cost_list(self, request):
+        status_date_value = request.query_params.get('status_date')
+        try:
+            data_datetime = parse_cpm_data_date(status_date_value) if status_date_value else None
+        except ValueError:
+            return Response(
+                {"status_date": "Invalid status_date. Use ISO datetime, date, or 'now'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        project_id = self._resolve_cost_project_id(request)
+        if not project_id:
+            return Response(
+                {"project_id": "project_id, revision_id, or task_id is required for cost EVM."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if project_id not in {str(item) for item in accessible_project_ids(request.user)}:
+            raise PermissionDenied("You do not have access to this project.")
+
+        try:
+            engine = EVMEngine(project_id=project_id, data_datetime=data_datetime)
+            rows = engine.run_cost_task_variances(revision_id=request.query_params.get('revision_id'))
+        except Revision.DoesNotExist:
+            return Response({"revision_id": "Revision not found for this project."}, status=status.HTTP_404_NOT_FOUND)
+
+        rows = self._filtered_cost_rows(request, rows)
+        page_param = request.query_params.get('page')
+        page_size_param = request.query_params.get('pageSize') or request.query_params.get('page_size')
+
+        if not page_param and not page_size_param:
+            return Response(rows)
+
+        try:
+            page = max(int(page_param or 1), 1)
+            page_size = min(max(int(page_size_param or 100), 1), 250)
+        except (TypeError, ValueError):
+            page, page_size = 1, 100
+
+        total = len(rows)
+        start = (page - 1) * page_size
+        page_rows = rows[start:start + page_size]
+        return Response({
+            'results': page_rows,
+            'summary': self._cost_summary(rows),
+            'series': self._cost_series(rows),
+            'page': page,
+            'pageSize': page_size,
+            'total': total,
+            'hasNext': start + len(page_rows) < total,
+        })
+
     def list(self, request, *args, **kwargs):
+        dimension, error_response = self._parse_evm_dimension(request)
+        if error_response:
+            return error_response
+        if dimension == 'cost':
+            return self._cost_list(request)
+
         queryset = self.filter_queryset(self.get_queryset())
         series = self._series(queryset)
         include_history = (request.query_params.get('history') or '').lower() in {'1', 'true', 'yes'}
@@ -3149,6 +3402,8 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
             'resource_rate',
             'resource_rate__resource',
             'budget_allocation',
+        ).prefetch_related(
+            'milestone_allocations__milestone',
         ).annotate(
             _has_financial_plan=Exists(TaskFinancialPlan.objects.filter(pk=OuterRef('financial_plan_id'))),
         )
@@ -3293,6 +3548,8 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         cost_transaction = serializer.save(created_by=self.request.user, budget_allocation=None)
         self._allocate_budget_for_transaction(cost_transaction)
+        if cost_transaction.financial_plan_id:
+            allocate_cost_transaction_to_milestones(cost_transaction)
         log_budget_audit(
             self.request,
             'cost_transaction_created',
@@ -3308,6 +3565,8 @@ class CostTransactionViewSet(viewsets.ModelViewSet):
         cost_transaction.budget_consumptions.all().delete()
         cost_transaction = serializer.save(budget_allocation=None)
         self._allocate_budget_for_transaction(cost_transaction)
+        if cost_transaction.financial_plan_id:
+            allocate_cost_transaction_to_milestones(cost_transaction)
         log_budget_audit(
             self.request,
             'cost_transaction_updated',
@@ -3340,7 +3599,7 @@ class TaskFinancialPlanViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = TaskFinancialPlan.objects.select_related(
             'task', 'task__project', 'created_by',
-        ).prefetch_related('milestones__transactions', 'cost_transactions')
+        ).prefetch_related('milestones__transactions', 'milestones__cost_allocations', 'cost_transactions__milestone_allocations')
         queryset = queryset.filter(task__project_id__in=accessible_project_ids(self.request.user))
         task_id = self.request.query_params.get('task_id')
         if task_id:
@@ -3401,20 +3660,231 @@ class TaskFinancialPlanViewSet(viewsets.ModelViewSet):
             user=request.user,
             reference_number=serializer.validated_data.get('reference_number', ''),
             description=serializer.validated_data.get('description', ''),
+            currency=serializer.validated_data.get('currency') or None,
         )
         for tx in transactions:
             log_budget_audit(request, 'payment_transaction_allocated_created', tx)
         return Response({
             'transactions': PaymentTransactionSerializer(transactions, many=True).data,
-            'financial_status': get_task_financial_status(plan.task),
+            'financial_status': get_task_financial_status(plan.task, user=request.user),
         }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'], url_path='refresh-cost-allocations')
+    def refresh_cost_allocations(self, request, pk=None):
+        plan = self.get_object()
+        require_can_edit_project(request.user, plan.task.project)
+        summary = refresh_plan_cost_allocations(plan)
+        log_budget_audit(request, 'task_financial_plan_cost_allocations_refreshed', plan, extra=summary)
+        plan.refresh_from_db()
+        return Response({
+            'summary': summary,
+            'financial_plan': self.get_serializer(plan).data,
+            'financial_status': get_task_financial_status(plan.task, user=request.user),
+        })
+
     @action(detail=False, methods=['get'], url_path='status')
     def status_summary(self, request):
         task_id = request.query_params.get('task_id')
         if not task_id:
             raise ValidationError({'task_id': 'task_id is required.'})
         task = get_object_or_404(Task.objects.filter(project_id__in=accessible_project_ids(request.user)), pk=task_id)
-        return Response(get_task_financial_status(task))
+        return Response(get_task_financial_status(task, user=request.user))
+
+
+class TaskDeliveryViewSet(viewsets.ModelViewSet):
+    serializer_class = TaskDeliverySerializer
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
+
+    def get_queryset(self):
+        queryset = TaskDelivery.objects.select_related(
+            'project', 'project__owner_unit', 'task',
+            'created_by', 'submitted_by', 'approved_by', 'rejected_by', 'cancelled_by',
+        ).annotate(
+            _attachment_count=Count('attachments', distinct=True),
+            _can_review_user=Exists(TaskRole.objects.filter(
+                task=OuterRef('task_id'),
+                user=self.request.user,
+                role__in=['reviewer', 'project manager'],
+            ))
+        )
+        if self.action in {'retrieve', 'submit', 'approve', 'reject', 'cancel'}:
+            queryset = queryset.prefetch_related(
+                Prefetch('attachments', queryset=TaskDeliveryAttachment.objects.select_related('uploaded_by'))
+            )
+        queryset = queryset.filter(project_id__in=accessible_project_ids(self.request.user))
+        project_id = self.request.query_params.get('project_id')
+        if project_id:
+            queryset = queryset.filter(project_id=project_id)
+        task_id = self.request.query_params.get('task_id')
+        if task_id:
+            queryset = queryset.filter(task_id=task_id)
+        status_value = self.request.query_params.get('status')
+        if status_value:
+            queryset = queryset.filter(status=status_value)
+        needs_my_review = str(self.request.query_params.get('needs_my_review', '')).lower()
+        if needs_my_review in {'1', 'true', 'yes'}:
+            queryset = queryset.filter(status=TaskDelivery.STATUS_SUBMITTED)
+            if not is_company_level(self.request.user):
+                queryset = queryset.filter(_can_review_user=True)
+        search = (self.request.query_params.get('search') or '').strip()
+        if search:
+            queryset = queryset.filter(
+                Q(delivery_reference__icontains=search) |
+                Q(description__icontains=search) |
+                Q(project__name__icontains=search) |
+                Q(task__versions__title__icontains=search) |
+                Q(task__versions__wbs_node__wbs_code__icontains=search)
+            ).distinct()
+        return queryset
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['include_delivery_attachments'] = self.action in {'retrieve', 'submit', 'approve', 'reject', 'cancel'}
+        return context
+
+    def _can_review(self, delivery):
+        return get_task_delivery_capabilities(delivery, self.request.user)['can_approve']
+
+    def _require_review(self, delivery):
+        if not self._can_review(delivery):
+            raise PermissionDenied('Only project reviewers, project managers, or company-level users can review task deliveries.')
+
+    def perform_create(self, serializer):
+        task = serializer.validated_data.get('task')
+        require_can_edit_project(self.request.user, task.project)
+        delivery = serializer.save(created_by=self.request.user)
+        log_budget_audit(self.request, 'task_delivery_created', delivery)
+
+    def perform_update(self, serializer):
+        delivery = serializer.instance
+        if not get_task_delivery_capabilities(delivery, self.request.user)['can_edit']:
+            raise ValidationError({'status': 'Only draft deliveries can be edited directly.'})
+        old = model_to_dict_safe(delivery)
+        updated = serializer.save()
+        log_budget_audit(self.request, 'task_delivery_updated', updated, old=old)
+
+    def perform_destroy(self, instance):
+        require_can_edit_project(self.request.user, instance.project)
+        if instance.status != TaskDelivery.STATUS_DRAFT:
+            raise ValidationError({'status': 'Only draft deliveries can be deleted.'})
+        old = model_to_dict_safe(instance)
+        log_budget_audit(self.request, 'task_delivery_deleted', instance, old=old, extra={'deleted': old})
+        instance.delete()
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        delivery = self.get_object()
+        if not get_task_delivery_capabilities(delivery, request.user)['can_submit']:
+            raise PermissionDenied('You do not have permission to submit this task delivery.')
+        old = model_to_dict_safe(delivery)
+        delivery = submit_task_delivery(delivery, user=request.user)
+        log_budget_audit(request, 'task_delivery_submitted', delivery, old=old)
+        return Response({
+            'delivery': self.get_serializer(delivery).data,
+            'financial_status': get_task_financial_status(delivery.task, user=request.user),
+        })
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        delivery = self.get_object()
+        if not get_task_delivery_capabilities(delivery, request.user)['can_approve']:
+            raise PermissionDenied('Only project reviewers, project managers, or company-level users can review task deliveries.')
+        old = model_to_dict_safe(delivery)
+        delivery, summaries = approve_task_delivery(delivery, user=request.user)
+        log_budget_audit(request, 'task_delivery_approved', delivery, old=old, extra={'cost_allocation_summaries': summaries})
+        return Response({
+            'delivery': self.get_serializer(delivery).data,
+            'financial_status': get_task_financial_status(delivery.task, user=request.user),
+            'cost_allocation_summaries': summaries,
+        })
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        delivery = self.get_object()
+        if not get_task_delivery_capabilities(delivery, request.user)['can_reject']:
+            raise PermissionDenied('Only project reviewers, project managers, or company-level users can review task deliveries.')
+        old = model_to_dict_safe(delivery)
+        delivery = reject_task_delivery(delivery, user=request.user, reason=request.data.get('reason', ''))
+        log_budget_audit(request, 'task_delivery_rejected', delivery, old=old)
+        return Response({
+            'delivery': self.get_serializer(delivery).data,
+            'financial_status': get_task_financial_status(delivery.task, user=request.user),
+        })
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        delivery = self.get_object()
+        if not get_task_delivery_capabilities(delivery, request.user)['can_cancel']:
+            raise PermissionDenied('You do not have permission to cancel this task delivery.')
+        old = model_to_dict_safe(delivery)
+        delivery = cancel_task_delivery(delivery, user=request.user)
+        log_budget_audit(request, 'task_delivery_cancelled', delivery, old=old)
+        return Response({
+            'delivery': self.get_serializer(delivery).data,
+            'financial_status': get_task_financial_status(delivery.task, user=request.user),
+        })
+
+    @action(detail=True, methods=['get', 'post'], url_path='attachments', parser_classes=[MultiPartParser, FormParser, JSONParser])
+    def attachments(self, request, pk=None):
+        delivery = self.get_object()
+        if request.method.lower() == 'get':
+            queryset = delivery.attachments.select_related('uploaded_by')
+            serializer = TaskDeliveryAttachmentSerializer(queryset, many=True, context=self.get_serializer_context())
+            return Response(serializer.data)
+        if not get_task_delivery_attachment_capabilities(delivery, request.user)['can_upload']:
+            raise PermissionDenied('You do not have permission to upload evidence for this delivery.')
+        serializer = TaskDeliveryAttachmentSerializer(data=request.data, context={**self.get_serializer_context(), 'delivery': delivery})
+        serializer.is_valid(raise_exception=True)
+        attachment = serializer.save()
+        log_budget_audit(request, 'task_delivery_attachment_uploaded', delivery, extra={'attachment_id': str(attachment.id)})
+        delivery = self.get_queryset().get(pk=delivery.pk)
+        response_serializer = self.get_serializer(delivery)
+        return Response({
+            'attachment': TaskDeliveryAttachmentSerializer(attachment, context=self.get_serializer_context()).data,
+            'delivery': response_serializer.data,
+        }, status=status.HTTP_201_CREATED)
+
+
+class TaskDeliveryAttachmentViewSet(viewsets.GenericViewSet):
+    serializer_class = TaskDeliveryAttachmentSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return TaskDeliveryAttachment.objects.select_related(
+            'delivery', 'delivery__project', 'delivery__task', 'uploaded_by',
+        ).filter(delivery__project_id__in=accessible_project_ids(self.request.user))
+
+    def destroy(self, request, pk=None):
+        attachment = self.get_object()
+        delivery = attachment.delivery
+        if not get_task_delivery_attachment_capabilities(delivery, request.user)['can_delete']:
+            raise PermissionDenied('You do not have permission to delete evidence for this delivery.')
+        old = model_to_dict_safe(attachment)
+        log_budget_audit(request, 'task_delivery_attachment_deleted', delivery, old=old, extra={'attachment_id': str(attachment.id)})
+        attachment.delete()
+        delivery.refresh_from_db()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=['get'])
+    def download(self, request, pk=None):
+        attachment = self.get_object()
+        if not can_view_project(request.user, attachment.delivery.project):
+            raise Http404
+        if not attachment.file:
+            raise Http404
+        try:
+            opened = attachment.file.open('rb')
+        except FileNotFoundError:
+            raise Http404
+        response = FileResponse(
+            opened,
+            as_attachment=True,
+            filename=attachment.original_filename or attachment.file.name,
+        )
+        if attachment.content_type:
+            response['Content-Type'] = attachment.content_type
+        return response
 
 
 class PaymentMilestoneViewSet(viewsets.ModelViewSet):
@@ -3422,7 +3892,7 @@ class PaymentMilestoneViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = PaymentMilestone.objects.select_related('financial_plan', 'financial_plan__task', 'financial_plan__task__project').prefetch_related('transactions')
+        queryset = PaymentMilestone.objects.select_related('financial_plan', 'financial_plan__task', 'financial_plan__task__project').prefetch_related('transactions', 'cost_allocations')
         queryset = queryset.filter(financial_plan__task__project_id__in=accessible_project_ids(self.request.user))
         plan_id = self.request.query_params.get('financial_plan_id')
         if plan_id:
@@ -3448,8 +3918,8 @@ class PaymentMilestoneViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         self._require_manage(instance)
-        if instance.transactions.exists():
-            raise ValidationError({'detail': 'Milestones with ledger transactions cannot be deleted.'})
+        if instance.transactions.exists() or instance.cost_allocations.exists():
+            raise ValidationError({'detail': 'Milestones with ledger or cost allocations cannot be deleted.'})
         old = model_to_dict_safe(instance)
         log_budget_audit(self.request, 'payment_milestone_deleted', instance, old=old, extra={'deleted': old})
         instance.delete()
@@ -3468,9 +3938,29 @@ class PaymentMilestoneViewSet(viewsets.ModelViewSet):
             user=request.user,
             reference_number=serializer.validated_data.get('reference_number', ''),
             description=serializer.validated_data.get('description', ''),
+            currency=serializer.validated_data.get('currency') or None,
         )
         log_budget_audit(request, f"payment_transaction_{tx.transaction_type}_created", tx)
         return Response(PaymentTransactionSerializer(tx).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'], url_path='approve-manual')
+    def approve_manual(self, request, pk=None):
+        milestone = self.get_object()
+        self._require_manage(milestone)
+        if milestone.trigger_type != PaymentMilestone.TRIGGER_MANUAL:
+            raise ValidationError({'trigger_type': 'Only manual milestones can be manually approved.'})
+        old = model_to_dict_safe(milestone)
+        milestone.manual_approved = True
+        milestone.manual_approved_at = timezone.now()
+        milestone.manual_approved_by = request.user
+        milestone.save(update_fields=['manual_approved', 'manual_approved_at', 'manual_approved_by', 'updated_at'])
+        summary = refresh_plan_cost_allocations(milestone.financial_plan)
+        log_budget_audit(request, 'payment_milestone_manual_approved', milestone, old=old, extra=summary)
+        return Response({
+            'milestone': self.get_serializer(milestone).data,
+            'financial_status': get_task_financial_status(milestone.financial_plan.task, user=request.user),
+            'cost_allocation_summary': summary,
+        })
 
 
 class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):

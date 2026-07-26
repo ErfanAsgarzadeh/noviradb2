@@ -1,4 +1,4 @@
-import uuid
+import os
 import uuid
 from django.db import models
 from django.utils import timezone
@@ -14,6 +14,11 @@ from ktcPlanning.validators import validate_chat_file
 User = get_user_model()
 
 
+def task_delivery_attachment_upload_to(instance, filename):
+    base, ext = os.path.splitext(os.path.basename(filename or "evidence"))
+    return f"task_delivery_attachments/{instance.delivery_id}/{uuid.uuid4().hex}{ext.lower()}"
+
+
 BUDGET_STATUS_CHOICES = [
     ("DRAFT", "Draft"),
     ("SUBMITTED", "Submitted"),
@@ -22,6 +27,50 @@ BUDGET_STATUS_CHOICES = [
     ("LOCKED", "Locked"),
     ("CLOSED", "Closed"),
 ]
+
+
+class Currency(models.Model):
+    code = models.CharField(max_length=8, unique=True)
+    name = models.CharField(max_length=64)
+    symbol = models.CharField(max_length=16, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["code"]
+
+    def __str__(self):
+        return self.code
+
+
+class ExchangeRate(models.Model):
+    source_currency = models.CharField(max_length=8)
+    target_currency = models.CharField(max_length=8)
+    rate = models.DecimalField(max_digits=24, decimal_places=10)
+    effective_date = models.DateField()
+    source = models.CharField(max_length=128, blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-effective_date", "-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["source_currency", "target_currency", "effective_date"]),
+            models.Index(fields=["effective_date"]),
+        ]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(rate__gt=0), name="exchange_rate_positive"),
+            models.CheckConstraint(
+                condition=~models.Q(source_currency=models.F("target_currency")),
+                name="exchange_rate_source_target_differ",
+            ),
+            models.UniqueConstraint(
+                fields=["source_currency", "target_currency", "effective_date"],
+                name="unique_exchange_rate_pair_date",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.source_currency}->{self.target_currency} @ {self.effective_date}"
 
 
 # =========================================================
@@ -996,12 +1045,26 @@ class TaskActual(models.Model):
 # =========================================================
 
 class VarianceReport(models.Model):
+    DIMENSION_EFFORT = "effort"
+    DIMENSION_COST = "cost"
+    DIMENSION_CHOICES = [
+        (DIMENSION_EFFORT, "Effort"),
+        (DIMENSION_COST, "Cost"),
+    ]
+
     # اتصال مستقیم به Task برای حفظ تاریخچه در طول ریویژن‌های مختلف
     task = models.ForeignKey('Task', on_delete=models.CASCADE, related_name="variance_snapshots")
     revision = models.ForeignKey('Revision', on_delete=models.CASCADE, related_name="variances")
 
     # تاریخ محاسبه (Data Date)
     report_date = models.DateField(default=timezone.localdate)
+    dimension = models.CharField(
+        max_length=16,
+        choices=DIMENSION_CHOICES,
+        default=DIMENSION_EFFORT,
+        db_index=True,
+    )
+    currency = models.CharField(max_length=8, null=True, blank=True, db_index=True)
 
     # مقادیر پایه EVM (بر اساس ساعت)
     budget_at_completion = models.DecimalField(max_digits=15, decimal_places=2, default=0)  # BAC
@@ -1026,8 +1089,22 @@ class VarianceReport(models.Model):
     action_required = models.BooleanField(default=False)
 
     class Meta:
-        unique_together = [("task", "report_date", "revision")]
         ordering = ['-report_date']
+        indexes = [
+            models.Index(fields=["task", "dimension", "report_date"], name="variance_task_dim_date_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["task", "revision", "report_date", "dimension"],
+                condition=models.Q(dimension="effort"),
+                name="unique_effort_variance_report_task_revision_date",
+            ),
+            models.UniqueConstraint(
+                fields=["task", "revision", "report_date", "dimension", "currency"],
+                condition=models.Q(dimension="cost", currency__isnull=False),
+                name="unique_cost_variance_report_task_revision_date_currency",
+            ),
+        ]
 
     def __str__(self):
         return f"Variance for Task {self.task.id} on {self.report_date}"
@@ -1125,6 +1202,84 @@ class TaskReportAttachment(models.Model):
 
     def __str__(self):
         return self.file_name or str(self.file)
+
+
+class TaskDelivery(models.Model):
+    STATUS_DRAFT = "draft"
+    STATUS_SUBMITTED = "submitted"
+    STATUS_APPROVED = "approved"
+    STATUS_REJECTED = "rejected"
+    STATUS_CANCELLED = "cancelled"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_SUBMITTED, "Submitted"),
+        (STATUS_APPROVED, "Approved"),
+        (STATUS_REJECTED, "Rejected"),
+        (STATUS_CANCELLED, "Cancelled"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="task_deliveries")
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="deliveries")
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    delivery_reference = models.CharField(max_length=100, blank=True)
+    description = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_task_deliveries")
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    submitted_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="submitted_task_deliveries")
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="approved_task_deliveries")
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="rejected_task_deliveries")
+    rejection_reason = models.TextField(blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancelled_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="cancelled_task_deliveries")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["task_id", "-created_at", "-id"]
+        indexes = [
+            models.Index(fields=["project", "status"]),
+            models.Index(fields=["task", "status"]),
+            models.Index(fields=["status", "approved_at"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.task_id and self.project_id and self.task.project_id != self.project_id:
+            raise ValidationError({"task": "Task must belong to the selected project."})
+
+    def __str__(self):
+        return f"{self.task_id} - {self.status} - {self.delivery_reference or self.id}"
+
+
+class TaskDeliveryAttachment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    delivery = models.ForeignKey(TaskDelivery, on_delete=models.CASCADE, related_name="attachments")
+    file = models.FileField(upload_to=task_delivery_attachment_upload_to)
+    original_filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=100, blank=True, default="")
+    size_bytes = models.PositiveBigIntegerField(default=0)
+    description = models.CharField(max_length=500, blank=True, default="")
+    uploaded_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="task_delivery_attachments")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        indexes = [
+            models.Index(fields=["delivery", "created_at"]),
+        ]
+
+    def delete(self, *args, **kwargs):
+        storage = self.file.storage if self.file else None
+        name = self.file.name if self.file else None
+        super().delete(*args, **kwargs)
+        if storage and name and storage.exists(name):
+            storage.delete(name)
+
+    def __str__(self):
+        return self.original_filename or str(self.file)
 
 
 
@@ -1586,6 +1741,7 @@ class CostTransaction(models.Model):
     )
 
     transaction_date = models.DateField()
+    currency = models.CharField(max_length=8, null=True, blank=True, db_index=True)
 
     quantity = models.DecimalField(
         max_digits=14,
@@ -1641,6 +1797,18 @@ class CostTransaction(models.Model):
             and self.budget_allocation.project_id != self.project_id
         ):
             raise ValidationError("Budget allocation must belong to the selected project.")
+
+        if self.pk:
+            existing = CostTransaction.objects.filter(pk=self.pk).first()
+            allocated = self.milestone_allocations.aggregate(total=models.Sum("allocated_amount"))["total"] or Decimal("0.00")
+            if existing and allocated > 0 and existing.financial_plan_id != self.financial_plan_id:
+                raise ValidationError({"financial_plan": "Cost transactions with milestone allocations cannot change financial plan."})
+            if existing and (allocated > 0 or existing.financial_plan_id) and existing.task_id != self.task_id:
+                raise ValidationError({"task": "Cost transactions linked to a financial plan cannot change task."})
+            if existing and (allocated > 0 or existing.financial_plan_id) and existing.project_id != self.project_id:
+                raise ValidationError({"project": "Cost transactions linked to a financial plan cannot change project."})
+            if allocated > 0 and self.amount is not None and self.amount < allocated:
+                raise ValidationError({"amount": "Amount cannot be less than existing milestone allocations."})
 
         if self.financial_plan_id:
             if self.financial_plan.direction != TaskFinancialPlan.DIRECTION_PAYABLE:
@@ -1834,6 +2002,16 @@ class TaskFinancialPlan(models.Model):
         super().clean()
         if self.contract_amount is not None and self.contract_amount <= 0:
             raise ValidationError("Contract amount must be greater than zero.")
+        if self.pk:
+            allocated_percentage_milestones = self.milestones.filter(
+                amount_type=PaymentMilestone.AMOUNT_PERCENTAGE,
+                cost_allocations__isnull=False,
+            ).distinct()
+            for milestone in allocated_percentage_milestones:
+                allocated = milestone.cost_allocations.aggregate(total=models.Sum("allocated_amount"))["total"] or Decimal("0.00")
+                capacity = Decimal(self.contract_amount) * Decimal(milestone.percentage or 0) / Decimal("100")
+                if capacity < allocated:
+                    raise ValidationError({"contract_amount": "Contract amount cannot reduce milestone capacity below existing cost allocations."})
 
     def __str__(self):
         return f"{self.task_id} - {self.direction} - {self.contract_amount} {self.currency}"
@@ -1889,6 +2067,15 @@ class PaymentMilestone(models.Model):
     blocks_task_delivery = models.BooleanField(default=False)
     blocks_progress_after_threshold = models.BooleanField(default=False)
     status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=STATUS_LOCKED)
+    manual_approved = models.BooleanField(default=False)
+    manual_approved_at = models.DateTimeField(null=True, blank=True)
+    manual_approved_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="+",
+    )
     description = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -1909,6 +2096,30 @@ class PaymentMilestone(models.Model):
 
     def clean(self):
         super().clean()
+        allocated = Decimal("0.00")
+        if self.pk:
+            existing = PaymentMilestone.objects.filter(pk=self.pk).first()
+            allocated = self.cost_allocations.aggregate(total=models.Sum("allocated_amount"))["total"] or Decimal("0.00")
+            if existing and allocated > 0:
+                if existing.sequence != self.sequence:
+                    raise ValidationError({"sequence": "Milestones with cost allocations cannot change sequence."})
+                if existing.financial_plan_id != self.financial_plan_id:
+                    raise ValidationError({"financial_plan": "Milestones with cost allocations cannot change financial plan."})
+                trigger_fields = {
+                    "trigger_type",
+                    "progress_threshold",
+                    "due_date",
+                    "blocks_task_start",
+                    "blocks_task_delivery",
+                    "blocks_progress_after_threshold",
+                    "manual_approved",
+                }
+                changed = [
+                    field for field in trigger_fields
+                    if getattr(existing, field) != getattr(self, field)
+                ]
+                if changed:
+                    raise ValidationError({field: "Milestones with cost allocations cannot change trigger fields." for field in changed})
         if self.amount_type == self.AMOUNT_PERCENTAGE:
             if self.percentage is None:
                 raise ValidationError("Percentage is required for percentage milestones.")
@@ -1930,6 +2141,13 @@ class PaymentMilestone(models.Model):
                 raise ValidationError("Progress threshold must be between 0 and 100.")
         if self.trigger_type == self.TRIGGER_FIXED_DATE and self.due_date is None:
             raise ValidationError("Due date is required for fixed date milestones.")
+        if allocated > 0:
+            if self.amount_type == self.AMOUNT_FIXED:
+                capacity = self.fixed_amount or Decimal("0.00")
+            else:
+                capacity = Decimal(self.financial_plan.contract_amount) * Decimal(self.percentage or 0) / Decimal("100")
+            if capacity < allocated:
+                raise ValidationError({"allocated_amount": "Milestone capacity cannot be reduced below existing cost allocations."})
 
     @property
     def has_transactions(self):
@@ -1937,6 +2155,58 @@ class PaymentMilestone(models.Model):
 
     def __str__(self):
         return f"{self.financial_plan_id} / {self.sequence} - {self.title}"
+
+
+class CostTransactionMilestoneAllocation(models.Model):
+    cost_transaction = models.ForeignKey(
+        CostTransaction,
+        on_delete=models.CASCADE,
+        related_name="milestone_allocations",
+    )
+    milestone = models.ForeignKey(
+        PaymentMilestone,
+        on_delete=models.PROTECT,
+        related_name="cost_allocations",
+    )
+    allocated_amount = models.DecimalField(max_digits=16, decimal_places=2)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["cost_transaction", "milestone__sequence", "milestone_id"]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(allocated_amount__gt=0), name="cost_milestone_alloc_amount_positive"),
+            models.UniqueConstraint(fields=["cost_transaction", "milestone"], name="unique_cost_transaction_milestone_allocation"),
+        ]
+        indexes = [
+            models.Index(fields=["cost_transaction", "milestone"]),
+            models.Index(fields=["milestone"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.allocated_amount is not None and self.allocated_amount <= 0:
+            raise ValidationError({"allocated_amount": "Allocated amount must be greater than zero."})
+        if not self.cost_transaction_id or not self.milestone_id:
+            return
+        if not self.cost_transaction.financial_plan_id:
+            raise ValidationError({"cost_transaction": "Cost transaction must be linked to a financial plan before milestone allocation."})
+        if self.milestone.financial_plan_id != self.cost_transaction.financial_plan_id:
+            raise ValidationError({"milestone": "Milestone must belong to the cost transaction financial plan."})
+
+        transaction_total = self.cost_transaction.milestone_allocations.exclude(pk=self.pk).aggregate(total=models.Sum("allocated_amount"))["total"] or Decimal("0.00")
+        if transaction_total + (self.allocated_amount or Decimal("0.00")) > self.cost_transaction.amount:
+            raise ValidationError({"allocated_amount": "Total milestone allocations cannot exceed the cost transaction amount."})
+        milestone_total = self.milestone.cost_allocations.exclude(pk=self.pk).aggregate(total=models.Sum("allocated_amount"))["total"] or Decimal("0.00")
+        if self.milestone.amount_type == PaymentMilestone.AMOUNT_FIXED:
+            capacity = self.milestone.fixed_amount or Decimal("0.00")
+        else:
+            capacity = Decimal(self.milestone.financial_plan.contract_amount) * Decimal(self.milestone.percentage or 0) / Decimal("100")
+        if milestone_total + (self.allocated_amount or Decimal("0.00")) > capacity:
+            raise ValidationError({"allocated_amount": "Total milestone allocations cannot exceed milestone capacity."})
+
+    def __str__(self):
+        return f"{self.cost_transaction_id} -> {self.milestone_id}: {self.allocated_amount}"
 
 
 class PaymentTransaction(models.Model):
@@ -1952,6 +2222,7 @@ class PaymentTransaction(models.Model):
     milestone = models.ForeignKey(PaymentMilestone, on_delete=models.PROTECT, related_name="transactions")
     transaction_type = models.CharField(max_length=16, choices=TRANSACTION_TYPE_CHOICES)
     amount = models.DecimalField(max_digits=18, decimal_places=2)
+    currency = models.CharField(max_length=8, null=True, blank=True, db_index=True)
     transaction_date = models.DateField()
     reference_number = models.CharField(max_length=100, blank=True)
     description = models.TextField(blank=True)
