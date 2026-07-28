@@ -120,3 +120,25 @@ class VarianceReportDimensionTests(APITestCase):
         irr = self.create_report(dimension=VarianceReport.DIMENSION_COST, currency="IRR")
         usd = self.create_report(dimension=VarianceReport.DIMENSION_COST, currency="USD")
         self.assertNotEqual(irr.pk, usd.pk)
+
+    def test_cost_evm_series_uses_each_cost_snapshot_report_date(self):
+        yesterday = self.today - timedelta(days=1)
+        self.create_report(dimension=VarianceReport.DIMENSION_COST, day=yesterday, ev=Decimal("10.00"), currency="IRR")
+        self.create_report(dimension=VarianceReport.DIMENSION_COST, day=self.today, ev=Decimal("30.00"), currency="IRR")
+
+        response = api(self.viewer).get(self.url, {
+            "revision_id": self.revision.id,
+            "dimension": "cost",
+            "currency": "IRR",
+            "page": 1,
+            "page_size": 10,
+        })
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(
+            response.data["series"],
+            [
+                {"date": yesterday.isoformat(), "plannedValue": 20.0, "earnedValue": 10.0, "actualCost": 5.0},
+                {"date": self.today.isoformat(), "plannedValue": 20.0, "earnedValue": 30.0, "actualCost": 5.0},
+            ],
+        )

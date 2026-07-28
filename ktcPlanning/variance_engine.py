@@ -252,6 +252,10 @@ class EVMEngine:
             task_id_set = {str(item) for item in task_ids}
             active_tvs = [tv for tv in active_tvs if str(tv.task_id) in task_id_set]
         active_task_ids = [tv.task_id for tv in active_tvs]
+        wbs_codes = {}
+        for tv in active_tvs:
+            if tv.wbs_node_id and tv.wbs_node_id not in wbs_codes:
+                wbs_codes[tv.wbs_node_id] = tv.wbs_node.wbs_code
 
         baseline_tvs = {}
         if self.baseline_rev:
@@ -335,7 +339,7 @@ class EVMEngine:
                 'tcpi_bac': _decimal_string(metrics['tcpi_bac']),
                 'action_required': metrics['action_required'],
                 'task_name': task_version.title,
-                'task_code': task_version.wbs_node.wbs_code if task_version.wbs_node_id else 'N/A',
+                'task_code': wbs_codes.get(task_version.wbs_node_id, 'N/A') if task_version.wbs_node_id else 'N/A',
                 'wbs_node_id': task_version.wbs_node_id,
                 'dimension': 'cost',
                 'status_date': self.data_datetime.date().isoformat(),

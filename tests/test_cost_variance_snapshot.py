@@ -122,6 +122,38 @@ class CostVarianceSnapshotTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         self.assertIn("missing_cost_evm_snapshot", {item["code"] for item in response.data["warnings"]})
 
+    def test_payment_only_currency_does_not_require_cost_snapshot(self):
+        payment_task, _ = make_task(self.project, self.revision, title="Payment Currency Task")
+        plan = TaskFinancialPlan.objects.create(
+            task=payment_task,
+            direction=TaskFinancialPlan.DIRECTION_PAYABLE,
+            contract_amount=Decimal("100.00"),
+            currency="IRR",
+            status=TaskFinancialPlan.STATUS_ACTIVE,
+            created_by=self.admin,
+        )
+        milestone = PaymentMilestone.objects.create(
+            financial_plan=plan,
+            title="Payment Currency Gate",
+            sequence=1,
+            trigger_type=PaymentMilestone.TRIGGER_MANUAL,
+            amount_type=PaymentMilestone.AMOUNT_FIXED,
+            fixed_amount=Decimal("100.00"),
+        )
+        PaymentTransaction.objects.create(
+            milestone=milestone,
+            transaction_type=PaymentTransaction.TYPE_PAYMENT,
+            amount=Decimal("10.00"),
+            currency="USD",
+            transaction_date=timezone.localdate(),
+            created_by=self.admin,
+        )
+        response = api(self.admin).get(self.url, {"project_id": self.project.id, "task_id": payment_task.id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        codes = {item["code"] for item in response.data["warnings"]}
+        self.assertIn("payment_currency_differs_from_plan", codes)
+        self.assertNotIn("missing_cost_evm_snapshot", codes)
+
     def test_permission_denied_and_task_project_mismatch(self):
         denied = api(self.outsider).post(self.generate_url, {"project_id": self.project.id, "status_date": timezone.localdate().isoformat(), "currency": "IRR"}, format="json")
         self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)

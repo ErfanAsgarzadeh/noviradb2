@@ -42,6 +42,7 @@ class FinancialControlCurrencyTests(TestCase):
         self.today = timezone.localdate()
         self.url = reverse("financial-control")
         self.convert_url = reverse("financial-control-convert")
+        self.rate_url = reverse("financial-control-exchange-rate")
         for code in ["IRR", "USD", "EUR"]:
             Currency.objects.get_or_create(code=code, defaults={"name": code, "symbol": code})
         self.resource = Resource.objects.create(code="CUR-COST", name="Currency Cost", resource_type=Resource.COST)
@@ -105,6 +106,11 @@ class FinancialControlCurrencyTests(TestCase):
         self.assertEqual(payload["currency_mode"], "converted")
         self.assertTrue(payload["converted_summary"]["is_fully_converted"])
         self.assertEqual(payload["converted_summary"]["recognized_cost"], "11.00")
+        self.assertFalse(ExchangeRate.objects.filter(source_currency="IRR", target_currency="USD").exists())
+
+        without_manual = self.converted(reporting_currency="USD")
+        self.assertFalse(without_manual["converted_summary"]["is_fully_converted"])
+        self.assertIn("missing_exchange_rate", {item["code"] for item in without_manual["warnings"]})
 
     def test_converted_mode_reports_missing_rates_without_zero_assumption(self):
         payload = self.converted(reporting_currency="EUR")
@@ -117,6 +123,42 @@ class FinancialControlCurrencyTests(TestCase):
         payload = self.converted(reporting_currency="USD")
         self.assertTrue(payload["converted_summary"]["is_fully_converted"])
         self.assertIn({"source_currency": "IRR", "target_currency": "USD", "rate": "0.0100000000"}, payload["converted_summary"]["rates"])
+
+    def test_saved_rial_rates_support_cross_currency_conversion(self):
+        ExchangeRate.objects.create(source_currency="USD", target_currency="IRR", rate=Decimal("500000.00"), effective_date=self.today - timedelta(days=1), created_by=self.admin)
+        ExchangeRate.objects.create(source_currency="EUR", target_currency="IRR", rate=Decimal("600000.00"), effective_date=self.today - timedelta(days=1), created_by=self.admin)
+        self.eur_task, self.eur_version = make_task(self.project, self.revision, title="EUR Cost Task")
+        eur_source = FundingSource.objects.create(title="EUR Source", source_type="CONTRACT", received_date=self.today, total_amount=Decimal("100.00"), currency="EUR", status="APPROVED", created_by=self.admin)
+        BudgetAllocation.objects.create(funding_source=eur_source, project=self.project, revision=self.revision, scope_type="TASK", wbs_node=self.eur_version.wbs_node, task=self.eur_task, cost_type="COST", allocated_amount=Decimal("100.00"), status="APPROVED", created_by=self.admin)
+        VarianceReport.objects.create(task=self.eur_task, revision=self.revision, report_date=self.today, dimension=VarianceReport.DIMENSION_COST, currency="EUR", budget_at_completion=Decimal("100.00"), planned_value=Decimal("10.00"), earned_value=Decimal("10.00"), actual_cost=Decimal("0.00"))
+
+        payload = self.converted(reporting_currency="USD")
+        eur_rate = next(item for item in payload["converted_summary"]["rates"] if item["source_currency"] == "EUR")
+        self.assertEqual(eur_rate, {"source_currency": "EUR", "target_currency": "USD", "rate": "1.2000000000"})
+
+    def test_exchange_rate_save_permissions_and_validation(self):
+        denied = api(self.viewer).post(
+            self.rate_url,
+            {"source_currency": "IRR", "target_currency": "USD", "rate": "0.01", "effective_date": self.today.isoformat()},
+            format="json",
+        )
+        self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
+
+        for payload in [
+            {"source_currency": "IRR", "target_currency": "USD", "rate": "bad", "effective_date": self.today.isoformat()},
+            {"source_currency": "IRR", "target_currency": "USD", "rate": "0", "effective_date": self.today.isoformat()},
+            {"source_currency": "IRR", "target_currency": "IRR", "rate": "1", "effective_date": self.today.isoformat()},
+        ]:
+            response = api(self.admin).post(self.rate_url, payload, format="json")
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+
+        saved = api(self.admin).post(
+            self.rate_url,
+            {"source_currency": "IRR", "target_currency": "USD", "rate": "0.01", "effective_date": self.today.isoformat()},
+            format="json",
+        )
+        self.assertEqual(saved.status_code, status.HTTP_201_CREATED, saved.data)
+        self.assertEqual(saved.data["created_by"], self.admin.id)
 
     def test_financial_control_get_does_not_create_cost_snapshots(self):
         before = VarianceReport.objects.filter(dimension=VarianceReport.DIMENSION_COST).count()

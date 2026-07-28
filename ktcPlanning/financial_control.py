@@ -58,7 +58,7 @@ ORDERING_FIELDS = {
 }
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
-BASE_CURRENCY_CODE = "USD"
+BASE_CURRENCY_CODE = "IRR"
 AMOUNT_FIELDS = [
     "approved_budget",
     "recognized_cost",
@@ -819,7 +819,12 @@ def build_financial_control_payload(user, params):
                 task_warnings.append(_warning("paid_amount_exceeds_contract", "critical", task.id, f"Paid amount exceeds contract value in {code}."))
             if outstanding_payment < ZERO:
                 task_warnings.append(_warning("negative_outstanding_payment", "critical", task.id, f"Outstanding payment is negative in {code}."))
-            if (task.id, code) not in evm_by_task_currency:
+            needs_cost_evm_snapshot = (
+                approved_budget > ZERO
+                or recognized_cost > ZERO
+                or allocated_cost > ZERO
+            )
+            if needs_cost_evm_snapshot and (task.id, code) not in evm_by_task_currency:
                 task_warnings.append(_warning("missing_cost_evm_snapshot", "warning", task.id, f"No Cost EVM snapshot is available for this task in {code}."))
         if delivery and delivery.status == TaskDelivery.STATUS_SUBMITTED:
             task_warnings.append(_warning("delivery_pending_approval", "warning", task.id, "Delivery is submitted and waiting for approval."))

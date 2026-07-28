@@ -5,6 +5,7 @@ from django.utils import timezone
 from django.utils.text import get_valid_filename
 from decimal import Decimal
 import os
+import re
 
 from .models import *
 from .calendar import CalendarEngine
@@ -997,6 +998,14 @@ class FundingSourceSerializer(serializers.ModelSerializer):
             'rejection_reason', 'created_at',
         ]
 
+    def validate_currency(self, value):
+        normalized = str(value or '').strip().upper()
+        if not normalized:
+            raise serializers.ValidationError('Currency is required.')
+        if not re.fullmatch(r'[A-Z0-9]{3,8}', normalized):
+            raise serializers.ValidationError('Use a 3-8 character currency code.')
+        return normalized
+
     def validate_total_amount(self, value):
         if value <= 0:
             raise serializers.ValidationError('Funding amount must be greater than zero.')
@@ -1013,6 +1022,7 @@ class BudgetAllocationSerializer(serializers.ModelSerializer):
     borrowed_out_amount = serializers.SerializerMethodField()
     effective_amount = serializers.SerializerMethodField()
     funding_source_title = serializers.CharField(source='funding_source.title', read_only=True)
+    currency = serializers.CharField(source='funding_source.currency', read_only=True)
     project_name = serializers.CharField(source='project.name', read_only=True)
     task_title = serializers.SerializerMethodField()
     wbs_title = serializers.CharField(source='wbs_node.title', read_only=True, default=None)
@@ -1026,7 +1036,7 @@ class BudgetAllocationSerializer(serializers.ModelSerializer):
     class Meta:
         model = BudgetAllocation
         fields = [
-            'id', 'funding_source', 'funding_source_title',
+            'id', 'funding_source', 'funding_source_title', 'currency',
             'parent_allocation',
             'project', 'project_name', 'revision',
             'scope_type', 'wbs_node', 'wbs_title', 'task', 'task_title',
@@ -1313,6 +1323,8 @@ class BudgetBorrowSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({'to_allocation': 'Borrow source and destination cannot be the same allocation.'})
                 if to_allocation.status != 'APPROVED':
                     raise serializers.ValidationError({'to_allocation': 'Budget borrow requires an approved destination allocation.'})
+                if from_allocation.funding_source.currency != to_allocation.funding_source.currency:
+                    raise serializers.ValidationError({'to_allocation': 'Budget borrow destination must use the same currency as the source allocation.'})
             else:
                 if not destination_scope_type:
                     raise serializers.ValidationError({'destination_scope_type': 'Destination scope type is required when destination allocation is new.'})

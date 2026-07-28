@@ -164,7 +164,6 @@ WSGI_APPLICATION = 'KTCProject.wsgi.application'
 _DB_ENGINE = os.environ.get('DB_ENGINE', 'postgres').lower()
 
 if _DB_ENGINE in ('sqlite', 'sqlite3'):
-    print('sqlitttttt')
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',

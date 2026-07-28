@@ -2820,7 +2820,70 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
             return str(task.project_id) if task else None
         return None
 
-    def _cost_series(self, rows):
+    def _cost_snapshot_queryset(self, request, project_id):
+        queryset = VarianceReport.objects.filter(
+            revision__project_id=project_id,
+            revision__project_id__in=accessible_project_ids(request.user),
+            dimension=VarianceReport.DIMENSION_COST,
+        )
+        revision_id = request.query_params.get('revision_id')
+        if revision_id:
+            queryset = queryset.filter(revision_id=revision_id)
+        task_id = request.query_params.get('task_id')
+        if task_id:
+            queryset = queryset.filter(task_id=task_id)
+        currency = (request.query_params.get('currency') or '').strip().upper()
+        if currency:
+            queryset = queryset.filter(currency=currency)
+
+        status_date_value = request.query_params.get('status_date')
+        if status_date_value:
+            try:
+                queryset = queryset.filter(report_date__lte=parse_cpm_data_date(status_date_value).date())
+            except ValueError:
+                return VarianceReport.objects.none()
+
+        wbs_node_id = request.query_params.get('wbs_node_id')
+        if wbs_node_id:
+            wbs_queryset = WBSNodeVersion.objects.filter(node_id=wbs_node_id, is_deleted=False)
+            if revision_id:
+                wbs_queryset = wbs_queryset.filter(revision_id=revision_id)
+            wbs_version = wbs_queryset.first()
+            if wbs_version:
+                scoped_wbs_ids = wbs_version.get_descendants(include_self=True).values_list('id', flat=True)
+                queryset = queryset.filter(
+                    task__versions__revision_id=F('revision_id'),
+                    task__versions__wbs_node_id__in=scoped_wbs_ids,
+                ).distinct()
+            else:
+                queryset = queryset.none()
+
+        search = (request.query_params.get('search') or '').strip()
+        if search:
+            queryset = queryset.filter(
+                Q(task__versions__title__icontains=search, task__versions__revision_id=F('revision_id')) |
+                Q(task__versions__wbs_node__wbs_code__icontains=search, task__versions__revision_id=F('revision_id'))
+            ).distinct()
+        return queryset
+
+    def _cost_series(self, request, rows, project_id):
+        snapshot_rows = self._cost_snapshot_queryset(request, project_id).order_by('report_date').values('report_date').annotate(
+            total_pv=Sum('planned_value'),
+            total_ev=Sum('earned_value'),
+            total_ac=Sum('actual_cost'),
+        )
+        series = [
+            {
+                'date': item['report_date'].isoformat() if item['report_date'] else None,
+                'plannedValue': float(item['total_pv'] or Decimal('0')),
+                'earnedValue': float(item['total_ev'] or Decimal('0')),
+                'actualCost': float(item['total_ac'] or Decimal('0')),
+            }
+            for item in snapshot_rows
+        ]
+        if series:
+            return series
+
         totals = self._cost_summary(rows)
         dates = sorted({row.get('report_date') for row in rows if row.get('report_date')})
         return [
@@ -2927,7 +2990,7 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
         return Response({
             'results': page_rows,
             'summary': self._cost_summary(rows),
-            'series': self._cost_series(rows),
+            'series': self._cost_series(request, rows, project_id),
             'page': page,
             'pageSize': page_size,
             'total': total,
