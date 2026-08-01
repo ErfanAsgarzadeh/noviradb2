@@ -63,6 +63,17 @@ Last updated: 2026-08-01
 | Meeting Playwright spec | Blocked | Auth setup failed due missing `NOVIRA_E2E_PASSWORD`; 4 meeting tests did not run. |
 | Full frontend lint | Baseline failed | 99 errors, 107 warnings in pre-existing files. |
 
+## Phase 6 Executed Tests
+
+| Suite | Status | Notes |
+| --- | --- | --- |
+| Scoped frontend lint | Passed | Reporting dashboard files and E2E spec passed. |
+| Frontend typecheck | Passed | `npx.cmd tsc --noEmit` passed. |
+| Backend reporting/permission tests | Passed | 4 passed. |
+| Frontend build | Passed | `npm.cmd run build` passed. |
+| Meeting Playwright spec | Blocked | Auth setup failed due missing `NOVIRA_E2E_PASSWORD`; 5 meeting tests did not run. |
+| Full frontend lint | Baseline failed | 99 errors, 107 warnings in pre-existing files. |
+
 ## Planned Backend Tests
 
 - `tests/meeting_management/test_models.py`

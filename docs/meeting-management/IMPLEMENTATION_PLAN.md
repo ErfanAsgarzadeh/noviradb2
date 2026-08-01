@@ -4,7 +4,7 @@ Last updated: 2026-08-01
 
 ## Current Phase
 
-Phase 5 - Frontend operational workflows: completed; Phase 6 starting.
+Phase 6 - Dashboards, exports, and printable minutes: completed; Phase 7 starting.
 
 ## Repository Map
 

@@ -234,3 +234,39 @@ Failures and fixes:
 Remaining known limitations:
 
 - Operational UI uses compact forms and panels; advanced rich editors, file upload controls, and audit event drill-down need further refinement.
+
+Commit:
+
+- `0328b52` - Add meeting operational workflow panels
+
+## 2026-08-01 - Phase 6 Dashboards, Exports, Printable Minutes, And KPI Explanations
+
+Changes made:
+
+- Added report dashboard panels for individual, unit, and executive meeting/action KPIs.
+- Added a unit filter and drill-down style KPI tables backed by the meeting report API.
+- Added Excel export from the reporting dashboard using the existing `xlsx` dependency.
+- Added printable meeting minutes support from the meeting detail view.
+- Added KPI explanation copy in the reporting view.
+- Expanded the mocked Playwright spec to cover report sections and the export control.
+
+Commands:
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| `npm.cmd run lint -- components/meeting-management tests/e2e/meeting-management.spec.ts` | 0 | Passed. |
+| `npx.cmd tsc --noEmit` | 0 | Passed. |
+| `DB_ENGINE=sqlite python -m pytest tests/meeting_management/test_reporting.py tests/meeting_management/test_permissions.py` | 0 | 4 passed. |
+| `npm.cmd run build` | 0 | Passed. |
+| `npx.cmd playwright test tests/e2e/meeting-management.spec.ts --project=phase1e` | 1 | Auth setup failed due missing `NOVIRA_E2E_PASSWORD`; 5 meeting tests did not run. |
+| `npm.cmd run lint -- --format json -o artifacts/phase6-eslint.json` | 1 | 99 errors, 107 warnings in pre-existing files. |
+
+Failures and fixes:
+
+- No new scoped lint, typecheck, build, or backend reporting failures.
+- Playwright remains blocked by the missing auth secret.
+- Full lint remains verified pre-existing debt outside the meeting-management files.
+
+Remaining known limitations:
+
+- Browser-level report export behavior is implemented and type/build validated, but cannot be exercised in the authenticated Playwright suite until credentials are provided.
