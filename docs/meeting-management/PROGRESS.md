@@ -81,3 +81,38 @@ Remaining known limitations:
 
 - PostgreSQL validation has not run because no disposable PostgreSQL service has been confirmed.
 - Phase 1 does not yet expose APIs or workflow services; these are planned for Phases 2 and 3.
+
+Commit:
+
+- `a32c4c9` - Add meeting management domain foundation
+
+## 2026-08-01 - Phase 2 Resolutions, Actions, Tracking, And Workflow Services
+
+Changes made:
+
+- Added resolution/action models: `MeetingDecision`, `Resolution`, `ResolutionAction`, RACI role assignments, assignment history, dependencies, progress reports, evidence attachments, completion submissions, deadline change requests, workflow instances/tasks, and notifications.
+- Added constraints and indexes for progress range, due date ordering, action numbering, dependency uniqueness/self-dependency, role assignment uniqueness, and notification idempotency.
+- Added explicit workflow services for meeting/minutes transitions, progress submission, completion review, deadline changes, dependency cycle prevention, audit logging, and notification generation.
+- Added idempotent management command `generate_meeting_notifications`.
+- Added focused tests for services, dependencies, and notifications.
+
+Commands:
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| `DB_ENGINE=sqlite python manage.py makemigrations meeting_management` | 0 | Created `0002_meetingdecision_resolution_resolutionaction_and_more.py`. |
+| `DB_ENGINE=sqlite python manage.py check` | 0 | Passed. |
+| `DB_ENGINE=sqlite python manage.py makemigrations --check --dry-run` | 0 | Passed; no changes detected. |
+| `DB_ENGINE=sqlite python -m pytest tests/meeting_management/test_services.py tests/meeting_management/test_dependencies.py tests/meeting_management/test_notifications.py` | 1 then 0 | Initial factory error fixed; rerun 10 passed. |
+| `DB_ENGINE=sqlite python -m pytest tests/meeting_management` | 0 | 19 passed. |
+| `DB_ENGINE=sqlite python -m pytest` | 1 | 486 passed, 1 failed, 12 skipped. |
+
+Failures and fixes:
+
+- Initial notification test failed because the test factory created an overdue action with `planned_start` after `original_due_date`; fixed factory to set planned start before due date.
+- Full backend suite failure remains the verified pre-existing SQLite concurrency issue in `tests/test_engineering_phase1f_b_sequence.py`.
+
+Remaining known limitations:
+
+- API/permission/reporting endpoints are not implemented until Phase 3.
+- PostgreSQL validation still not run; no disposable service confirmed.

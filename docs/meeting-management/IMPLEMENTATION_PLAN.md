@@ -4,7 +4,7 @@ Last updated: 2026-08-01
 
 ## Current Phase
 
-Phase 1 - Backend domain foundation: completed; Phase 2 starting.
+Phase 2 - Resolutions, actions, tracking, and workflow services: completed; Phase 3 starting.
 
 ## Repository Map
 

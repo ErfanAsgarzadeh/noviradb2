@@ -18,7 +18,7 @@ Primary packages:
 - `admin.py`: initial operational admin registration.
 - `management/commands/generate_meeting_notifications.py`: deterministic notification run.
 
-Phase 1 implemented the governance, meeting, participation, agenda, and minutes-version model layer. Resolution/action workflow, services, API, reporting, and frontend layers follow in later phases.
+Phase 1 implemented the governance, meeting, participation, agenda, and minutes-version model layer. Phase 2 added the resolution/action execution chain, workflow services, audit calls, notifications, and deterministic notification command. API, reporting, and frontend layers follow in later phases.
 
 ## ERD-Level Model Groups
 
