@@ -281,8 +281,8 @@ class TestCostTransactionDirectAmount:
     @pytest.mark.parametrize(
         ("field", "value", "expected_error"),
         [
-            ("task", None, "financial_plan"),
-            ("project", None, "financial_plan"),
+            ("task", None, "task"),
+            ("project", None, "project"),
             ("transaction_type", "LABOR", "transaction_type"),
         ],
     )

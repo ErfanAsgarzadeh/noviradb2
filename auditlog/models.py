@@ -56,6 +56,9 @@ class AuditEvent(models.Model):
     request_method = models.CharField(max_length=8, blank=True, default='')
     request_path = models.CharField(max_length=512, blank=True, default='')
     status_code = models.PositiveSmallIntegerField(null=True, blank=True)
+    request_id = models.CharField(max_length=80, blank=True, default='', db_index=True)
+    correlation_id = models.CharField(max_length=80, blank=True, default='', db_index=True)
+    command_id = models.CharField(max_length=120, blank=True, default='', db_index=True)
 
     # نتیجه
     success = models.BooleanField(default=True, db_index=True)
@@ -71,6 +74,16 @@ class AuditEvent(models.Model):
         ]
         verbose_name = 'رویداد لاگ'
         verbose_name_plural = 'رویدادهای لاگ'
+
+    def save(self, *args, **kwargs):
+        if self.pk and AuditEvent.objects.filter(pk=self.pk).exists():
+            from django.core.exceptions import ValidationError
+            raise ValidationError({'audit': 'Audit events are append-only and immutable.'})
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        from django.core.exceptions import ValidationError
+        raise ValidationError({'audit': 'Audit events cannot be deleted.'})
 
     def __str__(self):
         who = self.actor_username or '—'

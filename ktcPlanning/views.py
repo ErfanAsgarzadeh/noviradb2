@@ -26,7 +26,7 @@ from .models import Project, Revision, WBSNodeVersion, TaskVersion, Dependency, 
     ResourceException, ResourceRate, VarianceReport, Calendar, ProjectViewer, SystemSettings, UnitOfMeasure, \
     ExpenseType, FundingSource, BudgetAllocation, BudgetBorrow, UnfundedForecastCost, CostTransaction, TaskReportAttachment, BudgetConsumption, TaskFinancialPlan, PaymentMilestone, PaymentTransaction, Currency, ExchangeRate, \
     TaskDeliveryAttachment, \
-    GlobalLevelingRun, LevelingPlanProject, TaskLevelingMetrics, ResourceUsage, TaskDelivery
+    GlobalLevelingRun, LevelingPlanProject, TaskLevelingMetrics, ResourceUsage, TaskDelivery, Program, ProjectMember, ProjectDeliverable, ProjectMilestone, ProjectBaselineSnapshot, ProjectManufacturingRequirement, ProjectProcurementRequirement, ProjectMakeBuyDecision, ProjectDownstreamLink, ProjectProgressSnapshot, ProjectForecastSnapshot, ProjectImpactEvent
 from .serializers import (
     ProjectSerializer,
     RevisionSerializer,
@@ -40,7 +40,8 @@ from .serializers import (
     ResourceExceptionSerializer, ResourceRateSerializer, AssignmentSerializer, VarianceReportSerializer,
     CalendarSerializer, ProjectViewerSerializer, SystemSettingsSerializer, UnitOfMeasureSerializer,
     ExpenseTypeSerializer, FundingSourceSerializer, BudgetAllocationSerializer, BudgetBorrowSerializer, UnfundedForecastCostSerializer,
-    CostTransactionSerializer, TaskDropdownSerializer, ResourceLevelingPlanSerializer, TaskFinancialPlanSerializer, PaymentMilestoneSerializer, PaymentTransactionSerializer, PlanPaymentAllocationSerializer, TaskDeliveryAttachmentSerializer, TaskDeliverySerializer
+    CostTransactionSerializer, TaskDropdownSerializer, ResourceLevelingPlanSerializer, TaskFinancialPlanSerializer, PaymentMilestoneSerializer, PaymentTransactionSerializer, PlanPaymentAllocationSerializer, TaskDeliveryAttachmentSerializer, TaskDeliverySerializer,
+    ProgramSerializer, ProjectMemberSerializer, ProjectDeliverableSerializer, ProjectMilestoneSerializer, ProjectBaselineSnapshotSerializer, ProjectManufacturingRequirementSerializer, ProjectProcurementRequirementSerializer, ProjectMakeBuyDecisionSerializer, ProjectDownstreamLinkSerializer, ProjectProgressSnapshotSerializer, ProjectForecastSnapshotSerializer, ProjectImpactEventSerializer
 )
 
 
@@ -90,8 +91,188 @@ from .revision_policy import (
     official_revision_ids, promote_approved_revision,
     resolve_designated_approver,
 )
+from .project_phase14_services import (
+    ProjectPhase14Conflict,
+    approve_make_buy_decision,
+    approve_manufacturing_requirement,
+    approve_procurement_requirement,
+    approve_project_baseline,
+    convert_manufacturing_requirement_to_demand,
+    convert_procurement_requirement_to_requisition,
+    create_forecast_snapshot,
+    create_progress_snapshot,
+    next_number,
+    project_dashboard,
+)
 from django.contrib.auth import get_user_model
 User = get_user_model()
+
+
+def phase14_error_response(exc):
+    if isinstance(exc, ProjectPhase14Conflict):
+        return Response(exc.payload, status=status.HTTP_409_CONFLICT)
+    if isinstance(exc, DjangoValidationError):
+        return Response(exc.message_dict if hasattr(exc, 'message_dict') else {'detail': exc.messages}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(getattr(exc, 'detail', {'detail': str(exc)}), status=status.HTTP_400_BAD_REQUEST)
+
+
+class ProgramViewSet(viewsets.ModelViewSet):
+    queryset = Program.objects.select_related('owner', 'sponsor').all()
+    serializer_class = ProgramSerializer
+    permission_classes = [IsAuthenticated]
+
+
+class ProjectMemberViewSet(viewsets.ModelViewSet):
+    serializer_class = ProjectMemberSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectMember.objects.select_related('project', 'user').filter(project_id__in=accessible_project_ids(self.request.user))
+
+
+class ProjectDeliverableViewSet(viewsets.ModelViewSet):
+    serializer_class = ProjectDeliverableSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectDeliverable.objects.select_related('project', 'activity', 'item_revision__item', 'document_revision').filter(project_id__in=accessible_project_ids(self.request.user))
+
+    @action(detail=True, methods=['post'])
+    def accept(self, request, pk=None):
+        deliverable = self.get_object()
+        deliverable.acceptance_status = ProjectDeliverable.STATUS_ACCEPTED
+        deliverable.accepted_by = request.user
+        deliverable.accepted_at = timezone.now()
+        deliverable.deliverable_version += 1
+        deliverable.save(update_fields=['acceptance_status', 'accepted_by', 'accepted_at', 'deliverable_version', 'updated_at'])
+        return Response(self.get_serializer(deliverable).data)
+
+
+class ProjectMilestoneViewSet(viewsets.ModelViewSet):
+    serializer_class = ProjectMilestoneSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectMilestone.objects.select_related('project', 'activity', 'owner').filter(project_id__in=accessible_project_ids(self.request.user))
+
+
+class ProjectBaselineSnapshotViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = ProjectBaselineSnapshotSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectBaselineSnapshot.objects.select_related('project', 'revision', 'approved_by').filter(project_id__in=accessible_project_ids(self.request.user))
+
+
+class ProjectManufacturingRequirementViewSet(viewsets.ModelViewSet):
+    serializer_class = ProjectManufacturingRequirementSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectManufacturingRequirement.objects.select_related('project', 'activity', 'deliverable', 'item_revision__item', 'bom_revision', 'opc_diagram', 'warehouse', 'plant', 'converted_demand').filter(project_id__in=accessible_project_ids(self.request.user))
+
+    def perform_create(self, serializer):
+        serializer.save(requirement_number=next_number(ProjectManufacturingRequirement, 'requirement_number', f'PMR-{timezone.now():%Y}-'))
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        try:
+            req = approve_manufacturing_requirement(self.get_object(), actor=request.user, expected_version=request.data.get('expected_version'))
+            return Response(self.get_serializer(req).data)
+        except Exception as exc:
+            return phase14_error_response(exc)
+
+    @action(detail=True, methods=['post'])
+    def convert(self, request, pk=None):
+        try:
+            demand = convert_manufacturing_requirement_to_demand(self.get_object(), actor=request.user, expected_version=request.data.get('expected_version'), idempotency_key=request.data.get('idempotency_key', ''))
+            return Response({'planning_demand': str(demand.pk), 'demand_number': demand.demand_number, 'status': demand.status})
+        except Exception as exc:
+            return phase14_error_response(exc)
+
+
+class ProjectProcurementRequirementViewSet(viewsets.ModelViewSet):
+    serializer_class = ProjectProcurementRequirementSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectProcurementRequirement.objects.select_related('project', 'activity', 'deliverable', 'item_revision__item', 'warehouse', 'converted_requisition').filter(project_id__in=accessible_project_ids(self.request.user))
+
+    def perform_create(self, serializer):
+        serializer.save(requirement_number=next_number(ProjectProcurementRequirement, 'requirement_number', f'PPR-{timezone.now():%Y}-'))
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        try:
+            req = approve_procurement_requirement(self.get_object(), actor=request.user, expected_version=request.data.get('expected_version'))
+            return Response(self.get_serializer(req).data)
+        except Exception as exc:
+            return phase14_error_response(exc)
+
+    @action(detail=True, methods=['post'])
+    def convert(self, request, pk=None):
+        try:
+            requisition = convert_procurement_requirement_to_requisition(self.get_object(), actor=request.user, expected_version=request.data.get('expected_version'), idempotency_key=request.data.get('idempotency_key', ''))
+            return Response({'purchase_requisition': str(requisition.pk), 'requisition_number': requisition.requisition_number, 'status': requisition.status})
+        except Exception as exc:
+            return phase14_error_response(exc)
+
+
+class ProjectMakeBuyDecisionViewSet(viewsets.ModelViewSet):
+    serializer_class = ProjectMakeBuyDecisionSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectMakeBuyDecision.objects.select_related('project', 'manufacturing_requirement', 'procurement_requirement').filter(project_id__in=accessible_project_ids(self.request.user))
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        try:
+            decision = approve_make_buy_decision(self.get_object(), actor=request.user)
+            return Response(self.get_serializer(decision).data)
+        except Exception as exc:
+            return phase14_error_response(exc)
+
+
+class ProjectDownstreamLinkViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = ProjectDownstreamLinkSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectDownstreamLink.objects.select_related('project', 'activity', 'deliverable').filter(project_id__in=accessible_project_ids(self.request.user))
+
+
+class ProjectProgressSnapshotViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = ProjectProgressSnapshotSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectProgressSnapshot.objects.select_related('project', 'created_by').filter(project_id__in=accessible_project_ids(self.request.user))
+
+
+class ProjectForecastSnapshotViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = ProjectForecastSnapshotSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectForecastSnapshot.objects.select_related('project', 'created_by').filter(project_id__in=accessible_project_ids(self.request.user))
+
+
+class ProjectImpactEventViewSet(viewsets.ModelViewSet):
+    serializer_class = ProjectImpactEventSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectImpactEvent.objects.select_related('project', 'activity', 'deliverable').filter(project_id__in=accessible_project_ids(self.request.user))
+
+    @action(detail=True, methods=['post'])
+    def resolve(self, request, pk=None):
+        impact = self.get_object()
+        impact.active = False
+        impact.resolved_by = request.user
+        impact.resolved_at = timezone.now()
+        impact.save(update_fields=['active', 'resolved_by', 'resolved_at'])
+        return Response(self.get_serializer(impact).data)
 
 
 class FinancialControlView(APIView):
@@ -592,6 +773,43 @@ class ProjectViewSet(viewsets.ModelViewSet):
             )
         return Response(self.get_serializer(project).data)
 
+    @action(detail=True, methods=['post'], url_path='approve-baseline')
+    def approve_phase14_baseline(self, request, pk=None):
+        project = self.get_object()
+        revision_id = request.data.get('revision') or request.data.get('revision_id') or project.working_revision_id or project.active_baseline_revision_id
+        revision = get_object_or_404(Revision, pk=revision_id, project=project, is_deleted=False)
+        try:
+            snapshot = approve_project_baseline(
+                actor=request.user,
+                project=project,
+                revision=revision,
+                expected_project_version=request.data.get('expected_project_version'),
+                change_summary=request.data.get('change_summary', ''),
+            )
+            return Response(ProjectBaselineSnapshotSerializer(snapshot).data)
+        except Exception as exc:
+            return phase14_error_response(exc)
+
+    @action(detail=True, methods=['post'], url_path='progress-snapshot')
+    def progress_snapshot(self, request, pk=None):
+        try:
+            snapshot = create_progress_snapshot(actor=request.user, project=self.get_object(), data_date=parse_cpm_data_date(request.data.get('data_date')) if request.data.get('data_date') else None)
+            return Response(ProjectProgressSnapshotSerializer(snapshot).data)
+        except Exception as exc:
+            return phase14_error_response(exc)
+
+    @action(detail=True, methods=['post'], url_path='forecast-snapshot')
+    def forecast_snapshot(self, request, pk=None):
+        try:
+            snapshot = create_forecast_snapshot(actor=request.user, project=self.get_object(), data_date=parse_cpm_data_date(request.data.get('data_date')) if request.data.get('data_date') else None)
+            return Response(ProjectForecastSnapshotSerializer(snapshot).data)
+        except Exception as exc:
+            return phase14_error_response(exc)
+
+    @action(detail=True, methods=['get'], url_path='phase14-dashboard')
+    def phase14_dashboard(self, request, pk=None):
+        return Response(project_dashboard(self.get_object()))
+
 
 class ProjectViewerViewSet(viewsets.ModelViewSet):
     """
@@ -666,7 +884,7 @@ class RevisionViewSet(viewsets.ModelViewSet):
         instance.is_deleted = True
         instance.save(update_fields=['is_deleted'])
     # --- ظ…طھط¯ ظ‚ظپظ„ ع©ط±ط¯ظ† ظ†ط³ط®ظ‡ ---
-    @action(detail=True, methods=['post'], url_path='approve')
+    @action(detail=True, methods=['post'], url_path='approve', url_name='approve')
     def approve_revision(self, request, pk=None):
         revision = self.get_object()
 
@@ -685,7 +903,7 @@ class RevisionViewSet(viewsets.ModelViewSet):
         return Response({"detail": "ظ†ط³ط®ظ‡ ط¨ط§ ظ…ظˆظپظ‚غŒطھ ظ‚ظپظ„ ط´ط¯."}, status=status.HTTP_200_OK)
 
     # --- ط§ط±ط³ط§ظ„ ط§ط·ظ„ط§ط¹ط§طھ ط¨ظ‡ ع¯ط§ظ†طھâ€Œع†ط§ط±طھ ---
-    @action(detail=True, methods=['get'], url_path='gantt-data')
+    @action(detail=True, methods=['get'], url_path='gantt-data', url_name='gantt-data')
     def get_gantt_data(self, request, pk=None):
         revision = self.get_object()
 
@@ -815,7 +1033,10 @@ class RevisionViewSet(viewsets.ModelViewSet):
             )
             old_to_new_wbs_map[old_node.id] = new_node
 
-        old_tasks = TaskVersion.objects.filter(revision=base_revision, is_deleted=False)
+        old_tasks = list(
+            TaskVersion.objects.filter(revision=base_revision, is_deleted=False)
+            .select_related('actual')
+        )
         new_tasks_to_create = []
 
         for old_task in old_tasks:
@@ -834,6 +1055,31 @@ class RevisionViewSet(viewsets.ModelViewSet):
                 )
             )
         TaskVersion.objects.bulk_create(new_tasks_to_create)
+
+        new_task_versions = {
+            task_version.task_id: task_version
+            for task_version in TaskVersion.objects.filter(
+                revision=new_revision,
+                task_id__in=[old_task.task_id for old_task in old_tasks],
+                is_deleted=False,
+            )
+        }
+        new_actuals_to_create = []
+        for old_task in old_tasks:
+            old_actual = getattr(old_task, 'actual', None)
+            new_task_version = new_task_versions.get(old_task.task_id)
+            if old_actual is None or new_task_version is None:
+                continue
+            new_actuals_to_create.append(
+                TaskActual(
+                    task_version=new_task_version,
+                    actual_start=old_actual.actual_start,
+                    actual_finish=old_actual.actual_finish,
+                    progress=old_actual.progress,
+                    updated_by=old_actual.updated_by,
+                )
+            )
+        TaskActual.objects.bulk_create(new_actuals_to_create)
 
         old_deps = Dependency.objects.filter(revision=base_revision)
         new_deps_to_create = []
@@ -867,7 +1113,7 @@ class RevisionViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(new_revision)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-    @action(detail=True, methods=['post'], url_path='run-cpm')
+    @action(detail=True, methods=['post'], url_path='run-cpm', url_name='run-cpm')
     def run_cpm_engine(self, request, pk=None):
         """
         ط§ط¬ط±ط§غŒ ظ…ظˆطھظˆط± ظ…ط­ط§ط³ط¨ط§طھغŒ ط²ظ…ط§ظ†â€Œط¨ظ†ط¯غŒ (CPM) ط±ظˆغŒ غŒع© ظ†ط³ط®ظ‡ ط®ط§طµ
@@ -1560,7 +1806,7 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
             response['Content-Type'] = attachment.file_type
         return response
 
-    @action(detail=True, methods=['post'], url_path='approve')
+    @action(detail=True, methods=['post'], url_path='approve', url_name='approve')
     def approve_report(self, request, pk=None):
         """
         طھط§غŒغŒط¯ظگ ع¯ط²ط§ط±ط´ (ط¯ظˆâ€Œظ…ط±ط­ظ„ظ‡â€Œط§غŒ):
@@ -1667,7 +1913,7 @@ class TaskReportLogViewSet(viewsets.ModelViewSet):
 
         return Response({"detail": "ظˆط¶ط¹غŒطھ ظ†ط§ظ…ط¹طھط¨ط±."}, status=status.HTTP_400_BAD_REQUEST)
 
-    @action(detail=True, methods=['post'], url_path='reject')
+    @action(detail=True, methods=['post'], url_path='reject', url_name='reject')
     def reject_report(self, request, pk=None):
         """ط±ط¯ظگ ع¯ط²ط§ط±ط´ طھظˆط³ط· ط¨ط±ط±ط³غŒâ€Œع©ظ†ظ†ط¯ظ‡ غŒط§ ظ…ط¯غŒط± ط¨ط±ظ†ط§ظ…ظ‡â€Œط±غŒط²غŒ."""
         report = self.get_object()
@@ -3035,25 +3281,29 @@ class VarianceReportViewSet(viewsets.ModelViewSet):
             'hasNext': start + len(serializer.data) < total,
         })
 
-    @action(detail=False, methods=['post'], url_path='calculate')
+    @action(detail=False, methods=['post'], url_path='calculate', url_name='calculate')
     def trigger_calculation(self, request):
         """ط§ط¬ط±ط§غŒ ط¯ط³طھغŒ ظ…ظˆطھظˆط± ظ…ط­ط§ط³ط¨ط§طھغŒ ط¨ط±ط§غŒ غŒع© ظ¾ط±ظˆعکظ‡"""
         project_id = request.data.get('project_id')
+        revision_id = request.data.get('revision_id')
         if not project_id:
             return Response({"error": "project_id ط§ظ„ط²ط§ظ…غŒ ط§ط³طھ."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             data_datetime = parse_cpm_data_date(request.data.get('dataDate'))
-            engine = EVMEngine(project_id=project_id, data_datetime=data_datetime)
+            engine = EVMEngine(project_id=project_id, data_datetime=data_datetime, revision_id=revision_id)
             result = engine.run_historical_task_level_variances()
             return Response({
                 "status": "ظ…ط­ط§ط³ط¨ط§طھ ط¨ط§ ظ…ظˆظپظ‚غŒطھ ط§ظ†ط¬ط§ظ… ط´ط¯ ظˆ ط¯غŒطھط§ط¨غŒط³ ط¨ظ‡â€Œط±ظˆط²ط±ط³ط§ظ†غŒ ع¯ط±ط¯غŒط¯.",
                 "dataDate": engine.data_datetime.isoformat() if engine.data_datetime else None,
+                "revisionId": str(engine.current_rev.id),
                 "historyDates": result.get("dates", []),
                 "snapshots": result.get("snapshots", 0),
             }, status=status.HTTP_200_OK)
         except ValueError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Revision.DoesNotExist:
+            return Response({"revision_id": "Revision not found for this project."}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 

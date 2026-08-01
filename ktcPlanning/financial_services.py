@@ -215,7 +215,7 @@ def get_task_delivery_create_capabilities(task, user):
 
 def submit_task_delivery(delivery, *, user):
     with transaction.atomic():
-        locked = TaskDelivery.objects.select_for_update().select_related("task", "project").get(pk=delivery.pk)
+        locked = TaskDelivery.objects.select_for_update(of=("self",)).select_related("task", "project").get(pk=delivery.pk)
         if locked.status not in {TaskDelivery.STATUS_DRAFT, TaskDelivery.STATUS_REJECTED}:
             raise ValidationError({"status": "Only draft or rejected deliveries can be submitted."})
         locked.status = TaskDelivery.STATUS_SUBMITTED
@@ -236,7 +236,7 @@ def submit_task_delivery(delivery, *, user):
 
 def approve_task_delivery(delivery, *, user):
     with transaction.atomic():
-        locked = TaskDelivery.objects.select_for_update().select_related("task", "project").get(pk=delivery.pk)
+        locked = TaskDelivery.objects.select_for_update(of=("self",)).select_related("task", "project").get(pk=delivery.pk)
         if locked.status == TaskDelivery.STATUS_APPROVED:
             summaries = _refresh_payable_plan_allocations_for_task(locked.task)
             return locked, summaries
@@ -262,7 +262,7 @@ def reject_task_delivery(delivery, *, user, reason):
     if not clean_reason:
         raise ValidationError({"rejection_reason": "Rejection reason is required."})
     with transaction.atomic():
-        locked = TaskDelivery.objects.select_for_update().select_related("task", "project").get(pk=delivery.pk)
+        locked = TaskDelivery.objects.select_for_update(of=("self",)).select_related("task", "project").get(pk=delivery.pk)
         if locked.status != TaskDelivery.STATUS_SUBMITTED:
             raise ValidationError({"status": "Only submitted deliveries can be rejected."})
         locked.status = TaskDelivery.STATUS_REJECTED
@@ -276,7 +276,7 @@ def reject_task_delivery(delivery, *, user, reason):
 
 def cancel_task_delivery(delivery, *, user):
     with transaction.atomic():
-        locked = TaskDelivery.objects.select_for_update().select_related("task", "project").get(pk=delivery.pk)
+        locked = TaskDelivery.objects.select_for_update(of=("self",)).select_related("task", "project").get(pk=delivery.pk)
         if locked.status in {TaskDelivery.STATUS_APPROVED, TaskDelivery.STATUS_CANCELLED}:
             raise ValidationError({"status": "Approved or cancelled deliveries cannot be cancelled."})
         locked.status = TaskDelivery.STATUS_CANCELLED
@@ -812,7 +812,7 @@ def validate_progress_transition(task, target_progress):
 
 def register_transaction(milestone, transaction_type, amount, transaction_date, user=None, reference_number="", description="", currency=None):
     with transaction.atomic():
-        locked = PaymentMilestone.objects.select_for_update().select_related("financial_plan__task").get(pk=milestone.pk)
+        locked = PaymentMilestone.objects.select_for_update(of=("self",)).select_related("financial_plan__task").get(pk=milestone.pk)
         PaymentTransaction.objects.select_for_update().filter(milestone=locked).exists()
         tx = PaymentTransaction(
             milestone=locked,

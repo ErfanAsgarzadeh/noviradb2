@@ -42,7 +42,7 @@ def _decimal_string(value):
 
 
 class EVMEngine:
-    def __init__(self, project_id, data_datetime=None):
+    def __init__(self, project_id, data_datetime=None, revision_id=None):
         self.project_id = project_id
         self.project = Project.objects.select_related(
             'active_baseline_revision', 'current_execution_revision'
@@ -51,9 +51,16 @@ class EVMEngine:
         self.baseline_rev = get_official_revision(
             self.project, ROLE_BASELINE, required=False
         )
-        self.current_rev = get_official_revision(
-            self.project, ROLE_EXECUTION, required=True
-        )
+        if revision_id:
+            self.current_rev = Revision.objects.get(
+                pk=revision_id,
+                project_id=self.project_id,
+                is_deleted=False,
+            )
+        else:
+            self.current_rev = get_official_revision(
+                self.project, ROLE_EXECUTION, required=True
+            )
         self._cal_engines = {}
         self._default_cal_engine = None
         self._load_calendars()
@@ -494,7 +501,7 @@ class EVMEngine:
             if ac == Decimal('0.00'):
                 ac = self._actual_hours_from_dates(current_tv)
             # --- 2. Planned Value (PV) & Budget At Completion (BAC) ---
-            baseline_tv = baseline_tvs.get(task.id)
+            baseline_tv = baseline_tvs.get(task.id) or current_tv
             if not baseline_tv:
                 continue  # تسک جدید است و در بیس‌لاین نیست
 

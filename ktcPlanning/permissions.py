@@ -168,6 +168,11 @@ def accessible_project_ids(user):
         | Q(revisions__task_roles__user=user)
         | Q(revisions__task_roles__user__unit__manager=user)
     )
+    # Company projects are visible to their designated second-stage planning
+    # approver. Intra-unit projects remain concealed unless another rule grants
+    # access.
+    if is_planning_manager(user):
+        q |= Q(scope='company')
     try:
         from .models import ProjectViewer  # noqa: F401
         q |= Q(viewers__user=user)

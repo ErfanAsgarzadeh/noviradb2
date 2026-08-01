@@ -39,7 +39,7 @@ class TestProjectCRUD:
             "name": "پروژه جدید",
             "scope": "intra_unit",
         }, format="json")
-        assert resp.status_code == status.HTTP_201_CREATED
+        assert resp.status_code == status.HTTP_201_CREATED, resp.data
         assert Project.objects.filter(name="پروژه جدید").exists()
 
     def test_project_manager_can_create_project(self):
@@ -120,9 +120,8 @@ class TestRevisionAPI:
             "number": 1,
             "description": "ریویژن اول",
             "project_start": "2025-01-01T08:00:00Z",
-            "designated_approver": admin.id,
         }, format="json")
-        assert resp.status_code == status.HTTP_201_CREATED
+        assert resp.status_code == status.HTTP_201_CREATED, resp.data
 
     def test_filter_revisions_by_project(self):
         admin = make_company_admin()
@@ -136,8 +135,8 @@ class TestRevisionAPI:
             {"project_id": str(project1.id)}
         )
         ids = [r["id"] for r in resp.data]
-        assert str(rev1.id) in ids
-        assert str(rev2.id) not in ids
+        assert rev1.id in ids
+        assert rev2.id not in ids
 
     def test_approve_revision_locks_it(self):
         admin = make_company_admin()
@@ -171,12 +170,19 @@ class TestRevisionAPI:
         resp = api(other_user).post(
             reverse("revision-approve", kwargs={"pk": rev.id})
         )
-        assert resp.status_code == status.HTTP_403_FORBIDDEN
+        assert resp.status_code == status.HTTP_404_NOT_FOUND
 
     def test_soft_delete_revision(self):
         admin = make_company_admin()
         project = make_project(creator=admin)
-        rev = make_revision(project)
+        rev = Revision.objects.create(
+            project=project,
+            number=1,
+            created_by=admin,
+            designated_approver=admin,
+            project_start=project.start_date,
+            project_end=project.end_date,
+        )
 
         resp = api(admin).delete(
             reverse("revision-detail", kwargs={"pk": rev.id})

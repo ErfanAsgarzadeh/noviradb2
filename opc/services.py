@@ -6,13 +6,14 @@ from typing import Iterable
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from auditlog.services import log_event, model_to_dict_safe
 from enterprise_items.exceptions import EngineeringLifecycleError, EngineeringPermissionError
-from enterprise_items.models import ItemRevision
 from enterprise_items.permissions import can_manage_engineering, is_engineering_releaser
 
-from .models import OPCDiagram, OPCEdge, OPCNode
+from .models import OPCDiagram, OPCEdge, OPCNode, OPCToolingRequirement, OPCValidationEvidence
+from .release_validation import POLICY_VERSION, validate_opc_release_readiness
 
 TRANSITIONS = {
     OPCDiagram.STATUS_DRAFT: {OPCDiagram.STATUS_UNDER_REVIEW},
@@ -22,7 +23,13 @@ TRANSITIONS = {
     OPCDiagram.STATUS_SUPERSEDED: {OPCDiagram.STATUS_OBSOLETE},
     OPCDiagram.STATUS_OBSOLETE: set(),
 }
-HEADER_FIELDS = {'item_revision', 'title', 'part_code', 'part_name', 'revision', 'description', 'effective_from', 'effective_to', 'status'}
+HEADER_FIELDS = {'item_revision', 'manufacturing_bom_revision', 'title', 'part_code', 'part_name', 'revision', 'description', 'effective_from', 'effective_to', 'status'}
+
+
+class OPCReleaseValidationError(EngineeringLifecycleError):
+    def __init__(self, validation_result: dict):
+        self.validation_result = validation_result
+        super().__init__({'validation': 'OPC release validation failed.'})
 
 
 def _require_manager(actor):
@@ -95,54 +102,7 @@ def _graph_cycle(nodes: Iterable[OPCNode], edges: Iterable[OPCEdge]) -> list[str
 
 
 def validate_opc_graph(diagram: OPCDiagram) -> dict:
-    errors: dict[str, str] = {}
-    warnings: list[str] = []
-    nodes = list(diagram.nodes.all())
-    edges = list(diagram.edges.select_related('source', 'target'))
-    if not diagram.item_revision_id:
-        errors['item_revision'] = 'OPC revision must be assigned to an ItemRevision before release.'
-    if not diagram.revision.strip():
-        errors['revision'] = 'OPC revision code is required.'
-    if diagram.item_revision and diagram.item_revision.status not in {ItemRevision.STATUS_APPROVED, ItemRevision.STATUS_RELEASED}:
-        errors['item_revision'] = 'Released OPC requires an approved or released ItemRevision.'
-    if not diagram.effective_from:
-        errors['effective_from'] = 'Effective start date is required before release.'
-    if not nodes:
-        errors['nodes'] = 'OPC revision must contain at least one operation node.'
-    operation_nodes = [node for node in nodes if node.node_type in {'OPERATION', 'INSPECTION', 'TRANSPORT'}]
-    if not operation_nodes:
-        errors['operation'] = 'OPC revision must contain at least one operation, inspection, or transport node.'
-    edge_pairs = set()
-    node_ids = {node.pk for node in nodes}
-    incoming = {node.pk: 0 for node in nodes}
-    outgoing = {node.pk: 0 for node in nodes}
-    for edge in edges:
-        if edge.source_id == edge.target_id:
-            errors['edge'] = 'OPC edges cannot reference the same source and target node.'
-        if edge.source_id not in node_ids or edge.target_id not in node_ids or edge.source.diagram_id != diagram.pk or edge.target.diagram_id != diagram.pk:
-            errors['edge'] = 'Every OPC edge must reference nodes in the same OPC revision.'
-        pair = (edge.source_id, edge.target_id)
-        if pair in edge_pairs:
-            errors['edge'] = 'Duplicate OPC edges are not allowed.'
-        edge_pairs.add(pair)
-        incoming[edge.target_id] = incoming.get(edge.target_id, 0) + 1
-        outgoing[edge.source_id] = outgoing.get(edge.source_id, 0) + 1
-    cycle = _graph_cycle(nodes, edges)
-    if cycle:
-        errors['cycle'] = 'OPC graph cycle detected: ' + ' -> '.join(cycle)
-    if nodes and not [node for node in nodes if incoming.get(node.pk, 0) == 0]:
-        errors['start'] = 'At least one start operation must be identifiable.'
-    if nodes and not [node for node in nodes if outgoing.get(node.pk, 0) == 0]:
-        errors['terminal'] = 'At least one terminal operation must be identifiable.'
-    for node in nodes:
-        if not node.label.strip():
-            errors['node'] = 'Every OPC node requires a label.'
-        for field in ('setup_time_hours', 'run_time_per_unit_hours', 'queue_time_hours', 'move_time_hours', 'inspection_time_hours', 'external_lead_time_days', 'buffer_time_hours'):
-            if getattr(node, field) < 0:
-                errors[field] = 'Duration values cannot be negative.'
-        if node.execution_type == 'EXTERNAL' and node.external_lead_time_days <= 0:
-            warnings.append(f'External operation {node.label} has no external lead time.')
-    return {'valid': not errors, 'errors': errors, 'warnings': warnings}
+    return validate_opc_release_readiness(diagram, mode='draft')
 
 
 def _validate_no_overlap(diagram: OPCDiagram, *, exclude_ids: Iterable[str] = ()): 
@@ -157,11 +117,19 @@ def _validate_no_overlap(diagram: OPCDiagram, *, exclude_ids: Iterable[str] = ()
             raise EngineeringLifecycleError({'effective_from': 'Released OPC revisions cannot have overlapping effective periods.'})
 
 
-def validate_opc_for_release(diagram: OPCDiagram):
-    result = validate_opc_graph(diagram)
-    if result['errors']:
-        raise EngineeringLifecycleError(result['errors'])
+def validate_opc_for_release(diagram: OPCDiagram, *, expected_graph_version=None, acknowledged_issue_keys: Iterable[str] = (), validation_policy_version: str | None = None) -> dict:
+    if validation_policy_version and validation_policy_version != POLICY_VERSION:
+        raise EngineeringLifecycleError({'validation': {'policy_version': f'Expected validation policy {POLICY_VERSION}.'}})
+    result = validate_opc_release_readiness(
+        diagram,
+        mode='release',
+        expected_graph_version=expected_graph_version,
+        acknowledged_issue_keys=acknowledged_issue_keys,
+    )
+    if not result['release_ready']:
+        raise OPCReleaseValidationError(result)
     _validate_no_overlap(diagram)
+    return result
 
 
 def _save_status(diagram: OPCDiagram, *, new_status: str, actor, update_fields: list[str] | None = None):
@@ -210,14 +178,47 @@ def approve_opc_revision(diagram: OPCDiagram, *, actor):
     return _save_status(diagram, new_status=OPCDiagram.STATUS_APPROVED, actor=actor, update_fields=['approved_by', 'approved_at'])
 
 
+def _store_validation_evidence(diagram: OPCDiagram, *, actor, validation_result: dict, acknowledged_issue_keys: Iterable[str], released_at):
+    validated_at = parse_datetime(validation_result['validated_at']) or timezone.now()
+    return OPCValidationEvidence.objects.create(
+        diagram=diagram,
+        graph_version=validation_result['graph_version'],
+        policy_version=validation_result['policy_version'],
+        mode=validation_result['mode'],
+        validated_at=validated_at,
+        released_at=released_at,
+        actor=actor,
+        valid=validation_result['valid'],
+        release_ready=validation_result['release_ready'],
+        counts=validation_result['counts'],
+        issues=validation_result['issues'],
+        acknowledged_issue_keys=list(acknowledged_issue_keys or []),
+        acknowledged_warning_codes=validation_result['acknowledged_warning_codes'],
+    )
+
+
 @transaction.atomic
-def release_opc_revision(diagram: OPCDiagram, *, actor, effective_from=None, supersede_current=False):
+def release_opc_revision(
+    diagram: OPCDiagram,
+    *,
+    actor,
+    effective_from=None,
+    supersede_current=False,
+    expected_graph_version=None,
+    acknowledged_issue_keys: Iterable[str] = (),
+    validation_policy_version: str | None = None,
+):
     _require_releaser(actor)
-    diagram = OPCDiagram.objects.select_for_update().prefetch_related('nodes', 'edges').get(pk=diagram.pk)
+    diagram = OPCDiagram.objects.select_for_update(of=('self',)).prefetch_related('nodes', 'edges').get(pk=diagram.pk)
     _validate_transition(diagram, OPCDiagram.STATUS_RELEASED)
     if effective_from is not None:
         diagram.effective_from = effective_from
-    validate_opc_for_release(diagram)
+    validation_result = validate_opc_for_release(
+        diagram,
+        expected_graph_version=expected_graph_version,
+        acknowledged_issue_keys=acknowledged_issue_keys,
+        validation_policy_version=validation_policy_version,
+    )
     current = OPCDiagram.objects.select_for_update().filter(item_revision=diagram.item_revision, status=OPCDiagram.STATUS_RELEASED, effective_to__isnull=True).exclude(pk=diagram.pk).order_by('-released_at', '-created_at').first()
     if current and not supersede_current:
         raise EngineeringLifecycleError({'supersede': 'A currently released OPC revision exists. Use supersede.'})
@@ -237,7 +238,9 @@ def release_opc_revision(diagram: OPCDiagram, *, actor, effective_from=None, sup
     diagram.released_at = now
     diagram.updated_by = actor
     diagram.save(update_fields=['status', 'released_by', 'released_at', 'effective_from', 'updated_by', 'updated_at'])
+    evidence = _store_validation_evidence(diagram, actor=actor, validation_result=validation_result, acknowledged_issue_keys=acknowledged_issue_keys, released_at=now)
     log_event('opc_revision_released', target=diagram, category='business', changes={'status': {'old': old_snapshot.get('status'), 'new': OPCDiagram.STATUS_RELEASED}}, extra={'item_revision_id': str(diagram.item_revision_id), 'revision': diagram.revision})
+    log_event('opc_release_validation_evidence_recorded', target=evidence, category='business', extra={'diagram_id': str(diagram.pk), 'graph_version': validation_result['graph_version'], 'policy_version': validation_result['policy_version']})
     return diagram
 
 
@@ -252,7 +255,7 @@ def obsolete_opc_revision(diagram: OPCDiagram, *, actor):
 @transaction.atomic
 def clone_opc_revision(source: OPCDiagram, *, actor, revision_code: str):
     _require_manager(actor)
-    source = OPCDiagram.objects.select_for_update().prefetch_related('nodes', 'edges').get(pk=source.pk)
+    source = OPCDiagram.objects.select_for_update(of=('self',)).prefetch_related('nodes__tooling_requirements', 'edges').get(pk=source.pk)
     clone = OPCDiagram.objects.create(
         item_revision=source.item_revision,
         title=source.title,
@@ -274,6 +277,11 @@ def clone_opc_revision(source: OPCDiagram, *, actor, revision_code: str):
             process_code=node.process_code,
             station=node.station,
             execution_type=node.execution_type,
+            operation_number=node.operation_number,
+            process_definition=node.process_definition,
+            plant=node.plant,
+            work_center=node.work_center,
+            machine_asset=node.machine_asset,
             setup_time_hours=node.setup_time_hours,
             run_time_per_unit_hours=node.run_time_per_unit_hours,
             queue_time_hours=node.queue_time_hours,
@@ -287,6 +295,17 @@ def clone_opc_revision(source: OPCDiagram, *, actor, revision_code: str):
             y=node.y,
             meta=node.meta,
         )
+        OPCToolingRequirement.objects.bulk_create([
+            OPCToolingRequirement(
+                node=copied,
+                tooling_definition=requirement.tooling_definition,
+                quantity=requirement.quantity,
+                mandatory=requirement.mandatory,
+                notes=requirement.notes,
+                sequence=requirement.sequence,
+            )
+            for requirement in node.tooling_requirements.all()
+        ])
         node_map[str(node.pk)] = copied
     for edge in source.edges.all():
         OPCEdge.objects.create(

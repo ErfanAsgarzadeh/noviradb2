@@ -41,6 +41,103 @@ TASK_DELIVERY_ALLOWED_CONTENT_TYPES = {
 }
 
 
+class ProgramSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Program
+        fields = '__all__'
+
+
+class ProjectMemberSerializer(serializers.ModelSerializer):
+    userName = serializers.CharField(source='user.username', read_only=True)
+
+    class Meta:
+        model = ProjectMember
+        fields = '__all__'
+
+
+class ProjectDeliverableSerializer(serializers.ModelSerializer):
+    itemCode = serializers.CharField(source='item_revision.item.item_code', read_only=True, default=None)
+    documentRevisionCode = serializers.CharField(source='document_revision.revision', read_only=True, default=None)
+
+    class Meta:
+        model = ProjectDeliverable
+        fields = '__all__'
+        read_only_fields = ['accepted_by', 'accepted_at', 'deliverable_version']
+
+
+class ProjectMilestoneSerializer(serializers.ModelSerializer):
+    ownerName = serializers.CharField(source='owner.username', read_only=True, default=None)
+
+    class Meta:
+        model = ProjectMilestone
+        fields = '__all__'
+        read_only_fields = ['milestone_version']
+
+
+class ProjectBaselineSnapshotSerializer(serializers.ModelSerializer):
+    approvedByName = serializers.CharField(source='approved_by.username', read_only=True, default=None)
+
+    class Meta:
+        model = ProjectBaselineSnapshot
+        fields = '__all__'
+        read_only_fields = ['baseline_number', 'revision_number', 'status', 'snapshot', 'checksum', 'approved_by', 'approved_at', 'superseded_by', 'created_at']
+
+
+class ProjectManufacturingRequirementSerializer(serializers.ModelSerializer):
+    itemCode = serializers.CharField(source='item_revision.item.item_code', read_only=True, default=None)
+    demandNumber = serializers.CharField(source='converted_demand.demand_number', read_only=True, default=None)
+
+    class Meta:
+        model = ProjectManufacturingRequirement
+        fields = '__all__'
+        read_only_fields = ['requirement_number', 'status', 'requirement_version', 'approved_by', 'approved_at', 'converted_demand', 'idempotency_key']
+
+
+class ProjectProcurementRequirementSerializer(serializers.ModelSerializer):
+    itemCode = serializers.CharField(source='item_revision.item.item_code', read_only=True, default=None)
+    requisitionNumber = serializers.CharField(source='converted_requisition.requisition_number', read_only=True, default=None)
+
+    class Meta:
+        model = ProjectProcurementRequirement
+        fields = '__all__'
+        read_only_fields = ['requirement_number', 'status', 'requirement_version', 'approved_by', 'approved_at', 'converted_requisition', 'idempotency_key']
+
+
+class ProjectMakeBuyDecisionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectMakeBuyDecision
+        fields = '__all__'
+        read_only_fields = ['status', 'approved_by', 'approved_at', 'superseded_by']
+
+
+class ProjectDownstreamLinkSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectDownstreamLink
+        fields = '__all__'
+        read_only_fields = ['created_at']
+
+
+class ProjectProgressSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectProgressSnapshot
+        fields = '__all__'
+        read_only_fields = ['snapshot_number', 'progress_percent', 'engineering_percent', 'manufacturing_percent', 'procurement_percent', 'quality_percent', 'maintenance_impact_count', 'snapshot', 'checksum', 'created_by', 'created_at']
+
+
+class ProjectForecastSnapshotSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectForecastSnapshot
+        fields = '__all__'
+        read_only_fields = ['snapshot_number', 'baseline_finish', 'current_plan_finish', 'forecast_finish', 'actual_finish', 'critical_path', 'milestone_risks', 'inputs', 'checksum', 'created_by', 'created_at']
+
+
+class ProjectImpactEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectImpactEvent
+        fields = '__all__'
+        read_only_fields = ['created_at', 'resolved_at', 'resolved_by']
+
+
 def _calendar_for_task_version(task_version):
     project = getattr(task_version.revision, 'project', None)
     return (
@@ -126,6 +223,8 @@ class CalendarSerializer(serializers.ModelSerializer):
 class ProjectSerializer(serializers.ModelSerializer):
     createdAt = serializers.DateTimeField(source='created_at', format="%Y-%m-%dT%H:%M:%S", read_only=True)
     description = serializers.SerializerMethodField()
+    programName = serializers.CharField(source='program.name', read_only=True, default=None)
+    sponsorName = serializers.CharField(source='sponsor.username', read_only=True, default=None)
     start_date = serializers.DateTimeField(format="%Y-%m-%d", required=False, allow_null=True)
     end_date = serializers.DateTimeField(format="%Y-%m-%d", required=False, allow_null=True)
     calendarId = serializers.PrimaryKeyRelatedField(
@@ -163,7 +262,10 @@ class ProjectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Project
         fields = [
-            'id', 'name', 'description', 'createdAt', 'start_date', 'end_date',
+            'id', 'program', 'programName', 'project_number', 'project_code',
+            'name', 'description', 'project_type', 'sponsor', 'sponsorName',
+            'createdAt', 'start_date', 'end_date', 'forecast_completion_date',
+            'project_version',
             'calendarId', 'calendarName', 'scope', 'parentProjectId',
             'parentProjectName', 'childProjectCount', 'parentScheduleWarning',
             'parentScheduleWarningUpdatedAt', 'lifecycleStatus', 'currentDataDate',
@@ -263,11 +365,17 @@ class ProjectViewerSerializer(serializers.ModelSerializer):
 
 class RevisionSerializer(serializers.ModelSerializer):
     projectId = serializers.PrimaryKeyRelatedField(source='project', read_only=True)
-    projectStart = serializers.DateTimeField(source='project_start', format="%Y-%m-%d")
-    projectEnd = serializers.DateTimeField(source='project_end', format="%Y-%m-%d")
-    createdAt = serializers.DateTimeField(source='created_at', format="%Y-%m-%dT%H:%M:%S")
-    approvedAt = serializers.DateTimeField(source='approved_at', format="%Y-%m-%dT%H:%M:%S")
-    isBaseline = serializers.BooleanField(source='is_baseline')
+    # Preserve the established camel-case response while accepting the legacy
+    # snake-case create payload used by the revision endpoint.
+    project = serializers.PrimaryKeyRelatedField(queryset=Project.objects.all(), write_only=True, required=False)
+    project_start = serializers.DateTimeField(write_only=True, required=False)
+    project_end = serializers.DateTimeField(write_only=True, required=False, allow_null=True)
+    designated_approver = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), write_only=True, required=False, allow_null=True)
+    projectStart = serializers.DateTimeField(source='project_start', format="%Y-%m-%d", required=False)
+    projectEnd = serializers.DateTimeField(source='project_end', format="%Y-%m-%d", required=False, allow_null=True)
+    createdAt = serializers.DateTimeField(source='created_at', format="%Y-%m-%dT%H:%M:%S", read_only=True)
+    approvedAt = serializers.DateTimeField(source='approved_at', format="%Y-%m-%dT%H:%M:%S", read_only=True)
+    isBaseline = serializers.BooleanField(source='is_baseline', required=False, default=False)
     # طھط§غŒغŒط¯ع©ظ†ظ†ط¯ظ‡â€ŒغŒ طھط¹غŒغŒظ†â€Œط´ط¯ظ‡ â€” User ط§ط² models.py ط¯ط± namespace ظ‡ط³طھ (User = get_user_model())
     designatedApproverId = serializers.PrimaryKeyRelatedField(
         source='designated_approver', queryset=User.objects.all(),
@@ -277,9 +385,9 @@ class RevisionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Revision
-        fields = ['id', 'projectId', 'number', 'description', 'projectStart','projectEnd',
+        fields = ['id', 'projectId', 'project', 'number', 'description', 'projectStart','projectEnd', 'project_start', 'project_end',
                   'createdAt','approvedAt', 'isBaseline',
-                  'designatedApproverId', 'designatedApproverName']
+                  'designatedApproverId', 'designatedApproverName', 'designated_approver']
 
     def validate(self, attrs):
         has_approver_update = 'designated_approver' in attrs

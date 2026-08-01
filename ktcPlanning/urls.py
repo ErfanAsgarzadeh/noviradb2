@@ -11,7 +11,11 @@ from .views import (
     VarianceReportViewSet, CalendarViewSet, ProjectViewerViewSet, SystemSettingsView, ExpenseTypeViewSet,
     UnitOfMeasureViewSet, FundingSourceViewSet, BudgetAllocationViewSet, BudgetBorrowViewSet, UnfundedForecastCostViewSet,
     CostTransactionViewSet, TaskDeliveryAttachmentViewSet, TaskDeliveryViewSet, TaskFinancialPlanViewSet, PaymentMilestoneViewSet, PaymentTransactionViewSet, TaskViewSet, ResourceLevelingPlanViewSet,
-    FinancialControlConvertView, FinancialControlExchangeRateView, FinancialControlGenerateCostSnapshotsView, FinancialControlView
+    FinancialControlConvertView, FinancialControlExchangeRateView, FinancialControlGenerateCostSnapshotsView, FinancialControlView,
+    ProgramViewSet, ProjectMemberViewSet, ProjectDeliverableViewSet, ProjectMilestoneViewSet,
+    ProjectBaselineSnapshotViewSet, ProjectManufacturingRequirementViewSet, ProjectProcurementRequirementViewSet,
+    ProjectMakeBuyDecisionViewSet, ProjectDownstreamLinkViewSet, ProjectProgressSnapshotViewSet,
+    ProjectForecastSnapshotViewSet, ProjectImpactEventViewSet
 )
 
 # ایجاد یک نمونه از روتور پیش‌فرض DRF
@@ -31,6 +35,18 @@ router = OptionalSlashRouter()
 
 # ثبت ویوها در روتور
 router.register(r'projects', ProjectViewSet, basename='project')
+router.register(r'programs', ProgramViewSet, basename='program')
+router.register(r'project-members', ProjectMemberViewSet, basename='project-member')
+router.register(r'project-deliverables', ProjectDeliverableViewSet, basename='project-deliverable')
+router.register(r'project-milestones', ProjectMilestoneViewSet, basename='project-milestone')
+router.register(r'project-baselines', ProjectBaselineSnapshotViewSet, basename='project-baseline')
+router.register(r'project-manufacturing-requirements', ProjectManufacturingRequirementViewSet, basename='project-manufacturing-requirement')
+router.register(r'project-procurement-requirements', ProjectProcurementRequirementViewSet, basename='project-procurement-requirement')
+router.register(r'project-make-buy-decisions', ProjectMakeBuyDecisionViewSet, basename='project-make-buy-decision')
+router.register(r'project-downstream-links', ProjectDownstreamLinkViewSet, basename='project-downstream-link')
+router.register(r'project-progress-snapshots', ProjectProgressSnapshotViewSet, basename='project-progress-snapshot')
+router.register(r'project-forecast-snapshots', ProjectForecastSnapshotViewSet, basename='project-forecast-snapshot')
+router.register(r'project-impact-events', ProjectImpactEventViewSet, basename='project-impact-event')
 router.register(r'project-viewers', ProjectViewerViewSet, basename='project-viewer')
 router.register(r'calendars', CalendarViewSet, basename='calendar')
 router.register(r'revisions', RevisionViewSet, basename='revision')

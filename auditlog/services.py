@@ -56,6 +56,9 @@ def _request_context(request):
         'user_agent': (request.META.get('HTTP_USER_AGENT', '') or '')[:512],
         'request_method': (getattr(request, 'method', '') or '')[:8],
         'request_path': (getattr(request, 'path', '') or '')[:512],
+        'request_id': (getattr(request, 'request_id', '') or request.META.get('HTTP_X_REQUEST_ID', '') or '')[:80],
+        'correlation_id': (getattr(request, 'correlation_id', '') or request.META.get('HTTP_X_CORRELATION_ID', '') or '')[:80],
+        'command_id': (getattr(request, 'command_id', '') or request.META.get('HTTP_X_COMMAND_ID', '') or '')[:120],
     }
 
 

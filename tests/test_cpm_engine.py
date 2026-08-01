@@ -170,7 +170,7 @@ class TestRunCPMEndpoint:
         resp = api(admin).post(
             reverse("revision-run-cpm", kwargs={"pk": revision.id})
         )
-        assert resp.status_code == status.HTTP_403_FORBIDDEN
+        assert resp.status_code == status.HTTP_409_CONFLICT
 
     def test_run_cpm_with_cycle_returns_400(self):
         admin = make_company_admin()

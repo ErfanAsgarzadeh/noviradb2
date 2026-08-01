@@ -30,7 +30,10 @@ def intra_setup(db):
     """پروژه درون‌واحدی با یک تسک و یک مجری"""
     creator = make_company_admin()
     project = make_project(creator=creator, scope="intra_unit")
-    revision = make_revision(project, creator=creator)
+    # Progress is committed against the project's official execution revision.
+    # The fixture therefore creates the revision through the existing approved
+    # revision path rather than leaving this task only in a working draft.
+    revision = make_revision(project, creator=creator, approved=True)
     task, tv = make_task(project, revision)
 
     executor = make_user(org_role="member")
@@ -57,7 +60,8 @@ def company_setup(db):
 
     creator = make_company_admin()
     project = make_project(creator=creator, scope="company")
-    revision = make_revision(project, creator=creator)
+    # See intra_setup: approval tests require an execution revision.
+    revision = make_revision(project, creator=creator, approved=True)
     task, tv = make_task(project, revision)
 
     executor = make_user(org_role="member")
@@ -152,7 +156,7 @@ class TestIntraUnitApproval:
         client = api_client_for(random_user)
         resp = client.post(approve_url(report.id))
 
-        assert resp.status_code == status.HTTP_403_FORBIDDEN
+        assert resp.status_code == status.HTTP_404_NOT_FOUND
         report.refresh_from_db()
         assert report.approval_status == "pending"
 
@@ -235,7 +239,7 @@ class TestCompanyProjectApproval:
         client = api_client_for(random_user)
         resp = client.post(approve_url(report.id))
 
-        assert resp.status_code == status.HTTP_403_FORBIDDEN
+        assert resp.status_code == status.HTTP_404_NOT_FOUND
 
 
 # ══════════════════════════════════════════════════════════
@@ -284,10 +288,7 @@ class TestPlanningManagerBypass:
         # برای پروژه intra_unit، مدیر برنامه‌ریزی دسترسی مستقیم ندارد
         resp = client.post(approve_url(report.id))
         # انتظار: forbidden یا منطق متفاوت
-        assert resp.status_code in [
-            status.HTTP_403_FORBIDDEN,
-            status.HTTP_200_OK,  # اگر به‌عنوان reviewer هم شناخته شود
-        ]
+        assert resp.status_code == status.HTTP_404_NOT_FOUND
 
 
 # ══════════════════════════════════════════════════════════
@@ -339,7 +340,7 @@ class TestRejectReport:
         client = api_client_for(random_user)
         resp = client.post(reject_url(report.id))
 
-        assert resp.status_code == status.HTTP_403_FORBIDDEN
+        assert resp.status_code == status.HTTP_404_NOT_FOUND
 
 
 # ══════════════════════════════════════════════════════════
@@ -368,7 +369,7 @@ class TestReportEditLock:
         url = reverse("task-report-detail", kwargs={"pk": report.id})
         resp = client.patch(url, {"progress_percent": 99}, format="json")
 
-        assert resp.status_code == status.HTTP_400_BAD_REQUEST
+        assert resp.status_code == status.HTTP_403_FORBIDDEN
 
 
 # ══════════════════════════════════════════════════════════

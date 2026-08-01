@@ -1,6 +1,7 @@
 from datetime import date
 
 import pytest
+from django.core.files.base import ContentFile
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -10,7 +11,7 @@ from enterprise_items.bom_services import approve_bom_revision, release_bom_revi
 from enterprise_items.exceptions import EngineeringLifecycleError, EngineeringPermissionError
 from enterprise_items.models import BOM, BOMLine, BOMRevision, CodingOrganization, Item, ItemRevision, ItemType
 from enterprise_items.readiness import evaluate_item_revision_readiness
-from opc.models import OPCDiagram, OPCEdge, OPCNode
+from opc.models import ControlledDocument, ControlledDocumentRevision, OPCDiagram, OPCEdge, OPCNode, OPCNodeDocumentRequirement, OPCOperationMaterialAllocation
 from opc.services import approve_opc_revision, clone_opc_revision, release_opc_revision, submit_opc_revision, validate_opc_graph
 from tests.factories import make_company_admin, make_member, make_project_manager
 
@@ -77,6 +78,16 @@ def make_valid_opc(item_revision, revision='A', *, status_value=OPCDiagram.STATU
     out = OPCNode.objects.create(diagram=diagram, node_type='OUTPUT', label='Output', sequence=3)
     OPCEdge.objects.create(diagram=diagram, source=start, target=op, sequence=1)
     OPCEdge.objects.create(diagram=diagram, source=op, target=out, sequence=2)
+    component = make_item_revision(f'{item_revision.item.item_code}-C', status_value=ItemRevision.STATUS_RELEASED)
+    mbom = BOM.objects.create(parent_item_revision=item_revision, bom_type=BOM.TYPE_MANUFACTURING)
+    mbom_revision = BOMRevision.objects.create(bom=mbom, revision='M0', status=BOMRevision.STATUS_RELEASED, effective_from=effective_from)
+    line = BOMLine.objects.create(bom_revision=mbom_revision, sequence=10, component_item_revision=component, quantity='1.000000', unit='EA')
+    document = ControlledDocument.objects.create(document_number=f'WI-{item_revision.item.item_code}', title='Work instruction', document_type=ControlledDocument.TYPE_WORK_INSTRUCTION)
+    document_revision = ControlledDocumentRevision.objects.create(document=document, revision='A', status=ControlledDocumentRevision.STATUS_RELEASED, effective_from=effective_from, file=ContentFile(b'work instruction', name='wi.pdf'))
+    OPCOperationMaterialAllocation.objects.create(node=op, bom_line=line, component_item_revision=component, quantity='1.000000', unit='EA')
+    OPCNodeDocumentRequirement.objects.create(node=op, document_revision=document_revision, purpose=OPCNodeDocumentRequirement.PURPOSE_WORK_INSTRUCTION, mandatory=True)
+    diagram.manufacturing_bom_revision = mbom_revision
+    diagram.save(update_fields=['manufacturing_bom_revision'])
     return diagram
 
 

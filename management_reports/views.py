@@ -47,8 +47,8 @@ class PreparePlannerReportAPI(APIView):
                 )
             )
 
-            total_weight = progress_stats['total_weight'] or 0
-            weighted_progress_sum = progress_stats['weighted_progress_sum'] or 0
+            total_weight = float(progress_stats['total_weight'] or 0)
+            weighted_progress_sum = float(progress_stats['weighted_progress_sum'] or 0)
 
             if total_weight > 0:
                 auto_progress = round(weighted_progress_sum / total_weight, 2)
@@ -74,7 +74,7 @@ class PreparePlannerReportAPI(APIView):
             problematic_logs = problematic_logs.filter(task_id__in=official_task_ids)
         else:
             problematic_logs = problematic_logs.none()
-        problematic_logs = problematic_logs.order_by('task', '-timestamp').distinct('task')
+        problematic_logs = self._latest_per_task(problematic_logs.order_by('task_id', '-timestamp'))
 
         for log in problematic_logs:
             tv_info = active_task_versions_dict.get(log.task_id, {})
@@ -98,7 +98,7 @@ class PreparePlannerReportAPI(APIView):
             normal_logs = normal_logs.filter(task_id__in=official_task_ids)
         else:
             normal_logs = normal_logs.none()
-        normal_logs = normal_logs.order_by('task', '-timestamp').distinct('task')
+        normal_logs = self._latest_per_task(normal_logs.order_by('task_id', '-timestamp'))
 
         for log in normal_logs:
             tv_info = active_task_versions_dict.get(log.task_id, {})
@@ -119,6 +119,9 @@ class PreparePlannerReportAPI(APIView):
                 task__project=project,
                 revision=official_execution_revision,
                 action_required=True
+            )
+            critical_variances = self._latest_per_task(
+                critical_variances.order_by('task_id', '-report_date', '-id')
             )
             for var in critical_variances:
                 tv_info = active_task_versions_dict.get(var.task_id, {})
@@ -143,6 +146,17 @@ class PreparePlannerReportAPI(APIView):
             "suggested_bottlenecks": suggested_bottlenecks,
             "available_highlights": available_highlights
         }, status=status.HTTP_200_OK)
+
+    @staticmethod
+    def _latest_per_task(logs):
+        seen = set()
+        latest = []
+        for log in logs:
+            if log.task_id in seen:
+                continue
+            seen.add(log.task_id)
+            latest.append(log)
+        return latest
 
 
 class SaveManagementReportAPI(APIView):

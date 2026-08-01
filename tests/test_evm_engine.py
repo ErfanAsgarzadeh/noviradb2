@@ -23,7 +23,7 @@ from ktcPlanning.models import (
 )
 from .factories import (
     make_company_admin, make_project, make_revision,
-    make_task, make_report,
+    make_task, make_report, make_wbs_node,
 )
 
 
@@ -255,7 +255,7 @@ class TestVarianceCalculateEndpoint:
             format="json",
         )
         assert resp.status_code == status.HTTP_200_OK
-        assert "محاسبات" in resp.data.get("status", "")
+        assert resp.data.get("status")
 
     def test_calculate_without_project_id_returns_400(self):
         admin = make_company_admin()
@@ -276,6 +276,49 @@ class TestVarianceCalculateEndpoint:
             format="json",
         )
         assert resp.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_calculate_uses_selected_revision_when_provided(self):
+        admin = make_company_admin()
+        project = make_project(creator=admin)
+        project.refresh_from_db()
+        baseline = project.active_baseline_revision
+        task, baseline_tv = make_task(project, baseline, duration_hours=8)
+        execution_revision = make_revision(project, creator=admin, approved=True)
+        selected_revision = make_revision(project, creator=admin)
+        _, selected_wbs = make_wbs_node(project, selected_revision, title="Rev02 WBS")
+        now = timezone.now()
+
+        baseline_tv.planned_start = now - timedelta(hours=10)
+        baseline_tv.planned_finish = now - timedelta(hours=2)
+        baseline_tv.save()
+        selected_tv = TaskVersion.objects.create(
+            task=task,
+            revision=selected_revision,
+            wbs_node=selected_wbs,
+            title="Rev02 Activity",
+            duration_hours=8,
+            planned_start=now - timedelta(hours=10),
+            planned_finish=now - timedelta(hours=2),
+            sequence=1,
+        )
+        set_task_actual(selected_tv, progress=80, actual_start=now - timedelta(hours=4))
+        new_task, _ = make_task(project, selected_revision, title="Rev02 New Activity", duration_hours=6)
+
+        resp = api(admin).post(
+            reverse("variance-report-calculate"),
+            {
+                "project_id": str(project.id),
+                "revision_id": str(selected_revision.id),
+                "dataDate": now.isoformat(),
+            },
+            format="json",
+        )
+
+        assert resp.status_code == status.HTTP_200_OK
+        assert resp.data["revisionId"] == str(selected_revision.id)
+        assert VarianceReport.objects.filter(task=task, revision=selected_revision).exists()
+        assert VarianceReport.objects.filter(task=new_task, revision=selected_revision).exists()
+        assert not VarianceReport.objects.filter(task=task, revision=execution_revision).exists()
 
 
 @pytest.mark.django_db

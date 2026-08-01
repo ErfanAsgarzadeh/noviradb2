@@ -77,7 +77,64 @@ class ExchangeRate(models.Model):
 # 1. PROJECT
 # =========================================================
 
+class Program(models.Model):
+    STATUS_DRAFT = 'DRAFT'
+    STATUS_ACTIVE = 'ACTIVE'
+    STATUS_ON_HOLD = 'ON_HOLD'
+    STATUS_COMPLETED = 'COMPLETED'
+    STATUS_CANCELLED = 'CANCELLED'
+    STATUS_CLOSED = 'CLOSED'
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, 'Draft'),
+        (STATUS_ACTIVE, 'Active'),
+        (STATUS_ON_HOLD, 'On hold'),
+        (STATUS_COMPLETED, 'Completed'),
+        (STATUS_CANCELLED, 'Cancelled'),
+        (STATUS_CLOSED, 'Closed'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    program_code = models.CharField(max_length=60, unique=True)
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    owner = models.ForeignKey(User, on_delete=models.PROTECT, related_name='owned_programs')
+    sponsor = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='sponsored_programs')
+    planned_start = models.DateField(null=True, blank=True)
+    planned_end = models.DateField(null=True, blank=True)
+    actual_start = models.DateField(null=True, blank=True)
+    actual_end = models.DateField(null=True, blank=True)
+    priority = models.PositiveIntegerField(default=100)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['program_code']
+
+    def __str__(self):
+        return f'{self.program_code} - {self.name}'
+
 class Project(models.Model):
+    TYPE_PRODUCT_DEVELOPMENT = 'PRODUCT_DEVELOPMENT'
+    TYPE_MANUFACTURING = 'MANUFACTURING'
+    TYPE_CUSTOMER_DELIVERY = 'CUSTOMER_DELIVERY'
+    TYPE_OVERHAUL = 'OVERHAUL'
+    TYPE_INSTALLATION = 'INSTALLATION'
+    TYPE_COMMISSIONING = 'COMMISSIONING'
+    TYPE_INTERNAL = 'INTERNAL'
+    TYPE_OTHER = 'OTHER'
+    TYPE_CHOICES = [
+        (TYPE_PRODUCT_DEVELOPMENT, 'Product development'),
+        (TYPE_MANUFACTURING, 'Manufacturing'),
+        (TYPE_CUSTOMER_DELIVERY, 'Customer delivery'),
+        (TYPE_OVERHAUL, 'Overhaul'),
+        (TYPE_INSTALLATION, 'Installation'),
+        (TYPE_COMMISSIONING, 'Commissioning'),
+        (TYPE_INTERNAL, 'Internal'),
+        (TYPE_OTHER, 'Other'),
+    ]
+
     LIFECYCLE_DRAFT = 'draft'
     LIFECYCLE_PLANNING = 'planning'
     LIFECYCLE_ACTIVE = 'active'
@@ -100,8 +157,13 @@ class Project(models.Model):
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    program = models.ForeignKey(Program, null=True, blank=True, on_delete=models.PROTECT, related_name='projects')
+    project_number = models.CharField(max_length=80, unique=True, null=True, blank=True)
+    project_code = models.CharField(max_length=80, blank=True, db_index=True)
     name = models.CharField(max_length=255)
+    project_type = models.CharField(max_length=40, choices=TYPE_CHOICES, default=TYPE_INTERNAL)
     created_by = models.ForeignKey(User, on_delete=models.PROTECT)
+    sponsor = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='sponsored_projects')
     created_at = models.DateTimeField(auto_now_add=True)
     start_date = models.DateTimeField(null=True, blank=True)
     end_date = models.DateTimeField(null=True, blank=True)
@@ -170,6 +232,19 @@ class Project(models.Model):
         verbose_name="اولویت پروژه",
         help_text="در تسطیح چندپروژه‌ای، پروژه‌های با عدد کمتر اولویت بالاتری در رقابت بر سر منابع دارند."
     )
+
+    forecast_completion_date = models.DateTimeField(null=True, blank=True)
+    project_version = models.PositiveBigIntegerField(default=0)
+
+    def save(self, *args, **kwargs):
+        if not self.project_number:
+            prefix = f'PRJ-{timezone.now():%Y}-'
+            latest = Project.objects.filter(project_number__startswith=prefix).order_by('-project_number').values_list('project_number', flat=True).first()
+            sequence = int(str(latest).split('-')[-1]) + 1 if latest else 1
+            self.project_number = f'{prefix}{sequence:06d}'
+        if self.project_code:
+            self.project_code = self.project_code.strip().upper()
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
@@ -1119,6 +1194,505 @@ class Baseline(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
+class ProjectMember(models.Model):
+    ROLE_PROJECT_MANAGER = 'PROJECT_MANAGER'
+    ROLE_ENGINEERING_LEAD = 'ENGINEERING_LEAD'
+    ROLE_MANUFACTURING_LEAD = 'MANUFACTURING_LEAD'
+    ROLE_PROCUREMENT_LEAD = 'PROCUREMENT_LEAD'
+    ROLE_QUALITY_LEAD = 'QUALITY_LEAD'
+    ROLE_PLANNER = 'PLANNER'
+    ROLE_VIEWER = 'VIEWER'
+    ROLE_CHOICES = [
+        (ROLE_PROJECT_MANAGER, 'Project manager'),
+        (ROLE_ENGINEERING_LEAD, 'Engineering lead'),
+        (ROLE_MANUFACTURING_LEAD, 'Manufacturing lead'),
+        (ROLE_PROCUREMENT_LEAD, 'Procurement lead'),
+        (ROLE_QUALITY_LEAD, 'Quality lead'),
+        (ROLE_PLANNER, 'Planner'),
+        (ROLE_VIEWER, 'Viewer'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='members')
+    user = models.ForeignKey(User, on_delete=models.PROTECT, related_name='project_memberships')
+    role = models.CharField(max_length=40, choices=ROLE_CHOICES)
+    allocation_percent = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    active = models.BooleanField(default=True)
+    effective_from = models.DateField(null=True, blank=True)
+    effective_to = models.DateField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('project', 'user', 'role')]
+        ordering = ['project__name', 'role']
+
+
+class ProjectDeliverable(models.Model):
+    TYPE_ENGINEERING = 'ENGINEERING'
+    TYPE_MANUFACTURED_ITEM = 'MANUFACTURED_ITEM'
+    TYPE_PROCURED_ITEM = 'PROCURED_ITEM'
+    TYPE_ASSEMBLY = 'ASSEMBLY'
+    TYPE_DOCUMENT = 'DOCUMENT'
+    TYPE_INSPECTION = 'INSPECTION'
+    TYPE_INSTALLATION = 'INSTALLATION'
+    TYPE_SERVICE = 'SERVICE'
+    TYPE_OTHER = 'OTHER'
+    TYPE_CHOICES = [
+        (TYPE_ENGINEERING, 'Engineering'),
+        (TYPE_MANUFACTURED_ITEM, 'Manufactured item'),
+        (TYPE_PROCURED_ITEM, 'Procured item'),
+        (TYPE_ASSEMBLY, 'Assembly'),
+        (TYPE_DOCUMENT, 'Document'),
+        (TYPE_INSPECTION, 'Inspection'),
+        (TYPE_INSTALLATION, 'Installation'),
+        (TYPE_SERVICE, 'Service'),
+        (TYPE_OTHER, 'Other'),
+    ]
+    STATUS_NOT_STARTED = 'NOT_STARTED'
+    STATUS_IN_PROGRESS = 'IN_PROGRESS'
+    STATUS_SUBMITTED = 'SUBMITTED'
+    STATUS_ACCEPTED = 'ACCEPTED'
+    STATUS_REJECTED = 'REJECTED'
+    STATUS_WAIVED = 'WAIVED'
+    STATUS_CANCELLED = 'CANCELLED'
+    STATUS_CHOICES = [
+        (STATUS_NOT_STARTED, 'Not started'),
+        (STATUS_IN_PROGRESS, 'In progress'),
+        (STATUS_SUBMITTED, 'Submitted'),
+        (STATUS_ACCEPTED, 'Accepted'),
+        (STATUS_REJECTED, 'Rejected'),
+        (STATUS_WAIVED, 'Waived'),
+        (STATUS_CANCELLED, 'Cancelled'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='phase14_deliverables')
+    activity = models.ForeignKey(Task, null=True, blank=True, on_delete=models.PROTECT, related_name='project_deliverables')
+    deliverable_code = models.CharField(max_length=80)
+    name = models.CharField(max_length=255)
+    deliverable_type = models.CharField(max_length=40, choices=TYPE_CHOICES)
+    description = models.TextField(blank=True)
+    quantity = models.DecimalField(max_digits=18, decimal_places=6, default=1)
+    unit = models.CharField(max_length=30, default='EA')
+    target_date = models.DateField(null=True, blank=True)
+    mandatory = models.BooleanField(default=True)
+    acceptance_criteria = models.TextField(blank=True)
+    acceptance_status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_NOT_STARTED)
+    accepted_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='accepted_project_deliverables')
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    item_revision = models.ForeignKey('enterprise_items.ItemRevision', null=True, blank=True, on_delete=models.PROTECT, related_name='project_deliverables')
+    document_revision = models.ForeignKey('opc.ControlledDocumentRevision', null=True, blank=True, on_delete=models.PROTECT, related_name='project_deliverables')
+    deliverable_version = models.PositiveBigIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [('project', 'deliverable_code')]
+        ordering = ['project__name', 'deliverable_code']
+
+    def clean(self):
+        super().clean()
+        if self.activity_id and self.activity.project_id != self.project_id:
+            raise ValidationError({'activity': 'Deliverable activity must belong to the same project.'})
+        if self.quantity <= 0:
+            raise ValidationError({'quantity': 'Deliverable quantity must be positive.'})
+
+    def save(self, *args, **kwargs):
+        self.unit = (self.unit or 'EA').upper()
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class ProjectMilestone(models.Model):
+    STATUS_NOT_STARTED = 'NOT_STARTED'
+    STATUS_AT_RISK = 'AT_RISK'
+    STATUS_ACHIEVED = 'ACHIEVED'
+    STATUS_MISSED = 'MISSED'
+    STATUS_WAIVED = 'WAIVED'
+    STATUS_CANCELLED = 'CANCELLED'
+    STATUS_CHOICES = [
+        (STATUS_NOT_STARTED, 'Not started'),
+        (STATUS_AT_RISK, 'At risk'),
+        (STATUS_ACHIEVED, 'Achieved'),
+        (STATUS_MISSED, 'Missed'),
+        (STATUS_WAIVED, 'Waived'),
+        (STATUS_CANCELLED, 'Cancelled'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='phase14_milestones')
+    activity = models.ForeignKey(Task, null=True, blank=True, on_delete=models.PROTECT, related_name='project_milestones')
+    milestone_code = models.CharField(max_length=80)
+    name = models.CharField(max_length=255)
+    baseline_date = models.DateField(null=True, blank=True)
+    current_planned_date = models.DateField(null=True, blank=True)
+    forecast_date = models.DateField(null=True, blank=True)
+    actual_date = models.DateField(null=True, blank=True)
+    acceptance_criteria = models.TextField(blank=True)
+    mandatory = models.BooleanField(default=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_NOT_STARTED)
+    owner = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='owned_project_milestones')
+    milestone_version = models.PositiveBigIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [('project', 'milestone_code')]
+        ordering = ['project__name', 'current_planned_date', 'milestone_code']
+
+    def clean(self):
+        super().clean()
+        if self.activity_id and self.activity.project_id != self.project_id:
+            raise ValidationError({'activity': 'Milestone activity must belong to the same project.'})
+
+
+class ProjectBaselineSnapshot(models.Model):
+    STATUS_DRAFT = 'DRAFT'
+    STATUS_APPROVED = 'APPROVED'
+    STATUS_SUPERSEDED = 'SUPERSEDED'
+    STATUS_CHOICES = [(STATUS_DRAFT, 'Draft'), (STATUS_APPROVED, 'Approved'), (STATUS_SUPERSEDED, 'Superseded')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='phase14_baselines')
+    revision = models.ForeignKey(Revision, on_delete=models.PROTECT, related_name='phase14_baselines')
+    baseline_number = models.CharField(max_length=80, unique=True)
+    revision_number = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    snapshot = models.JSONField(default=dict)
+    checksum = models.CharField(max_length=64, blank=True)
+    change_summary = models.TextField(blank=True)
+    approved_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='approved_phase14_baselines')
+    approved_at = models.DateTimeField(null=True, blank=True)
+    superseded_by = models.ForeignKey('self', null=True, blank=True, on_delete=models.PROTECT, related_name='supersedes')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['project__name', '-revision_number', '-created_at']
+        indexes = [models.Index(fields=['project', 'status'])]
+
+    def save(self, *args, **kwargs):
+        if self.pk and ProjectBaselineSnapshot.objects.filter(pk=self.pk, status__in=[self.STATUS_APPROVED, self.STATUS_SUPERSEDED]).exists():
+            original = ProjectBaselineSnapshot.objects.get(pk=self.pk)
+            mutable = {'status', 'superseded_by'}
+            for field in self._meta.fields:
+                if field.name not in mutable and getattr(original, field.name) != getattr(self, field.name):
+                    raise ValidationError({'baseline': 'Approved project baseline snapshots are immutable.'})
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError({'baseline': 'Project baseline snapshots cannot be deleted.'})
+
+
+class ProjectManufacturingRequirement(models.Model):
+    STRATEGY_MAKE = 'MAKE'
+    STRATEGY_ASSEMBLY = 'ASSEMBLY'
+    STRATEGY_MAKE_OR_BUY = 'MAKE_OR_BUY'
+    STRATEGY_INSPECTION = 'INSPECTION'
+    STRATEGY_CHOICES = [(STRATEGY_MAKE, 'Make'), (STRATEGY_ASSEMBLY, 'Assembly'), (STRATEGY_MAKE_OR_BUY, 'Make or buy'), (STRATEGY_INSPECTION, 'Inspection')]
+    STATUS_DRAFT = 'DRAFT'
+    STATUS_APPROVED = 'APPROVED'
+    STATUS_CONVERTED = 'CONVERTED'
+    STATUS_REJECTED = 'REJECTED'
+    STATUS_CANCELLED = 'CANCELLED'
+    STATUS_CHOICES = [(STATUS_DRAFT, 'Draft'), (STATUS_APPROVED, 'Approved'), (STATUS_CONVERTED, 'Converted'), (STATUS_REJECTED, 'Rejected'), (STATUS_CANCELLED, 'Cancelled')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='manufacturing_requirements')
+    activity = models.ForeignKey(Task, null=True, blank=True, on_delete=models.PROTECT, related_name='manufacturing_requirements')
+    deliverable = models.ForeignKey(ProjectDeliverable, null=True, blank=True, on_delete=models.PROTECT, related_name='manufacturing_requirements')
+    requirement_number = models.CharField(max_length=80, unique=True, blank=True)
+    strategy = models.CharField(max_length=30, choices=STRATEGY_CHOICES, default=STRATEGY_MAKE)
+    item_revision = models.ForeignKey('enterprise_items.ItemRevision', on_delete=models.PROTECT, related_name='project_manufacturing_requirements')
+    bom_revision = models.ForeignKey('enterprise_items.BOMRevision', null=True, blank=True, on_delete=models.PROTECT, related_name='project_manufacturing_requirements')
+    opc_diagram = models.ForeignKey('opc.OPCDiagram', null=True, blank=True, on_delete=models.PROTECT, related_name='project_manufacturing_requirements')
+    opc_graph_version = models.PositiveBigIntegerField(default=0)
+    document_revision = models.ForeignKey('opc.ControlledDocumentRevision', null=True, blank=True, on_delete=models.PROTECT, related_name='project_manufacturing_requirements')
+    quantity = models.DecimalField(max_digits=18, decimal_places=6)
+    unit = models.CharField(max_length=30, default='EA')
+    required_date = models.DateField()
+    plant = models.ForeignKey('opc.Plant', null=True, blank=True, on_delete=models.PROTECT, related_name='project_manufacturing_requirements')
+    warehouse = models.ForeignKey('opc.Warehouse', null=True, blank=True, on_delete=models.PROTECT, related_name='project_manufacturing_requirements')
+    priority = models.CharField(max_length=20, default='NORMAL')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    requirement_version = models.PositiveBigIntegerField(default=0)
+    approved_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='approved_project_manufacturing_requirements')
+    approved_at = models.DateTimeField(null=True, blank=True)
+    converted_demand = models.ForeignKey('opc.PlanningDemand', null=True, blank=True, on_delete=models.PROTECT, related_name='project_manufacturing_requirements')
+    idempotency_key = models.CharField(max_length=120, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['required_date', 'requirement_number']
+        indexes = [models.Index(fields=['project', 'status']), models.Index(fields=['item_revision', 'required_date'])]
+
+    def clean(self):
+        super().clean()
+        self.unit = (self.unit or 'EA').upper()
+        if self.quantity <= 0:
+            raise ValidationError({'quantity': 'Requirement quantity must be positive.'})
+        if self.activity_id and self.activity.project_id != self.project_id:
+            raise ValidationError({'activity': 'Requirement activity must belong to the same project.'})
+        if self.deliverable_id and self.deliverable.project_id != self.project_id:
+            raise ValidationError({'deliverable': 'Requirement deliverable must belong to the same project.'})
+        if not self.warehouse_id and not self.plant_id:
+            raise ValidationError({'scope': 'Manufacturing requirement requires plant or warehouse.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class ProjectProcurementRequirement(models.Model):
+    TYPE_ITEM = 'ITEM'
+    TYPE_SERVICE = 'SERVICE'
+    TYPE_CHOICES = [(TYPE_ITEM, 'Item'), (TYPE_SERVICE, 'Service')]
+    STATUS_DRAFT = 'DRAFT'
+    STATUS_APPROVED = 'APPROVED'
+    STATUS_CONVERTED = 'CONVERTED'
+    STATUS_REJECTED = 'REJECTED'
+    STATUS_CANCELLED = 'CANCELLED'
+    STATUS_CHOICES = ProjectManufacturingRequirement.STATUS_CHOICES
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='procurement_requirements')
+    activity = models.ForeignKey(Task, null=True, blank=True, on_delete=models.PROTECT, related_name='procurement_requirements')
+    deliverable = models.ForeignKey(ProjectDeliverable, null=True, blank=True, on_delete=models.PROTECT, related_name='procurement_requirements')
+    requirement_number = models.CharField(max_length=80, unique=True, blank=True)
+    requirement_type = models.CharField(max_length=20, choices=TYPE_CHOICES, default=TYPE_ITEM)
+    item_revision = models.ForeignKey('enterprise_items.ItemRevision', null=True, blank=True, on_delete=models.PROTECT, related_name='project_procurement_requirements')
+    service_description = models.TextField(blank=True)
+    quantity = models.DecimalField(max_digits=18, decimal_places=6)
+    unit = models.CharField(max_length=30, default='EA')
+    required_date = models.DateField()
+    warehouse = models.ForeignKey('opc.Warehouse', null=True, blank=True, on_delete=models.PROTECT, related_name='project_procurement_requirements')
+    inspection_required = models.BooleanField(default=False)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    requirement_version = models.PositiveBigIntegerField(default=0)
+    approved_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='approved_project_procurement_requirements')
+    approved_at = models.DateTimeField(null=True, blank=True)
+    converted_requisition = models.ForeignKey('opc.PurchaseRequisition', null=True, blank=True, on_delete=models.PROTECT, related_name='project_procurement_requirements')
+    idempotency_key = models.CharField(max_length=120, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['required_date', 'requirement_number']
+        indexes = [models.Index(fields=['project', 'status']), models.Index(fields=['item_revision', 'required_date'])]
+
+    def clean(self):
+        super().clean()
+        self.unit = (self.unit or 'EA').upper()
+        if self.quantity <= 0:
+            raise ValidationError({'quantity': 'Requirement quantity must be positive.'})
+        if self.requirement_type == self.TYPE_ITEM and not self.item_revision_id:
+            raise ValidationError({'item_revision': 'Item procurement requires an exact ItemRevision.'})
+        if self.requirement_type == self.TYPE_SERVICE and not self.service_description:
+            raise ValidationError({'service_description': 'Service procurement requires a service description.'})
+        if self.activity_id and self.activity.project_id != self.project_id:
+            raise ValidationError({'activity': 'Requirement activity must belong to the same project.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class ProjectMakeBuyDecision(models.Model):
+    STRATEGY_MAKE = 'MAKE'
+    STRATEGY_BUY = 'BUY'
+    STRATEGY_SPLIT = 'SPLIT'
+    STRATEGY_TRANSFER = 'TRANSFER'
+    STRATEGY_SUBCONTRACT = 'SUBCONTRACT'
+    STRATEGY_CHOICES = [(STRATEGY_MAKE, 'Make'), (STRATEGY_BUY, 'Buy'), (STRATEGY_SPLIT, 'Split'), (STRATEGY_TRANSFER, 'Transfer'), (STRATEGY_SUBCONTRACT, 'Subcontract')]
+    STATUS_DRAFT = 'DRAFT'
+    STATUS_APPROVED = 'APPROVED'
+    STATUS_SUPERSEDED = 'SUPERSEDED'
+    STATUS_CHOICES = [(STATUS_DRAFT, 'Draft'), (STATUS_APPROVED, 'Approved'), (STATUS_SUPERSEDED, 'Superseded')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='make_buy_decisions')
+    manufacturing_requirement = models.ForeignKey(ProjectManufacturingRequirement, null=True, blank=True, on_delete=models.PROTECT, related_name='make_buy_decisions')
+    procurement_requirement = models.ForeignKey(ProjectProcurementRequirement, null=True, blank=True, on_delete=models.PROTECT, related_name='make_buy_decisions')
+    strategy = models.CharField(max_length=20, choices=STRATEGY_CHOICES)
+    make_quantity = models.DecimalField(max_digits=18, decimal_places=6, default=0)
+    buy_quantity = models.DecimalField(max_digits=18, decimal_places=6, default=0)
+    reason = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    approved_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='approved_project_make_buy_decisions')
+    approved_at = models.DateTimeField(null=True, blank=True)
+    superseded_by = models.ForeignKey('self', null=True, blank=True, on_delete=models.PROTECT, related_name='supersedes')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def clean(self):
+        super().clean()
+        if not self.manufacturing_requirement_id and not self.procurement_requirement_id:
+            raise ValidationError({'requirement': 'Make/buy decision requires a manufacturing or procurement requirement.'})
+        total = Decimal(self.make_quantity or 0) + Decimal(self.buy_quantity or 0)
+        expected = Decimal('0')
+        if self.manufacturing_requirement_id:
+            expected = self.manufacturing_requirement.quantity
+        elif self.procurement_requirement_id:
+            expected = self.procurement_requirement.quantity
+        if self.strategy == self.STRATEGY_SPLIT and expected and total != expected:
+            raise ValidationError({'quantity': 'Split make/buy quantities must equal requirement quantity.'})
+
+
+class ProjectDownstreamLink(models.Model):
+    TYPE_PLANNING_DEMAND = 'PLANNING_DEMAND'
+    TYPE_MRP_RECOMMENDATION = 'MRP_RECOMMENDATION'
+    TYPE_PRODUCTION_ORDER = 'PRODUCTION_ORDER'
+    TYPE_PURCHASE_REQUISITION = 'PURCHASE_REQUISITION'
+    TYPE_SCHEDULING_ASSIGNMENT = 'SCHEDULING_ASSIGNMENT'
+    TYPE_OPERATION_EXECUTION = 'OPERATION_EXECUTION'
+    TYPE_INSPECTION = 'INSPECTION'
+    TYPE_NCR = 'NCR'
+    TYPE_MAINTENANCE_WORK_ORDER = 'MAINTENANCE_WORK_ORDER'
+    TYPE_CHOICES = [
+        (TYPE_PLANNING_DEMAND, 'Planning demand'),
+        (TYPE_MRP_RECOMMENDATION, 'MRP recommendation'),
+        (TYPE_PRODUCTION_ORDER, 'Production order'),
+        (TYPE_PURCHASE_REQUISITION, 'Purchase requisition'),
+        (TYPE_SCHEDULING_ASSIGNMENT, 'Scheduling assignment'),
+        (TYPE_OPERATION_EXECUTION, 'Operation execution'),
+        (TYPE_INSPECTION, 'Inspection'),
+        (TYPE_NCR, 'NCR'),
+        (TYPE_MAINTENANCE_WORK_ORDER, 'Maintenance work order'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='downstream_links')
+    activity = models.ForeignKey(Task, null=True, blank=True, on_delete=models.PROTECT, related_name='downstream_links')
+    deliverable = models.ForeignKey(ProjectDeliverable, null=True, blank=True, on_delete=models.PROTECT, related_name='downstream_links')
+    manufacturing_requirement = models.ForeignKey(ProjectManufacturingRequirement, null=True, blank=True, on_delete=models.PROTECT, related_name='downstream_links')
+    procurement_requirement = models.ForeignKey(ProjectProcurementRequirement, null=True, blank=True, on_delete=models.PROTECT, related_name='downstream_links')
+    link_type = models.CharField(max_length=40, choices=TYPE_CHOICES)
+    object_id = models.CharField(max_length=80)
+    object_number = models.CharField(max_length=120, blank=True)
+    quantity = models.DecimalField(max_digits=18, decimal_places=6, null=True, blank=True)
+    unit = models.CharField(max_length=30, blank=True)
+    status_snapshot = models.CharField(max_length=80, blank=True)
+    baseline = models.ForeignKey(ProjectBaselineSnapshot, null=True, blank=True, on_delete=models.PROTECT, related_name='downstream_links')
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('project', 'link_type', 'object_id')]
+        indexes = [models.Index(fields=['project', 'link_type']), models.Index(fields=['object_id'])]
+
+
+class ProjectProgressSnapshot(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='progress_snapshots')
+    snapshot_number = models.CharField(max_length=80, unique=True)
+    data_date = models.DateTimeField()
+    progress_percent = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    engineering_percent = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    manufacturing_percent = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    procurement_percent = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    quality_percent = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    maintenance_impact_count = models.PositiveIntegerField(default=0)
+    snapshot = models.JSONField(default=dict)
+    checksum = models.CharField(max_length=64, blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='created_project_progress_snapshots')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-data_date', '-created_at']
+
+    def save(self, *args, **kwargs):
+        if self.pk and ProjectProgressSnapshot.objects.filter(pk=self.pk).exists():
+            raise ValidationError({'progress_snapshot': 'Project progress snapshots are immutable.'})
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError({'progress_snapshot': 'Project progress snapshots cannot be deleted.'})
+
+
+class ProjectForecastSnapshot(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='forecast_snapshots')
+    snapshot_number = models.CharField(max_length=80, unique=True)
+    data_date = models.DateTimeField()
+    baseline_finish = models.DateTimeField(null=True, blank=True)
+    current_plan_finish = models.DateTimeField(null=True, blank=True)
+    forecast_finish = models.DateTimeField(null=True, blank=True)
+    actual_finish = models.DateTimeField(null=True, blank=True)
+    critical_path = models.JSONField(default=list, blank=True)
+    milestone_risks = models.JSONField(default=list, blank=True)
+    inputs = models.JSONField(default=dict, blank=True)
+    checksum = models.CharField(max_length=64, blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='created_project_forecast_snapshots')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-data_date', '-created_at']
+
+    def save(self, *args, **kwargs):
+        if self.pk and ProjectForecastSnapshot.objects.filter(pk=self.pk).exists():
+            raise ValidationError({'forecast_snapshot': 'Project forecast snapshots are immutable.'})
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError({'forecast_snapshot': 'Project forecast snapshots cannot be deleted.'})
+
+
+class ProjectImpactEvent(models.Model):
+    DOMAIN_ENGINEERING = 'ENGINEERING'
+    DOMAIN_MATERIAL = 'MATERIAL'
+    DOMAIN_PROCUREMENT = 'PROCUREMENT'
+    DOMAIN_CAPACITY = 'CAPACITY'
+    DOMAIN_EXECUTION = 'EXECUTION'
+    DOMAIN_QUALITY = 'QUALITY'
+    DOMAIN_MAINTENANCE = 'MAINTENANCE'
+    DOMAIN_CHOICES = [
+        (DOMAIN_ENGINEERING, 'Engineering'),
+        (DOMAIN_MATERIAL, 'Material'),
+        (DOMAIN_PROCUREMENT, 'Procurement'),
+        (DOMAIN_CAPACITY, 'Capacity'),
+        (DOMAIN_EXECUTION, 'Execution'),
+        (DOMAIN_QUALITY, 'Quality'),
+        (DOMAIN_MAINTENANCE, 'Maintenance'),
+    ]
+    SEVERITY_INFO = 'INFO'
+    SEVERITY_WARNING = 'WARNING'
+    SEVERITY_CRITICAL = 'CRITICAL'
+    SEVERITY_CHOICES = [(SEVERITY_INFO, 'Info'), (SEVERITY_WARNING, 'Warning'), (SEVERITY_CRITICAL, 'Critical')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='impact_events')
+    activity = models.ForeignKey(Task, null=True, blank=True, on_delete=models.PROTECT, related_name='impact_events')
+    deliverable = models.ForeignKey(ProjectDeliverable, null=True, blank=True, on_delete=models.PROTECT, related_name='impact_events')
+    domain = models.CharField(max_length=30, choices=DOMAIN_CHOICES)
+    severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES, default=SEVERITY_WARNING)
+    impact_type = models.CharField(max_length=80)
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    blocking = models.BooleanField(default=False)
+    active = models.BooleanField(default=True)
+    source_type = models.CharField(max_length=80, blank=True)
+    source_id = models.CharField(max_length=80, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolved_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='resolved_project_impacts')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-active', '-created_at']
+        indexes = [models.Index(fields=['project', 'active', 'severity']), models.Index(fields=['domain', 'impact_type'])]
+
+    def save(self, *args, **kwargs):
+        if self.pk and ProjectImpactEvent.objects.filter(pk=self.pk).exists():
+            original = ProjectImpactEvent.objects.get(pk=self.pk)
+            mutable = {'active', 'resolved_at', 'resolved_by'}
+            for field in self._meta.fields:
+                if field.name not in mutable and getattr(original, field.name) != getattr(self, field.name):
+                    raise ValidationError({'impact': 'Project impact events are append-only except resolution fields.'})
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError({'impact': 'Project impact events cannot be deleted.'})
+
+
 # =========================================================
 # 14. TASK REPORTING (MY TASKS SYSTEM)
 # =========================================================
@@ -1216,6 +1790,25 @@ class TaskDelivery(models.Model):
         (STATUS_APPROVED, "Approved"),
         (STATUS_REJECTED, "Rejected"),
         (STATUS_CANCELLED, "Cancelled"),
+    ]
+
+    TYPE_PRODUCT_DEVELOPMENT = 'PRODUCT_DEVELOPMENT'
+    TYPE_MANUFACTURING = 'MANUFACTURING'
+    TYPE_CUSTOMER_DELIVERY = 'CUSTOMER_DELIVERY'
+    TYPE_OVERHAUL = 'OVERHAUL'
+    TYPE_INSTALLATION = 'INSTALLATION'
+    TYPE_COMMISSIONING = 'COMMISSIONING'
+    TYPE_INTERNAL = 'INTERNAL'
+    TYPE_OTHER = 'OTHER'
+    TYPE_CHOICES = [
+        (TYPE_PRODUCT_DEVELOPMENT, 'Product development'),
+        (TYPE_MANUFACTURING, 'Manufacturing'),
+        (TYPE_CUSTOMER_DELIVERY, 'Customer delivery'),
+        (TYPE_OVERHAUL, 'Overhaul'),
+        (TYPE_INSTALLATION, 'Installation'),
+        (TYPE_COMMISSIONING, 'Commissioning'),
+        (TYPE_INTERNAL, 'Internal'),
+        (TYPE_OTHER, 'Other'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

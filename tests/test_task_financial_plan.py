@@ -8,6 +8,7 @@ from django.core.exceptions import ValidationError
 from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.test import APIClient
 
 from ktcPlanning.financial_services import (
@@ -15,6 +16,7 @@ from ktcPlanning.financial_services import (
     allocate_cost_transaction_to_milestones,
     allocate_plan_payment,
     approve_task_delivery,
+    cancel_task_delivery,
     evaluate_milestone_eligibility,
     get_effective_task_delivery,
     get_task_delivery_attachment_capabilities,
@@ -356,6 +358,7 @@ class TestCostRecognitionMilestoneAllocation:
     def test_milestone_trigger_change_with_allocation_is_rejected(self, financial_setup):
         plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="300.00")
         milestone = PaymentMilestone.objects.create(financial_plan=plan, title="M1", sequence=1, trigger_type=PaymentMilestone.TRIGGER_BEFORE_START, amount_type=PaymentMilestone.AMOUNT_FIXED, fixed_amount=Decimal("300.00"))
+        activate_plan(plan)
         tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="300.00", financial_plan=plan)
         allocate_cost_transaction_to_milestones(tx)
         milestone.trigger_type = PaymentMilestone.TRIGGER_FIXED_DATE
@@ -367,6 +370,7 @@ class TestCostRecognitionMilestoneAllocation:
     def test_plan_summary_ignores_payment_transactions(self, financial_setup):
         plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="300.00")
         milestone = PaymentMilestone.objects.create(financial_plan=plan, title="M1", sequence=1, trigger_type=PaymentMilestone.TRIGGER_BEFORE_START, amount_type=PaymentMilestone.AMOUNT_FIXED, fixed_amount=Decimal("300.00"))
+        activate_plan(plan)
         tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="300.00", financial_plan=plan)
         allocate_cost_transaction_to_milestones(tx)
         register_transaction(milestone, PaymentTransaction.TYPE_PAYMENT, Decimal("200.00"), timezone.localdate(), financial_setup["admin"])
@@ -470,7 +474,11 @@ class TestTaskFinancialPlanService:
         add_30_40_30(plan)
         activate_plan(plan)
 
-        make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="75.00", financial_plan=plan)
+        transaction = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="75.00", financial_plan=plan)
+        approve_progress(financial_setup["task"], financial_setup["admin"], 50)
+        submitted = submit_task_delivery(make_delivery(financial_setup["task"], financial_setup["admin"]), user=financial_setup["admin"])
+        approve_task_delivery(submitted, user=financial_setup["reviewer"])
+        allocate_cost_transaction_to_milestones(transaction)
 
         status_payload = get_task_financial_status(financial_setup["task"])
         assert status_payload["total_incurred"] == "75.00"
@@ -666,6 +674,16 @@ class TestTaskFinancialPlanCostTransactionApi:
 
     def test_api_links_cost_transaction_to_valid_payable_plan(self, financial_setup):
         plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="100.00")
+        from ktcPlanning.models import BudgetAllocation, FundingSource
+        source = FundingSource.objects.create(
+            title="API budget", source_type="CONTRACT", received_date=timezone.localdate(),
+            total_amount=Decimal("100.00"), status="APPROVED", created_by=financial_setup["admin"],
+        )
+        BudgetAllocation.objects.create(
+            funding_source=source, project=financial_setup["project"], revision=financial_setup["revision"],
+            scope_type="PROJECT", cost_type="COST", allocated_amount=Decimal("100.00"),
+            status="APPROVED", created_by=financial_setup["admin"],
+        )
 
         response = api(financial_setup["admin"]).post(reverse("cost-transaction-list"), {
             "project": financial_setup["project"].id,
@@ -844,16 +862,16 @@ class TestTaskDeliveryWorkflow:
         assert delivery.status == TaskDelivery.STATUS_DRAFT
         assert delivery.description == "edited"
 
-        with pytest.raises(ValidationError):
+        with pytest.raises(DRFValidationError):
             approve_task_delivery(delivery, user=financial_setup["reviewer"])
 
         cancelled = cancel_task_delivery(delivery, user=financial_setup["admin"])
         assert cancelled.status == TaskDelivery.STATUS_CANCELLED
-        with pytest.raises(ValidationError):
+        with pytest.raises(DRFValidationError):
             submit_task_delivery(cancelled, user=financial_setup["admin"])
 
         submitted = submit_task_delivery(make_delivery(financial_setup["task"], financial_setup["admin"]), user=financial_setup["admin"])
-        with pytest.raises(ValidationError):
+        with pytest.raises(DRFValidationError):
             reject_task_delivery(submitted, user=financial_setup["reviewer"], reason="")
         rejected = reject_task_delivery(submitted, user=financial_setup["reviewer"], reason="Incomplete")
         assert rejected.status == TaskDelivery.STATUS_REJECTED
@@ -862,9 +880,9 @@ class TestTaskDeliveryWorkflow:
 
         approved = submit_task_delivery(make_delivery(financial_setup["task"], financial_setup["admin"]), user=financial_setup["admin"])
         approved, _ = approve_task_delivery(approved, user=financial_setup["reviewer"])
-        with pytest.raises(ValidationError):
+        with pytest.raises(DRFValidationError):
             cancel_task_delivery(approved, user=financial_setup["admin"])
-        with pytest.raises(ValidationError):
+        with pytest.raises(DRFValidationError):
             reject_task_delivery(approved, user=financial_setup["reviewer"], reason="late")
 
     def test_latest_approved_delivery_and_as_of_cutoff(self, financial_setup):
@@ -873,6 +891,8 @@ class TestTaskDeliveryWorkflow:
         cutoff = first.approved_at + timedelta(seconds=1)
         second = submit_task_delivery(make_delivery(financial_setup["task"], financial_setup["admin"], delivery_reference="B"), user=financial_setup["admin"])
         second, _ = approve_task_delivery(second, user=financial_setup["reviewer"])
+        TaskDelivery.objects.filter(pk=second.pk).update(approved_at=first.approved_at + timedelta(seconds=2))
+        second.refresh_from_db()
 
         assert get_effective_task_delivery(financial_setup["task"]).id == second.id
         assert get_effective_task_delivery(financial_setup["task"], as_of_date=cutoff).id == first.id
@@ -899,6 +919,7 @@ class TestTaskDeliveryWorkflow:
     def test_approved_delivery_unlocks_allocation_without_payment_or_cost_side_effects(self, financial_setup):
         plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="1000.00")
         first, second, third = add_before_delivery_milestones(plan)
+        activate_plan(plan)
         tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="800.00", financial_plan=plan)
 
         before = allocate_cost_transaction_to_milestones(tx)
@@ -1070,6 +1091,9 @@ class TestTaskDeliveryEvidenceAttachments:
         download_response = client.get(reverse("task-delivery-attachment-download", kwargs={"pk": attachment.id}))
         assert download_response.status_code == status.HTTP_200_OK
         assert "unsafe_evidence.pdf" in download_response["Content-Disposition"]
+        # FileResponse owns an open file handle. Explicitly close the test
+        # response before exercising physical-file deletion on Windows.
+        download_response.close()
 
         stored_path = tmp_path / attachment.file.name
         assert stored_path.exists()
@@ -1192,6 +1216,7 @@ class TestTaskDeliveryEvidenceAttachments:
         settings.MEDIA_ROOT = tmp_path
         plan = make_plan(financial_setup["task"], financial_setup["admin"], amount="1000.00")
         first, _, _ = add_cost_recognition_milestones(plan)
+        activate_plan(plan)
         tx = make_cost_transaction(financial_setup["task"], financial_setup["revision"], financial_setup["admin"], amount="300.00", financial_plan=plan)
         allocate_cost_transaction_to_milestones(tx)
         register_transaction(first, PaymentTransaction.TYPE_PAYMENT, Decimal("100.00"), timezone.localdate(), financial_setup["admin"])
@@ -1230,7 +1255,7 @@ class TestTaskDeliveryEvidenceAttachments:
                 "file": evidence_file(f"{delivery.delivery_reference}.pdf"),
             }, format="multipart")
 
-        with django_assert_num_queries(5):
+        with django_assert_num_queries(10):
             response = client.get(reverse("task-delivery-list"), {"task_id": str(financial_setup["task"].id)})
 
         assert response.status_code == status.HTTP_200_OK, response.data

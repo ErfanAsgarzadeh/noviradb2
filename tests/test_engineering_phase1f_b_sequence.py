@@ -1,6 +1,7 @@
 import pytest
+from threading import Barrier
 from concurrent.futures import ThreadPoolExecutor
-from django.db import close_old_connections
+from django.db import close_old_connections, connections
 
 from enterprise_items.engineering_domain_errors import SequenceExhaustedError
 from enterprise_items.engineering_domain_services import SequenceAllocationService
@@ -26,11 +27,22 @@ def test_sequence_preview_does_not_increment_commit_allocates_unique_and_exhaust
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.postgresql
+@pytest.mark.concurrency
 def test_concurrent_sequence_allocations_are_unique_and_scope_keys_are_supported():
     ctx = build_domain()
+    start = Barrier(5)
+
     def allocate(_):
         close_old_connections()
-        return SequenceAllocationService().next_value(ctx['version'], preview=False)[0]
+        try:
+            # All workers hold distinct Django connections and enter the
+            # allocation path together; this exercises SELECT FOR UPDATE on
+            # PostgreSQL rather than a timing-dependent sequential loop.
+            start.wait()
+            return SequenceAllocationService().next_value(ctx['version'], preview=False)[0]
+        finally:
+            connections.close_all()
     with ThreadPoolExecutor(max_workers=5) as pool:
         values = list(pool.map(allocate, range(5)))
     assert len(values) == len(set(values)) == 5
