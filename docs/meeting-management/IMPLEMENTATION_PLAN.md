@@ -4,7 +4,7 @@ Last updated: 2026-08-01
 
 ## Current Phase
 
-Phase 6 - Dashboards, exports, and printable minutes: completed; Phase 7 starting.
+Phase 7 - Final integration and hardening: completed.
 
 ## Repository Map
 

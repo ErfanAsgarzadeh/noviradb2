@@ -18,7 +18,7 @@ Primary packages:
 - `admin.py`: initial operational admin registration.
 - `management/commands/generate_meeting_notifications.py`: deterministic notification run.
 
-Phase 1 implemented the governance, meeting, participation, agenda, and minutes-version model layer. Phase 2 added the resolution/action execution chain, workflow services, audit calls, notifications, and deterministic notification command. API, reporting, and frontend layers follow in later phases.
+Phase 1 implemented the governance, meeting, participation, agenda, and minutes-version model layer. Phase 2 added the resolution/action execution chain, workflow services, audit calls, notifications, and deterministic notification command. Phase 3 exposed the DRF API and reporting selectors. Phases 4 through 6 added the frontend application shell, operational panels, reporting dashboards, export, and printable minutes.
 
 ## ERD-Level Model Groups
 
@@ -39,7 +39,6 @@ Meeting lifecycle:
 - `MeetingParticipant`
 - `MeetingAgendaItem`
 - `MeetingMinutesVersion`
-- `MeetingAttachment`
 
 Resolution chain:
 
@@ -121,3 +120,4 @@ Responsible users cannot directly move actions to `closed`; an accepted completi
 - Index meeting date/status/type/project/unit/confidentiality.
 - Index action status, priority, due dates, accountable unit/user, responsible user, reviewer, and project/task links.
 - Dashboard selectors must aggregate in the database and avoid row-by-row permission or KPI queries.
+- API list endpoints use filtered querysets with `select_related()` for common meeting/action relations and object visibility is applied before detail responses and aggregate reports.

@@ -74,6 +74,24 @@ Last updated: 2026-08-01
 | Meeting Playwright spec | Blocked | Auth setup failed due missing `NOVIRA_E2E_PASSWORD`; 5 meeting tests did not run. |
 | Full frontend lint | Baseline failed | 99 errors, 107 warnings in pre-existing files. |
 
+## Phase 7 Executed Tests
+
+| Suite | Status | Notes |
+| --- | --- | --- |
+| Focused API hardening tests | Passed after fix | 7 passed after correcting local test setup. |
+| Django check | Passed | `DB_ENGINE=sqlite python manage.py check` |
+| Migration dry-run | Passed | `DB_ENGINE=sqlite python manage.py makemigrations --check --dry-run` |
+| Fresh SQLite migration rehearsal | Passed after timeout rerun | `DB_ENGINE=sqlite SQLITE_DB_PATH=:memory: python manage.py migrate --noinput` applied all migrations. |
+| Meeting-management package | Passed | 31 passed. |
+| Backend full pytest | Baseline failed | 501 passed, 1 failed, 12 skipped; same SQLite concurrency lock failure. |
+| Scoped frontend lint | Passed | Meeting-management files and E2E spec passed. |
+| Frontend typecheck | Passed | `npx.cmd tsc --noEmit` passed. |
+| Frontend build | Passed | `npm.cmd run build` passed. |
+| Full frontend lint | Baseline failed | 99 errors, 107 warnings in pre-existing files. |
+| Meeting Playwright spec | Blocked | Auth setup failed due missing `NOVIRA_E2E_PASSWORD`; 5 meeting tests did not run. |
+| Full Playwright | Failed/blocked | 3 passed, auth setup failed due missing secret, public `/OPC` redirect smoke failed, 28 did not run. |
+| Diff whitespace check | Passed | `git diff --check` passed in both repositories with line-ending warnings only. |
+
 ## Planned Backend Tests
 
 - `tests/meeting_management/test_models.py`

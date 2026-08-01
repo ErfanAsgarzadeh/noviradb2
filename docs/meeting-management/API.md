@@ -27,13 +27,12 @@ Implemented in Phase 3 using DRF routers and explicit command actions.
 - `progress-reports/`
 - `completion-submissions/`
 - `deadline-change-requests/`
-- `approval-workflows/`
-- `workflow-instances/`
+- `workflows/`
+- `reminder-policies/`
 - `notifications/`
 - `reports/individual/`
 - `reports/unit/`
 - `reports/executive/`
-- `reports/secretariat/`
 
 Current implemented report actions:
 
@@ -46,9 +45,9 @@ Current implemented report actions:
 - `POST /api/meetings/meetings/{id}/schedule/`
 - `POST /api/meetings/meetings/{id}/mark-held/`
 - `POST /api/meetings/meetings/{id}/start-minutes/`
-- `POST /api/meetings/meetings/{id}/submit-minutes/`
 - `POST /api/meetings/meetings/{id}/cancel/`
 - `POST /api/meetings/meetings/{id}/archive/`
+- `POST /api/meetings/minute-versions/{id}/submit/`
 - `POST /api/meetings/minute-versions/{id}/approve/`
 - `POST /api/meetings/minute-versions/{id}/request-revision/`
 - `POST /api/meetings/actions/{id}/submit-progress/`
@@ -56,7 +55,6 @@ Current implemented report actions:
 - `POST /api/meetings/actions/{id}/convert-to-project-task/`
 - `POST /api/meetings/completion-submissions/{id}/accept/`
 - `POST /api/meetings/completion-submissions/{id}/request-revision/`
-- `POST /api/meetings/completion-submissions/{id}/reject/`
 - `POST /api/meetings/deadline-change-requests/{id}/approve/`
 - `POST /api/meetings/deadline-change-requests/{id}/reject/`
 

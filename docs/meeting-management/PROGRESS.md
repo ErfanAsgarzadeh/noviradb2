@@ -270,3 +270,52 @@ Failures and fixes:
 Remaining known limitations:
 
 - Browser-level report export behavior is implemented and type/build validated, but cannot be exercised in the authenticated Playwright suite until credentials are provided.
+
+Frontend commit:
+
+- `4a0c562` - Add meeting reporting dashboards and export
+
+Backend docs commit:
+
+- `ab78f9f` - Document meeting reporting phase
+
+## 2026-08-01 - Phase 7 Final Integration And Hardening
+
+Changes made:
+
+- Added explicit `POST /api/meetings/minute-versions/{id}/submit/` endpoint using the existing minutes workflow service.
+- Hardened dependency creation and deadline-change creation to resolve submitted action IDs through visible-action querysets.
+- Ensured dependency API creation returns the service-created dependency instance.
+- Corrected API documentation drift for implemented workflow/reminder/report endpoints.
+- Refreshed architecture notes for the completed API/frontend/reporting phases.
+
+Commands:
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| `DB_ENGINE=sqlite python -m pytest tests/meeting_management/test_api_meetings.py tests/meeting_management/test_dependencies.py` | 1 then 0 | Initial test setup bug fixed; rerun 7 passed. |
+| `DB_ENGINE=sqlite python manage.py check` | 0 | Passed. |
+| `DB_ENGINE=sqlite python manage.py makemigrations --check --dry-run` | 0 | Passed; no changes detected. |
+| `DB_ENGINE=sqlite SQLITE_DB_PATH=:memory: python manage.py migrate --noinput` | 124 then 0 | First run timed out at 2 minutes; rerun with longer timeout passed and applied all migrations. |
+| `DB_ENGINE=sqlite python -m pytest tests/meeting_management` | 0 | 31 passed. |
+| `DB_ENGINE=sqlite python -m pytest` | 1 | 501 passed, 1 failed, 12 skipped; same verified SQLite concurrency baseline failure. |
+| `npm.cmd run lint -- components/meeting-management lib/meetingManagementApi.ts types/meetingManagement.ts tests/e2e/meeting-management.spec.ts` | 0 | Passed. |
+| `npx.cmd tsc --noEmit` | 0 | Passed. |
+| `npm.cmd run build` | 0 | Passed. |
+| `npm.cmd run lint -- --format json -o artifacts/phase7-eslint.json` | 1 | 99 errors, 107 warnings in pre-existing files. |
+| `npx.cmd playwright test tests/e2e/meeting-management.spec.ts --project=phase1e` | 1 | Auth setup failed due missing `NOVIRA_E2E_PASSWORD`; 5 meeting tests did not run. |
+| `npx.cmd playwright test` | 1 | 3 passed, 2 failed, 28 did not run; auth secret missing and public `/OPC` redirect smoke failed. |
+| `git diff --check` | 0 | Passed for both repositories; line-ending warnings only. |
+
+Failures and fixes:
+
+- Fixed a Phase 7 test setup error caused by passing unsupported keyword arguments to the meeting test factory.
+- Full backend suite still has the verified pre-existing SQLite lock failure in `tests/test_engineering_phase1f_b_sequence.py`.
+- Authenticated Playwright tests remain blocked by the missing `NOVIRA_E2E_PASSWORD` secret.
+- Full Playwright additionally exposed an unrelated public smoke expectation for `/OPC` redirect behavior; meeting-management tests did not execute because auth setup failed.
+- Broad frontend lint remains verified pre-existing debt outside this feature slice.
+
+Remaining known limitations:
+
+- File/evidence upload UI for meeting action completion evidence is model-ready but not exposed as a polished frontend upload workflow.
+- Authenticated browser validation, including narrow-viewport review, requires valid E2E credentials.

@@ -1,4 +1,5 @@
 from django.db.models import Q
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -181,6 +182,11 @@ class MeetingMinutesVersionViewSet(MeetingChildViewSet):
     queryset = MeetingMinutesVersion.objects.select_related("meeting", "author", "submitted_by", "approved_by")
     serializer_class = MeetingMinutesVersionSerializer
 
+    @action(detail=True, methods=["post"], url_path="submit")
+    def submit(self, request, pk=None):
+        minute = submit_minutes(self.get_object(), actor=request.user)
+        return Response(self.get_serializer(minute).data)
+
     @action(detail=True, methods=["post"], url_path="approve")
     def approve(self, request, pk=None):
         minute = approve_minutes(self.get_object(), actor=request.user)
@@ -257,9 +263,12 @@ class ActionDependencyViewSet(MeetingBaseViewSet):
         return self.queryset.filter(Q(predecessor_id__in=action_ids) | Q(successor_id__in=action_ids))
 
     def perform_create(self, serializer):
-        add_dependency(
-            predecessor=serializer.validated_data["predecessor"],
-            successor=serializer.validated_data["successor"],
+        visible_actions = filter_visible_actions(ResolutionAction.objects.all(), self.request.user)
+        predecessor = get_object_or_404(visible_actions, pk=serializer.validated_data["predecessor"].pk)
+        successor = get_object_or_404(visible_actions, pk=serializer.validated_data["successor"].pk)
+        serializer.instance = add_dependency(
+            predecessor=predecessor,
+            successor=successor,
             dependency_type=serializer.validated_data.get("dependency_type", DependencyType.FINISH_TO_START),
             actor=self.request.user,
             description=serializer.validated_data.get("description", ""),
@@ -303,7 +312,7 @@ class ActionDeadlineChangeRequestViewSet(MeetingBaseViewSet):
         return self.queryset.filter(action_id__in=action_ids)
 
     def create(self, request, *args, **kwargs):
-        action_obj = ResolutionAction.objects.get(pk=request.data["action"])
+        action_obj = get_object_or_404(filter_visible_actions(ResolutionAction.objects.all(), request.user), pk=request.data["action"])
         req = request_deadline_change(action_obj, actor=request.user, requested_due_date=request.data["requested_due_date"], reason=request.data.get("reason", ""))
         return Response(self.get_serializer(req).data, status=status.HTTP_201_CREATED)
 
