@@ -116,3 +116,37 @@ Remaining known limitations:
 
 - API/permission/reporting endpoints are not implemented until Phase 3.
 - PostgreSQL validation still not run; no disposable service confirmed.
+
+Commit:
+
+- `8e37596` - Add meeting management workflows and tracking
+
+## 2026-08-01 - Phase 3 Backend API, Permissions, And Reporting
+
+Changes made:
+
+- Added DRF serializers, viewsets, optional-slash router, and `/api/meetings/` URL mount.
+- Added explicit action endpoints for meeting transitions, minutes approval/revision, action progress/completion, completion acceptance/revision, deadline decisions, and project-task conversion.
+- Added queryset and object-level permission filtering for meetings/actions and child resources.
+- Added individual, unit, and executive dashboard endpoints.
+- Added API, permission, and reporting tests.
+
+Commands:
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| `DB_ENGINE=sqlite python manage.py check` | 0 | Passed. |
+| `DB_ENGINE=sqlite python manage.py makemigrations --check --dry-run` | 0 | Passed; no changes detected. |
+| `DB_ENGINE=sqlite python -m pytest tests/meeting_management` | 0 | 29 passed. |
+| `DB_ENGINE=sqlite python -m pytest` | 1 | 496 passed, 1 failed, 12 skipped. |
+
+Failures and fixes:
+
+- No Phase 3 test failures in focused suite.
+- Full backend suite failure remains verified pre-existing SQLite concurrency issue in `tests/test_engineering_phase1f_b_sequence.py`.
+
+Remaining known limitations:
+
+- API documentation is endpoint inventory level; detailed request/response examples should be expanded in hardening.
+- Attachment content authorization endpoints are not yet exposed; model-level evidence and visibility groundwork exists.
+- PostgreSQL validation still not run.

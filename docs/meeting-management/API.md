@@ -6,6 +6,8 @@ Base namespace: `/api/meetings/`
 
 Routing will preserve optional trailing slash compatibility.
 
+Implemented in Phase 3 using DRF routers and explicit command actions.
+
 ## Resource Inventory
 
 - `meeting-types/`
@@ -32,6 +34,12 @@ Routing will preserve optional trailing slash compatibility.
 - `reports/unit/`
 - `reports/executive/`
 - `reports/secretariat/`
+
+Current implemented report actions:
+
+- `GET /api/meetings/reports/individual/`
+- `GET /api/meetings/reports/unit/`
+- `GET /api/meetings/reports/executive/`
 
 ## Command Endpoints
 

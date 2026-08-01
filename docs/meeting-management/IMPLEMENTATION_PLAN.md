@@ -4,7 +4,7 @@ Last updated: 2026-08-01
 
 ## Current Phase
 
-Phase 2 - Resolutions, actions, tracking, and workflow services: completed; Phase 3 starting.
+Phase 3 - Backend API, permissions, and reporting: completed; Phase 4 starting.
 
 ## Repository Map
 
