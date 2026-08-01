@@ -4,7 +4,7 @@ Last updated: 2026-08-01
 
 ## Current Phase
 
-Phase 3 - Backend API, permissions, and reporting: completed; Phase 4 starting.
+Phase 4 - Frontend application shell and administration: completed; Phase 5 starting.
 
 ## Repository Map
 

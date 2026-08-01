@@ -43,6 +43,16 @@ Last updated: 2026-08-01
 | Meeting-management API/package | Passed | 29 passed. |
 | Backend full pytest | Baseline failed | 496 passed, 1 failed, 12 skipped; same SQLite concurrency lock failure as baseline. |
 
+## Phase 4 Executed Tests
+
+| Suite | Status | Notes |
+| --- | --- | --- |
+| Scoped frontend lint | Passed after fix | New meeting-management files and E2E spec passed. |
+| Frontend typecheck | Passed after fix | `npx.cmd tsc --noEmit` passed. |
+| Full frontend lint | Baseline failed | 99 errors, 107 warnings in pre-existing files. |
+| Frontend build | Passed | `npm.cmd run build` passed and generated meeting routes. |
+| Meeting Playwright spec | Blocked | Auth setup failed due missing `NOVIRA_E2E_PASSWORD`; 2 meeting tests did not run. |
+
 ## Planned Backend Tests
 
 - `tests/meeting_management/test_models.py`
