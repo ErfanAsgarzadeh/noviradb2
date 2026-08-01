@@ -196,3 +196,41 @@ Remaining known limitations:
 
 - Phase 4 UI is a shell/admin foundation; operational detail workflows are planned for Phase 5.
 - Authenticated Playwright coverage is added but cannot run without `NOVIRA_E2E_PASSWORD`.
+
+Frontend commit:
+
+- `52eb638` - Add meeting management frontend shell
+
+Backend docs commit:
+
+- `6e0290b` - Document meeting frontend shell phase
+
+## 2026-08-01 - Phase 5 Frontend Operational Workflows
+
+Changes made:
+
+- Added meeting detail operational panels for attendance, agenda, minutes versions, and actions/RACI.
+- Added My Commitments command controls for progress submission and completion submission.
+- Added administration notification/dependency/history summary surfaces.
+- Expanded frontend API/types for participants, agenda, minutes, notifications, progress, completion, deadline requests, and dependencies.
+- Expanded Playwright spec to cover operational panels and commitment actions with mocked APIs.
+
+Commands:
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| `npm.cmd run lint -- components/meeting-management lib/meetingManagementApi.ts types/meetingManagement.ts tests/e2e/meeting-management.spec.ts` | 0 | Passed. |
+| `npx.cmd tsc --noEmit` | 0 | Passed. |
+| `npm.cmd run build` | 0 | Passed. |
+| `npx.cmd playwright test tests/e2e/meeting-management.spec.ts --project=phase1e` | 1 | Auth setup failed due missing `NOVIRA_E2E_PASSWORD`; 4 meeting tests did not run. |
+| `npm.cmd run lint` | 1 | 99 errors, 107 warnings in pre-existing files. |
+
+Failures and fixes:
+
+- No new scoped lint/type/build failures.
+- Playwright remains blocked by missing auth secret.
+- Full lint remains verified pre-existing debt.
+
+Remaining known limitations:
+
+- Operational UI uses compact forms and panels; advanced rich editors, file upload controls, and audit event drill-down need further refinement.

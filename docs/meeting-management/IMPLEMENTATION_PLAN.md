@@ -4,7 +4,7 @@ Last updated: 2026-08-01
 
 ## Current Phase
 
-Phase 4 - Frontend application shell and administration: completed; Phase 5 starting.
+Phase 5 - Frontend operational workflows: completed; Phase 6 starting.
 
 ## Repository Map
 
