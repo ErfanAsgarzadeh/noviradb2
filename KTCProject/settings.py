@@ -111,7 +111,9 @@ INSTALLED_APPS = [
     'enterprise_items.apps.EnterpriseItemsConfig',
     'corsheaders',
     "rest_framework_simplejwt.token_blacklist",
-    'management_reports.apps.ManagementReportsConfig'
+    'management_reports.apps.ManagementReportsConfig',
+    'release_readiness.apps.ReleaseReadinessConfig',
+    'meeting_management.apps.MeetingManagementConfig',
 
 ]
 
@@ -120,6 +122,7 @@ if os.environ.get('USE_S3_STORAGE', '0').lower() in ('1', 'true', 'yes'):
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'KTCProject.middleware.RequestCorrelationMiddleware',
     'KTCProject.middleware.IPWhitelistMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -180,7 +183,7 @@ else:
             'HOST':         os.environ.get('POSTGRES_HOST'),
             'PORT':         os.environ.get('POSTGRES_PORT'),
             # Persistent connections for better performance under load.
-            'CONN_MAX_AGE': int(os.environ.get('POSTGRES_CONN_MAX_AGE')),
+            'CONN_MAX_AGE': int(os.environ.get('POSTGRES_CONN_MAX_AGE', '0')),
         }
     }
 
@@ -353,3 +356,27 @@ CORS_ALLOW_HEADERS = [
 ]
 
 APPEND_SLASH=False
+
+SESSION_COOKIE_SECURE = os.environ.get('SESSION_COOKIE_SECURE', '0' if DEBUG else '1').lower() in ('1', 'true', 'yes')
+CSRF_COOKIE_SECURE = os.environ.get('CSRF_COOKIE_SECURE', '0' if DEBUG else '1').lower() in ('1', 'true', 'yes')
+SECURE_SSL_REDIRECT = os.environ.get('SECURE_SSL_REDIRECT', '0' if DEBUG else '1').lower() in ('1', 'true', 'yes')
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = os.environ.get('SECURE_REFERRER_POLICY', 'same-origin')
+X_FRAME_OPTIONS = os.environ.get('X_FRAME_OPTIONS', 'DENY')
+SECURE_HSTS_SECONDS = int(os.environ.get('SECURE_HSTS_SECONDS', '0' if DEBUG else '31536000'))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = os.environ.get('SECURE_HSTS_INCLUDE_SUBDOMAINS', '0' if DEBUG else '1').lower() in ('1', 'true', 'yes')
+SECURE_HSTS_PRELOAD = os.environ.get('SECURE_HSTS_PRELOAD', '0').lower() in ('1', 'true', 'yes')
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https') if os.environ.get('TRUST_PROXY_SSL_HEADER', '0').lower() in ('1', 'true', 'yes') else None
+NOVIRA_BUILD_ID = os.environ.get('NOVIRA_BUILD_ID', 'local-no-git')
+NOVIRA_API_VERSION = os.environ.get('NOVIRA_API_VERSION', 'v1')
+NOVIRA_EMAIL_PROVIDER = os.environ.get('NOVIRA_EMAIL_PROVIDER', '').strip()
+NOVIRA_IMPORT_MAX_ROWS = int(os.environ.get('NOVIRA_IMPORT_MAX_ROWS', '1000'))
+NOVIRA_EXPORT_MAX_ROWS = int(os.environ.get('NOVIRA_EXPORT_MAX_ROWS', '5000'))
+NOVIRA_RELEASE_ID = os.environ.get('NOVIRA_RELEASE_ID', '').strip()
+NOVIRA_EXPECTED_RELEASE_ID = os.environ.get('NOVIRA_EXPECTED_RELEASE_ID', '').strip()
+NOVIRA_ENVIRONMENT_NAME = os.environ.get('NOVIRA_ENVIRONMENT_NAME', 'local')
+NOVIRA_FRONTEND_URL = os.environ.get('NOVIRA_FRONTEND_URL', 'http://127.0.0.1:3000')
+NOVIRA_BACKEND_URL = os.environ.get('NOVIRA_BACKEND_URL', 'http://127.0.0.1:8000')
+NOVIRA_BACKUP_DESTINATION_CLASS = os.environ.get('NOVIRA_BACKUP_DESTINATION_CLASS', '').strip()
+NOVIRA_MONITORING_DESTINATION_CLASS = os.environ.get('NOVIRA_MONITORING_DESTINATION_CLASS', '').strip()
+NOVIRA_OUTBOX_PROVIDER = os.environ.get('NOVIRA_OUTBOX_PROVIDER', '').strip()
