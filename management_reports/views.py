@@ -13,6 +13,29 @@ from .models import ManagementReport, CuratedBottleneck
 from .serializers import ManagementReportSerializer
 
 
+def dedupe_bottlenecks(rows):
+    seen_task_ids = set()
+    seen_fingerprints = set()
+    deduped = []
+    for row in rows:
+        task_id = row.get("task_id")
+        if task_id:
+            if task_id in seen_task_ids:
+                continue
+            seen_task_ids.add(task_id)
+        fingerprint = (
+            task_id or "",
+            row.get("issue_type") or "",
+            row.get("description") or "",
+            row.get("severity") or "",
+        )
+        if fingerprint in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fingerprint)
+        deduped.append(row)
+    return deduped
+
+
 class PreparePlannerReportAPI(APIView):
     """
     متد GET: خواندن دیتای خام از هسته سیستم و تولید پیش‌نویس (Draft) برای برنامه‌ریز
@@ -136,6 +159,9 @@ class PreparePlannerReportAPI(APIView):
                     "planner_remark": ""
                 })
 
+        suggested_bottlenecks = dedupe_bottlenecks(suggested_bottlenecks)
+        available_highlights = dedupe_bottlenecks(available_highlights)
+
         return Response({
             "project_id": project.id,
             "project_name": project.name,
@@ -178,7 +204,7 @@ class SaveManagementReportAPI(APIView):
         )
 
         # استخراج و ذخیره آیتم‌های گلوگاه (نام تسک و WBS در دیتابیس ذخیره نمی‌شوند)
-        bottlenecks_data = data.get("bottlenecks", [])
+        bottlenecks_data = dedupe_bottlenecks(data.get("bottlenecks", []))
         bottlenecks_to_create = [
             CuratedBottleneck(
                 report=report,

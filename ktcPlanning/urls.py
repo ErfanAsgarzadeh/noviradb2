@@ -15,7 +15,7 @@ from .views import (
     ProgramViewSet, ProjectMemberViewSet, ProjectDeliverableViewSet, ProjectMilestoneViewSet,
     ProjectBaselineSnapshotViewSet, ProjectManufacturingRequirementViewSet, ProjectProcurementRequirementViewSet,
     ProjectMakeBuyDecisionViewSet, ProjectDownstreamLinkViewSet, ProjectProgressSnapshotViewSet,
-    ProjectForecastSnapshotViewSet, ProjectImpactEventViewSet
+    ProjectForecastSnapshotViewSet, ProjectImpactEventViewSet, ProjectOPCImportViewSet
 )
 
 # ایجاد یک نمونه از روتور پیش‌فرض DRF
@@ -44,6 +44,7 @@ router.register(r'project-manufacturing-requirements', ProjectManufacturingRequi
 router.register(r'project-procurement-requirements', ProjectProcurementRequirementViewSet, basename='project-procurement-requirement')
 router.register(r'project-make-buy-decisions', ProjectMakeBuyDecisionViewSet, basename='project-make-buy-decision')
 router.register(r'project-downstream-links', ProjectDownstreamLinkViewSet, basename='project-downstream-link')
+router.register(r'project-opc-imports', ProjectOPCImportViewSet, basename='project-opc-import')
 router.register(r'project-progress-snapshots', ProjectProgressSnapshotViewSet, basename='project-progress-snapshot')
 router.register(r'project-forecast-snapshots', ProjectForecastSnapshotViewSet, basename='project-forecast-snapshot')
 router.register(r'project-impact-events', ProjectImpactEventViewSet, basename='project-impact-event')

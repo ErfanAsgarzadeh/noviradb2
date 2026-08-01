@@ -5,7 +5,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from ktcPlanning.models import TaskActual, VarianceReport
+from ktcPlanning.models import TaskActual, TaskReportLog, VarianceReport
 from tests.factories import make_company_admin, make_project, make_revision, make_task
 
 
@@ -61,3 +61,39 @@ class PlannerDraftReportTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(evm_rows), 1)
         self.assertIn("0.75", evm_rows[0]["description"])
+
+    def test_planner_draft_deduplicates_critical_items_per_task(self):
+        admin = make_company_admin()
+        project = make_project(creator=admin)
+        revision = make_revision(project, creator=admin, approved=True)
+        task, _ = make_task(project, revision, duration_hours=8)
+
+        TaskReportLog.objects.create(
+            task=task,
+            user=admin,
+            status="blocked",
+            progress_percent=10,
+            blockers="Blocked by material shortage",
+        )
+        VarianceReport.objects.create(
+            task=task,
+            revision=revision,
+            report_date=timezone.localdate(),
+            budget_at_completion=Decimal("8.00"),
+            planned_value=Decimal("8.00"),
+            earned_value=Decimal("2.00"),
+            actual_cost=Decimal("8.00"),
+            spi=Decimal("0.25"),
+            cpi=Decimal("0.25"),
+            action_required=True,
+        )
+
+        self.client.force_authenticate(user=admin)
+        response = self.client.get(f"/api/reports/planner/draft/{project.id}/")
+
+        task_rows = [
+            row for row in response.data["suggested_bottlenecks"]
+            if row["task_id"] == str(task.id)
+        ]
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(task_rows), 1)

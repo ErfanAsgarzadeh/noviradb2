@@ -1,8 +1,10 @@
+from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 
@@ -60,6 +62,7 @@ from .services import (
     add_dependency,
     approve_minutes,
     decide_deadline_change,
+    ensure_project_task_for_action,
     request_completion_revision,
     request_deadline_change,
     request_minutes_revision,
@@ -156,11 +159,38 @@ class MeetingViewSet(MeetingBaseViewSet):
 
 class MeetingChildViewSet(MeetingBaseViewSet):
     parent_field = "meeting"
+    editable_statuses = {
+        MeetingStatus.DRAFT,
+        MeetingStatus.SCHEDULED,
+        MeetingStatus.HELD,
+        MeetingStatus.MINUTES_DRAFTING,
+    }
 
     def get_queryset(self):
         qs = self.queryset.all()
         meeting_ids = filter_visible_meetings(Meeting.objects.all(), self.request.user).values("id")
-        return qs.filter(**{f"{self.parent_field}_id__in": meeting_ids})
+        qs = qs.filter(**{f"{self.parent_field}_id__in": meeting_ids})
+        parent_id = self.request.query_params.get(self.parent_field)
+        if parent_id:
+            qs = qs.filter(**{f"{self.parent_field}_id": parent_id})
+        return qs
+
+    def _assert_meeting_editable(self, meeting):
+        if meeting.status not in self.editable_statuses:
+            raise ValidationError({"detail": "Meeting minutes are locked after submission for review."})
+
+    def perform_create(self, serializer):
+        self._assert_meeting_editable(serializer.validated_data[self.parent_field])
+        serializer.save()
+
+    def perform_update(self, serializer):
+        parent = getattr(serializer.instance, self.parent_field)
+        self._assert_meeting_editable(parent)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._assert_meeting_editable(getattr(instance, self.parent_field))
+        instance.delete()
 
 
 class MeetingUnitInvitationViewSet(MeetingChildViewSet):
@@ -181,6 +211,13 @@ class MeetingAgendaItemViewSet(MeetingChildViewSet):
 class MeetingMinutesVersionViewSet(MeetingChildViewSet):
     queryset = MeetingMinutesVersion.objects.select_related("meeting", "author", "submitted_by", "approved_by")
     serializer_class = MeetingMinutesVersionSerializer
+
+    def perform_create(self, serializer):
+        meeting = serializer.validated_data["meeting"]
+        self._assert_meeting_editable(meeting)
+        with transaction.atomic():
+            MeetingMinutesVersion.objects.filter(meeting=meeting, is_current=True).update(is_current=False)
+            serializer.save(author=self.request.user, is_current=True)
 
     @action(detail=True, methods=["post"], url_path="submit")
     def submit(self, request, pk=None):
@@ -210,11 +247,73 @@ class ResolutionViewSet(MeetingChildViewSet):
 
 class ResolutionActionViewSet(MeetingBaseViewSet):
     serializer_class = ResolutionActionSerializer
+    editable_statuses = MeetingChildViewSet.editable_statuses
 
     def get_queryset(self):
         qs = ResolutionAction.objects.select_related("resolution__meeting", "accountable_unit", "accountable_user", "responsible_user", "reviewer", "approver", "project", "task")
         qs = filter_visible_actions(qs, self.request.user)
         return _filter_actions(qs, self.request.query_params)
+
+    def _assert_action_definition_editable(self, meeting):
+        if meeting.status not in self.editable_statuses:
+            raise ValidationError({"detail": "Meeting action definitions are locked after minutes submission."})
+
+    def create(self, request, *args, **kwargs):
+        from CustomUser.models import OrgUnit
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        data = request.data.copy()
+        target_type = data.pop("assignment_target_type", "user")
+        if isinstance(target_type, list):
+            target_type = target_type[0]
+        create_project_task = data.pop("create_project_task", True)
+        if isinstance(create_project_task, list):
+            create_project_task = create_project_task[0]
+        should_create_task = str(create_project_task).lower() not in {"false", "0", "no"}
+        data.pop("target_user", None)
+        data.pop("target_unit", None)
+        resolution = get_object_or_404(Resolution.objects.select_related("meeting"), pk=data.get("resolution"))
+        self._assert_action_definition_editable(resolution.meeting)
+
+        if target_type == "unit":
+            unit_id = request.data.get("target_unit") or request.data.get("accountable_unit")
+            unit = get_object_or_404(OrgUnit.objects.select_related("manager"), pk=unit_id)
+            if not unit.manager_id:
+                return Response({"detail": "Selected unit has no manager."}, status=status.HTTP_400_BAD_REQUEST)
+            data["accountable_unit"] = unit.pk
+            data["accountable_user"] = unit.manager_id
+            data["responsible_user"] = unit.manager_id
+            data["reviewer"] = unit.manager_id
+        else:
+            user_id = request.data.get("target_user") or request.data.get("responsible_user") or request.data.get("accountable_user")
+            target_user = get_object_or_404(User.objects.select_related("unit__manager"), pk=user_id)
+            unit_id = getattr(target_user, "unit_id", None) or request.data.get("accountable_unit")
+            if not unit_id:
+                return Response({"detail": "Selected user has no unit; choose accountable unit."}, status=status.HTTP_400_BAD_REQUEST)
+            reviewer_id = getattr(getattr(target_user, "unit", None), "manager_id", None) or request.data.get("reviewer") or target_user.pk
+            data["accountable_unit"] = unit_id
+            data["accountable_user"] = target_user.pk
+            data["responsible_user"] = target_user.pk
+            data["reviewer"] = reviewer_id
+
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            action_obj = serializer.save()
+            if should_create_task:
+                ensure_project_task_for_action(action_obj, actor=request.user, assign_executor=(target_type != "unit"))
+                action_obj.refresh_from_db()
+        headers = self.get_success_headers(serializer.data)
+        return Response(self.get_serializer(action_obj).data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def perform_update(self, serializer):
+        self._assert_action_definition_editable(serializer.instance.resolution.meeting)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._assert_action_definition_editable(instance.resolution.meeting)
+        instance.delete()
 
     @action(detail=True, methods=["post"], url_path="submit-progress")
     def submit_progress(self, request, pk=None):
@@ -238,11 +337,23 @@ class ResolutionActionViewSet(MeetingBaseViewSet):
     @action(detail=True, methods=["post"], url_path="convert-to-project-task")
     def convert_to_project_task(self, request, pk=None):
         action_obj = self.get_object()
+        self._assert_action_definition_editable(action_obj.resolution.meeting)
         action_obj.task_id = request.data.get("task")
         action_obj.execution_mode = "project_task"
         action_obj.full_clean()
         action_obj.save()
         return Response(self.get_serializer(action_obj).data)
+
+    @action(detail=True, methods=["get"], url_path="task-reports")
+    def task_reports(self, request, pk=None):
+        from ktcPlanning.models import TaskReportLog
+        from ktcPlanning.serializers import TaskReportLogSerializer
+
+        action_obj = self.get_object()
+        if not action_obj.task_id:
+            return Response([])
+        reports = TaskReportLog.objects.filter(task_id=action_obj.task_id).select_related("task__project", "user")
+        return Response(TaskReportLogSerializer(reports, many=True).data)
 
 
 class ResolutionActionRoleAssignmentViewSet(MeetingBaseViewSet):
@@ -386,6 +497,8 @@ def _filter_actions(qs, params):
         qs = qs.filter(Q(accountable_user_id=params["user"]) | Q(responsible_user_id=params["user"]))
     if params.get("project"):
         qs = qs.filter(project_id=params["project"])
+    if params.get("meeting"):
+        qs = qs.filter(resolution__meeting_id=params["meeting"])
     if params.get("overdue") == "true":
         qs = qs.exclude(status__in=[ActionStatus.CLOSED, ActionStatus.CANCELLED]).filter(current_due_date__lt=today)
     if params.get("blocked") == "true":

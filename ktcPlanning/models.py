@@ -1580,6 +1580,48 @@ class ProjectDownstreamLink(models.Model):
         indexes = [models.Index(fields=['project', 'link_type']), models.Index(fields=['object_id'])]
 
 
+class ProjectOPCImport(models.Model):
+    STATUS_APPLIED = 'APPLIED'
+    STATUS_CHOICES = [(STATUS_APPLIED, 'Applied')]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='opc_imports')
+    revision = models.ForeignKey(Revision, on_delete=models.PROTECT, related_name='opc_imports')
+    parent_wbs_node = models.ForeignKey(WBSNodeVersion, on_delete=models.PROTECT, related_name='opc_imports')
+    opc_diagram = models.ForeignKey('opc.OPCDiagram', on_delete=models.PROTECT, related_name='project_imports')
+    opc_graph_version = models.PositiveBigIntegerField(default=0)
+    created_wbs_node = models.ForeignKey(WBSNodeVersion, null=True, blank=True, on_delete=models.PROTECT, related_name='created_by_opc_imports')
+    idempotency_key = models.CharField(max_length=120)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_APPLIED)
+    operation_task_map = models.JSONField(default=dict, blank=True)
+    resource_assignment_map = models.JSONField(default=dict, blank=True)
+    dependency_map = models.JSONField(default=list, blank=True)
+    warnings = models.JSONField(default=list, blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name='created_project_opc_imports')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        unique_together = [('revision', 'parent_wbs_node', 'opc_diagram', 'idempotency_key')]
+        indexes = [
+            models.Index(fields=['project', 'revision']),
+            models.Index(fields=['opc_diagram', 'opc_graph_version']),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.revision_id and self.project_id and self.revision.project_id != self.project_id:
+            raise ValidationError({'revision': 'Revision must belong to the import project.'})
+        if self.parent_wbs_node_id and self.revision_id and self.parent_wbs_node.revision_id != self.revision_id:
+            raise ValidationError({'parent_wbs_node': 'Parent WBS must belong to the import revision.'})
+        if not (self.idempotency_key or '').strip():
+            raise ValidationError({'idempotency_key': 'Idempotency key is required for OPC import.'})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
 class ProjectProgressSnapshot(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='progress_snapshots')

@@ -98,7 +98,7 @@ class MeetingMinutesVersionSerializer(serializers.ModelSerializer):
     class Meta:
         model = MeetingMinutesVersion
         fields = "__all__"
-        read_only_fields = ("status", "submitted_by", "submitted_at", "approved_by", "approved_at", "locked_at", "created_at", "updated_at")
+        read_only_fields = ("author", "status", "submitted_by", "submitted_at", "approved_by", "approved_at", "locked_at", "created_at", "updated_at")
 
 
 class MeetingDecisionSerializer(serializers.ModelSerializer):

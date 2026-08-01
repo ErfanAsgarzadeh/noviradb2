@@ -26,7 +26,8 @@ from .models import Project, Revision, WBSNodeVersion, TaskVersion, Dependency, 
     ResourceException, ResourceRate, VarianceReport, Calendar, ProjectViewer, SystemSettings, UnitOfMeasure, \
     ExpenseType, FundingSource, BudgetAllocation, BudgetBorrow, UnfundedForecastCost, CostTransaction, TaskReportAttachment, BudgetConsumption, TaskFinancialPlan, PaymentMilestone, PaymentTransaction, Currency, ExchangeRate, \
     TaskDeliveryAttachment, \
-    GlobalLevelingRun, LevelingPlanProject, TaskLevelingMetrics, ResourceUsage, TaskDelivery, Program, ProjectMember, ProjectDeliverable, ProjectMilestone, ProjectBaselineSnapshot, ProjectManufacturingRequirement, ProjectProcurementRequirement, ProjectMakeBuyDecision, ProjectDownstreamLink, ProjectProgressSnapshot, ProjectForecastSnapshot, ProjectImpactEvent
+    GlobalLevelingRun, LevelingPlanProject, TaskLevelingMetrics, ResourceUsage, TaskDelivery, Program, ProjectMember, ProjectDeliverable, ProjectMilestone, ProjectBaselineSnapshot, ProjectManufacturingRequirement, ProjectProcurementRequirement, ProjectMakeBuyDecision, ProjectDownstreamLink, ProjectProgressSnapshot, ProjectForecastSnapshot, ProjectImpactEvent, ProjectOPCImport
+from opc.models import OPCDiagram
 from .serializers import (
     ProjectSerializer,
     RevisionSerializer,
@@ -41,7 +42,7 @@ from .serializers import (
     CalendarSerializer, ProjectViewerSerializer, SystemSettingsSerializer, UnitOfMeasureSerializer,
     ExpenseTypeSerializer, FundingSourceSerializer, BudgetAllocationSerializer, BudgetBorrowSerializer, UnfundedForecastCostSerializer,
     CostTransactionSerializer, TaskDropdownSerializer, ResourceLevelingPlanSerializer, TaskFinancialPlanSerializer, PaymentMilestoneSerializer, PaymentTransactionSerializer, PlanPaymentAllocationSerializer, TaskDeliveryAttachmentSerializer, TaskDeliverySerializer,
-    ProgramSerializer, ProjectMemberSerializer, ProjectDeliverableSerializer, ProjectMilestoneSerializer, ProjectBaselineSnapshotSerializer, ProjectManufacturingRequirementSerializer, ProjectProcurementRequirementSerializer, ProjectMakeBuyDecisionSerializer, ProjectDownstreamLinkSerializer, ProjectProgressSnapshotSerializer, ProjectForecastSnapshotSerializer, ProjectImpactEventSerializer
+    ProgramSerializer, ProjectMemberSerializer, ProjectDeliverableSerializer, ProjectMilestoneSerializer, ProjectBaselineSnapshotSerializer, ProjectManufacturingRequirementSerializer, ProjectProcurementRequirementSerializer, ProjectMakeBuyDecisionSerializer, ProjectDownstreamLinkSerializer, ProjectProgressSnapshotSerializer, ProjectForecastSnapshotSerializer, ProjectImpactEventSerializer, ProjectOPCImportSerializer
 )
 
 
@@ -104,6 +105,7 @@ from .project_phase14_services import (
     next_number,
     project_dashboard,
 )
+from .opc_project_services import build_opc_wbs_preview, import_opc_to_wbs
 from django.contrib.auth import get_user_model
 User = get_user_model()
 
@@ -240,6 +242,65 @@ class ProjectDownstreamLinkViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         return ProjectDownstreamLink.objects.select_related('project', 'activity', 'deliverable').filter(project_id__in=accessible_project_ids(self.request.user))
+
+
+class ProjectOPCImportViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = ProjectOPCImportSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return ProjectOPCImport.objects.select_related(
+            'project', 'revision', 'parent_wbs_node__node', 'created_wbs_node__node',
+            'opc_diagram', 'created_by',
+        ).filter(project_id__in=accessible_project_ids(self.request.user))
+
+    def _context_objects(self, request):
+        revision = get_object_or_404(
+            Revision.objects.select_related('project'),
+            pk=request.data.get('revision') or request.data.get('revisionId'),
+            project_id__in=accessible_project_ids(request.user),
+        )
+        parent = get_object_or_404(
+            WBSNodeVersion.objects.select_related('node', 'revision'),
+            node_id=request.data.get('parent_wbs_node') or request.data.get('parentWbsNodeId') or request.data.get('parentId'),
+            revision=revision,
+            is_deleted=False,
+        )
+        diagram = get_object_or_404(
+            OPCDiagram.objects.prefetch_related('nodes', 'edges'),
+            pk=request.data.get('opc_diagram') or request.data.get('opcDiagramId'),
+        )
+        return revision, parent, diagram
+
+    @action(detail=False, methods=['post'])
+    def preview(self, request):
+        try:
+            revision, parent, diagram = self._context_objects(request)
+            return Response(build_opc_wbs_preview(
+                revision=revision,
+                parent_wbs_node=parent,
+                opc_diagram=diagram,
+                quantity=request.data.get('quantity', 1),
+            ))
+        except Exception as exc:
+            return phase14_error_response(exc)
+
+    @action(detail=False, methods=['post'])
+    def apply(self, request):
+        try:
+            revision, parent, diagram = self._context_objects(request)
+            imported = import_opc_to_wbs(
+                revision=revision,
+                parent_wbs_node=parent,
+                opc_diagram=diagram,
+                actor=request.user,
+                quantity=request.data.get('quantity', 1),
+                expected_project_version=request.data.get('expected_project_version') or request.data.get('expectedProjectVersion'),
+                idempotency_key=request.data.get('idempotency_key') or request.data.get('idempotencyKey') or '',
+            )
+            return Response(self.get_serializer(imported).data, status=status.HTTP_201_CREATED)
+        except Exception as exc:
+            return phase14_error_response(exc)
 
 
 class ProjectProgressSnapshotViewSet(viewsets.ReadOnlyModelViewSet):
@@ -2027,7 +2088,7 @@ class TaskRoleViewSet(viewsets.ModelViewSet):
         # ط§ظ…ع©ط§ظ† ظپغŒظ„طھط± ع©ط±ط¯ظ† ط¯غŒطھط§غŒ ط¨ط±ع¯ط´طھغŒ
         revision_id = self.request.query_params.get('revision_id')
         task_id = self.request.query_params.get('taskId')
-        user_id = self.request.query_params.get('userId')
+        user_id = self.request.query_params.get('userId') or self.request.query_params.get('user_id')
 
         if revision_id:
             queryset = queryset.filter(revision_id=revision_id)

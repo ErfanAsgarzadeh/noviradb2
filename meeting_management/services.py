@@ -1,3 +1,6 @@
+from datetime import datetime, time, timedelta
+from decimal import Decimal
+
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
 from django.utils import timezone
@@ -44,6 +47,105 @@ def _can_manage_meeting(user, meeting):
 
 def _can_review_action(user, action):
     return _is_admin(user) or user in {action.reviewer, action.approver, action.accountable_user}
+
+
+def _meeting_action_revision(actor):
+    from ktcPlanning.models import Project, Revision, WBSNode, WBSNodeVersion
+    from ktcPlanning.revision_policy import ROLE_WORKING, get_official_revision
+
+    project, _ = Project.objects.get_or_create(
+        name="System-Meeting-Actions",
+        defaults={
+            "created_by": actor,
+            "owner_unit_id": getattr(actor, "unit_id", None),
+            "scope": "intra_unit",
+            "project_type": Project.TYPE_INTERNAL,
+            "start_date": timezone.now(),
+            "end_date": timezone.now() + timedelta(days=365),
+            "lifecycle_status": Project.LIFECYCLE_PLANNING,
+        },
+    )
+    revision = get_official_revision(project, ROLE_WORKING, required=False)
+    if revision is None:
+        revision = Revision.objects.filter(project=project, is_deleted=False, approved_at__isnull=True).order_by("number").first()
+    if revision is None:
+        revision = Revision.objects.create(
+            project=project,
+            number=(Revision.objects.filter(project=project).order_by("-number").values_list("number", flat=True).first() or -1) + 1,
+            description="System meeting action task revision",
+            created_by=actor,
+            project_start=project.start_date or timezone.now(),
+            project_end=project.end_date,
+        )
+    updates = []
+    if project.working_revision_id != revision.pk:
+        project.working_revision = revision
+        updates.append("working_revision")
+    if not project.current_execution_revision_id:
+        project.current_execution_revision = revision
+        updates.append("current_execution_revision")
+    if not project.current_forecast_revision_id:
+        project.current_forecast_revision = revision
+        updates.append("current_forecast_revision")
+    if updates:
+        project.save(update_fields=updates)
+    root = WBSNodeVersion.objects.filter(revision=revision, parent__isnull=True, is_deleted=False).first()
+    if root is None:
+        root_node = WBSNode.objects.create(project=project)
+        root = WBSNodeVersion.objects.create(node=root_node, revision=revision, title=f"Root: {project.name}", sequence=1)
+    node = WBSNodeVersion.objects.filter(revision=revision, title="Meeting Actions", is_deleted=False).first()
+    if not node:
+        base_node = WBSNode.objects.create(project=project)
+        node = WBSNodeVersion.objects.create(
+            node=base_node,
+            revision=revision,
+            parent=root,
+            title="Meeting Actions",
+            sequence=(root.children.count() + 1) if root else 1,
+        )
+    return project, revision, node
+
+
+@transaction.atomic
+def ensure_project_task_for_action(action, *, actor, assign_executor=True):
+    from ktcPlanning.models import Task, TaskRole, TaskVersion
+
+    action = _lock(ResolutionAction, action.pk)
+    if action.task_id:
+        return action.task
+
+    project, revision, wbs_node = _meeting_action_revision(actor)
+    due_finish = datetime.combine(action.current_due_date, time(hour=17))
+    due_finish = timezone.make_aware(due_finish, timezone.get_current_timezone())
+    planned_start_date = action.planned_start or timezone.localdate()
+    planned_start = datetime.combine(planned_start_date, time(hour=8))
+    planned_start = timezone.make_aware(planned_start, timezone.get_current_timezone())
+    if planned_start > due_finish:
+        planned_start = due_finish - timedelta(hours=8)
+
+    task = Task.objects.create(project=project, created_by=actor)
+    TaskVersion.objects.create(
+        task=task,
+        revision=revision,
+        wbs_node=wbs_node,
+        title=action.title,
+        planned_start=planned_start,
+        planned_finish=due_finish,
+        duration_hours=Decimal("8.00"),
+        description=action.description,
+        sequence=TaskVersion.objects.filter(revision=revision, is_deleted=False).count() + 1,
+    )
+    if assign_executor:
+        TaskRole.objects.get_or_create(revision=revision, task=task, user=action.responsible_user, role="executor")
+    reviewer = action.reviewer or action.accountable_user
+    if reviewer:
+        TaskRole.objects.get_or_create(revision=revision, task=task, user=reviewer, role="reviewer")
+
+    action.project = project
+    action.task = task
+    action.execution_mode = "project_task"
+    action.save(update_fields=["project", "task", "execution_mode", "updated_at"])
+    return task
 
 
 @transaction.atomic

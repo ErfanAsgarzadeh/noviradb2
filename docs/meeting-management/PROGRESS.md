@@ -168,7 +168,6 @@ Changes made:
   - `/DashBoard/Committees`
   - `/DashBoard/Resolutions`
   - `/DashBoard/Resolutions/[id]`
-  - `/DashBoard/MyCommitments`
   - `/DashBoard/MeetingApprovals`
   - `/DashBoard/MeetingReports`
   - `/DashBoard/MeetingAdministration`
@@ -210,10 +209,10 @@ Backend docs commit:
 Changes made:
 
 - Added meeting detail operational panels for attendance, agenda, minutes versions, and actions/RACI.
-- Added My Commitments command controls for progress submission and completion submission.
+- Replaced the standalone My Commitments surface with meeting-detail task tracking for linked project tasks, progress, and reports.
 - Added administration notification/dependency/history summary surfaces.
 - Expanded frontend API/types for participants, agenda, minutes, notifications, progress, completion, deadline requests, and dependencies.
-- Expanded Playwright spec to cover operational panels and commitment actions with mocked APIs.
+- Expanded Playwright spec to cover operational panels and linked meeting-task reports with mocked APIs.
 
 Commands:
 

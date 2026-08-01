@@ -117,6 +117,25 @@ class ProjectDownstreamLinkSerializer(serializers.ModelSerializer):
         read_only_fields = ['created_at']
 
 
+class ProjectOPCImportSerializer(serializers.ModelSerializer):
+    opcTitle = serializers.CharField(source='opc_diagram.title', read_only=True, default=None)
+    opcPartCode = serializers.CharField(source='opc_diagram.part_code', read_only=True, default=None)
+    parentWbsNodeId = serializers.UUIDField(source='parent_wbs_node.node_id', read_only=True)
+    createdWbsNodeId = serializers.UUIDField(source='created_wbs_node.node_id', read_only=True, default=None)
+    createdByName = serializers.CharField(source='created_by.username', read_only=True, default=None)
+
+    class Meta:
+        model = ProjectOPCImport
+        fields = [
+            'id', 'project', 'revision', 'parent_wbs_node', 'parentWbsNodeId',
+            'opc_diagram', 'opcTitle', 'opcPartCode', 'opc_graph_version',
+            'created_wbs_node', 'createdWbsNodeId', 'idempotency_key', 'status',
+            'operation_task_map', 'resource_assignment_map', 'dependency_map',
+            'warnings', 'created_by', 'createdByName', 'created_at',
+        ]
+        read_only_fields = fields
+
+
 class ProjectProgressSnapshotSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProjectProgressSnapshot
