@@ -31,3 +31,16 @@ class CuratedBottleneck(models.Model):
 
     def __str__(self):
         return f"{self.issue_type} - {self.report.project.name}"
+
+
+class ManagementReportComment(models.Model):
+    bottleneck = models.ForeignKey(CuratedBottleneck, on_delete=models.CASCADE, related_name="manager_comments")
+    author = models.ForeignKey(User, on_delete=models.PROTECT, related_name="management_report_comments")
+    message = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"Comment on {self.bottleneck_id} by {self.author}"

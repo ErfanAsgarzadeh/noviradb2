@@ -1,3 +1,5 @@
 **pycache**/
 *.py[cod]
 .pytest_cache/
+/docs/
+/media/

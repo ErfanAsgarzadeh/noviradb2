@@ -9,25 +9,22 @@ from django.shortcuts import get_object_or_404
 from ktcPlanning.models import Project, TaskReportLog, VarianceReport, TaskVersion
 
 # ایمپورت مدل‌ها و سریالایزرهای همین اپلیکیشن
-from .models import ManagementReport, CuratedBottleneck
-from .serializers import ManagementReportSerializer
+from .models import ManagementReport, CuratedBottleneck, ManagementReportComment
+from .serializers import ManagementReportSerializer, ManagementReportCommentSerializer
 
 
 def dedupe_bottlenecks(rows):
-    seen_task_ids = set()
     seen_fingerprints = set()
     deduped = []
     for row in rows:
         task_id = row.get("task_id")
-        if task_id:
-            if task_id in seen_task_ids:
-                continue
-            seen_task_ids.add(task_id)
         fingerprint = (
             task_id or "",
             row.get("issue_type") or "",
             row.get("description") or "",
             row.get("severity") or "",
+            row.get("planner_remark") or "",
+            bool(row.get("is_manual")),
         )
         if fingerprint in seen_fingerprints:
             continue
@@ -233,18 +230,36 @@ class ExecutiveDashboardAPI(APIView):
     def get(self, request):
         active_projects = Project.objects.filter(is_deleted=False)
         summary_data = []
+        published_data = []
 
         for project in active_projects:
             # فقط دریافت گزارش‌هایی که توسط برنامه‌ریز منتشر شده‌اند
-            latest_published_report = project.management_reports.filter(
+            published_reports = project.management_reports.filter(
                 is_published=True
-            ).order_by('-created_at').first()
+            ).order_by('-created_at').prefetch_related('bottlenecks__manager_comments')
 
-            if latest_published_report:
-                serializer = ManagementReportSerializer(latest_published_report)
-                summary_data.append(serializer.data)
+            for index, report in enumerate(published_reports):
+                serializer = ManagementReportSerializer(report)
+                if index == 0:
+                    summary_data.append(serializer.data)
+                published_data.append(serializer.data)
 
         return Response({
             "total_active_projects": len(summary_data),
-            "executive_dashboard": summary_data
+            "executive_dashboard": summary_data,
+            "published_reports": published_data,
         }, status=status.HTTP_200_OK)
+
+
+class ManagementReportCommentAPI(APIView):
+    def post(self, request, bottleneck_id):
+        bottleneck = get_object_or_404(CuratedBottleneck, id=bottleneck_id)
+        message = (request.data.get("message") or "").strip()
+        if not message:
+            return Response({"message": "Comment text is required."}, status=status.HTTP_400_BAD_REQUEST)
+        comment = ManagementReportComment.objects.create(
+            bottleneck=bottleneck,
+            author=request.user,
+            message=message,
+        )
+        return Response(ManagementReportCommentSerializer(comment).data, status=status.HTTP_201_CREATED)

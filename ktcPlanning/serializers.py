@@ -4,6 +4,7 @@ from django.db.models import Sum
 from django.utils import timezone
 from django.utils.text import get_valid_filename
 from decimal import Decimal
+import datetime
 import os
 import re
 
@@ -1046,10 +1047,113 @@ class AssignmentSerializer(serializers.ModelSerializer):
 class VarianceReportSerializer(serializers.ModelSerializer):
     task_name = serializers.SerializerMethodField()
     task_code = serializers.SerializerMethodField()
+    planned_start = serializers.SerializerMethodField()
+    planned_finish = serializers.SerializerMethodField()
+    actual_start = serializers.SerializerMethodField()
+    actual_finish = serializers.SerializerMethodField()
+    start_variance_hours = serializers.SerializerMethodField()
+    finish_variance_hours = serializers.SerializerMethodField()
+    forecast_finish = serializers.SerializerMethodField()
+    task_weight = serializers.SerializerMethodField()
+    executor_unit_id = serializers.SerializerMethodField()
+    executor_unit_name = serializers.SerializerMethodField()
+    responsible_units = serializers.SerializerMethodField()
 
     class Meta:
         model = VarianceReport
         fields = '__all__'
+
+    def _task_version(self, obj):
+        cache_name = '_variance_serializer_task_version'
+        cached = getattr(obj, cache_name, None)
+        if cached is not None:
+            return cached
+        tv = obj.task.versions.filter(revision=obj.revision).select_related(
+            'actual',
+            'calendar',
+            'revision__project__calendar',
+            'wbs_node',
+        ).first()
+        setattr(obj, cache_name, tv)
+        return tv
+
+    def _iso_datetime(self, value):
+        if not value:
+            return None
+        if timezone.is_aware(value):
+            value = timezone.localtime(value)
+        return value.isoformat()
+
+    def _variance_hours(self, planned, actual):
+        if not planned or not actual:
+            return None
+        return round((actual - planned).total_seconds() / 3600, 2)
+
+    def _local_datetime(self, value):
+        if not value:
+            return None
+        if timezone.is_aware(value):
+            return timezone.localtime(value)
+        return value
+
+    def _status_datetime(self, obj):
+        report_date = getattr(obj, 'report_date', None)
+        if not report_date:
+            return timezone.localtime()
+        value = datetime.datetime.combine(report_date, datetime.time.min)
+        return timezone.make_aware(value, timezone.get_current_timezone()) if timezone.is_naive(value) else value
+
+    def _planned_work_hours(self, tv, engine):
+        if tv.planned_start and tv.planned_finish:
+            start = self._local_datetime(tv.planned_start)
+            finish = self._local_datetime(tv.planned_finish)
+            if engine:
+                return max(0.0, float(engine.working_hours_between(start, finish)))
+            return max(0.0, (finish - start).total_seconds() / 3600)
+        return float(tv.duration_hours or 0)
+
+    def _executor_role(self, obj):
+        cache_name = '_variance_serializer_executor_role'
+        cached = getattr(obj, cache_name, None)
+        if cached is not None:
+            return cached
+        role = TaskRole.objects.filter(
+            task=obj.task,
+            revision=obj.revision,
+            role='executor',
+        ).select_related('user__unit').first()
+        setattr(obj, cache_name, role)
+        return role
+
+    def _responsible_units(self, obj):
+        cache_name = '_variance_serializer_responsible_units'
+        cached = getattr(obj, cache_name, None)
+        if cached is not None:
+            return cached
+
+        units = {}
+        roles = TaskRole.objects.filter(
+            task=obj.task,
+            revision=obj.revision,
+            role__in=['executor', 'reviewer'],
+        ).select_related('user__unit').order_by('role', 'id')
+        for role in roles:
+            unit = getattr(role.user, 'unit', None)
+            if not unit:
+                continue
+            key = str(unit.id)
+            if key not in units:
+                units[key] = {
+                    'id': key,
+                    'name': unit.name,
+                    'roles': [],
+                }
+            if role.role not in units[key]['roles']:
+                units[key]['roles'].append(role.role)
+
+        result = list(units.values())
+        setattr(obj, cache_name, result)
+        return result
 
     def validate(self, attrs):
         instance = self.instance
@@ -1065,13 +1169,104 @@ class VarianceReportSerializer(serializers.ModelSerializer):
 
     def get_task_name(self, obj):
         # ظ¾غŒط¯ط§ ع©ط±ط¯ظ† ط¹ظ†ظˆط§ظ† طھط³ع© ط¯ط± ظ‡ظ…ط§ظ† ط±غŒظˆغŒعکظ†غŒ ع©ظ‡ ع¯ط²ط§ط±ط´ ط¨ط±ط§غŒ ط¢ظ† ط«ط¨طھ ط´ط¯ظ‡
-        tv = obj.task.versions.filter(revision=obj.revision).first()
+        tv = self._task_version(obj)
         return tv.title if tv else "طھط³ع© ظ†ط§ظ…ط´ط®طµ"
 
     def get_task_code(self, obj):
         # ط§ط³طھط®ط±ط§ط¬ ع©ط¯ WBS ط¨ط±ط§غŒ ط§غŒظ† طھط³ع©
-        tv = obj.task.versions.filter(revision=obj.revision).first()
+        tv = self._task_version(obj)
         return tv.wbs_node.wbs_code if (tv and hasattr(tv, 'wbs_node')) else "N/A"
+
+    def get_planned_start(self, obj):
+        tv = self._task_version(obj)
+        return self._iso_datetime(tv.planned_start if tv else None)
+
+    def get_planned_finish(self, obj):
+        tv = self._task_version(obj)
+        return self._iso_datetime(tv.planned_finish if tv else None)
+
+    def get_actual_start(self, obj):
+        tv = self._task_version(obj)
+        return self._iso_datetime(tv.actual.actual_start if tv and hasattr(tv, 'actual') else None)
+
+    def get_actual_finish(self, obj):
+        tv = self._task_version(obj)
+        return self._iso_datetime(tv.actual.actual_finish if tv and hasattr(tv, 'actual') else None)
+
+    def get_start_variance_hours(self, obj):
+        tv = self._task_version(obj)
+        if not tv or not hasattr(tv, 'actual'):
+            return None
+        return self._variance_hours(tv.planned_start, tv.actual.actual_start)
+
+    def get_finish_variance_hours(self, obj):
+        tv = self._task_version(obj)
+        if not tv or not hasattr(tv, 'actual'):
+            return None
+        return self._variance_hours(tv.planned_finish, tv.actual.actual_finish)
+
+    def get_task_weight(self, obj):
+        tv = self._task_version(obj)
+        if not tv:
+            return 0
+        return float(tv.weight or 0)
+
+    def get_executor_unit_id(self, obj):
+        role = self._executor_role(obj)
+        unit = getattr(role.user, 'unit', None) if role else None
+        return str(unit.id) if unit else None
+
+    def get_executor_unit_name(self, obj):
+        role = self._executor_role(obj)
+        unit = getattr(role.user, 'unit', None) if role else None
+        return unit.name if unit else None
+
+    def get_responsible_units(self, obj):
+        return self._responsible_units(obj)
+
+    def get_forecast_finish(self, obj):
+        tv = self._task_version(obj)
+        if not tv:
+            return None
+
+        actual = getattr(tv, 'actual', None)
+        if actual and actual.actual_finish:
+            return self._iso_datetime(actual.actual_finish)
+
+        calendar = _calendar_for_task_version(tv)
+        engine = CalendarEngine(calendar) if calendar else None
+        planned_hours = self._planned_work_hours(tv, engine)
+        if planned_hours <= 0:
+            return self._iso_datetime(tv.planned_finish)
+
+        spi = float(obj.spi or 0)
+        effective_spi = spi if spi > 0 else 1.0
+        ev = float(obj.earned_value or 0)
+        bac = float(obj.budget_at_completion or 0)
+        remaining_hours = max(0.0, bac - ev) if bac > 0 else planned_hours
+        forecast_hours = remaining_hours / effective_spi
+
+        status_dt = self._local_datetime(self._status_datetime(obj))
+        planned_start = self._local_datetime(tv.planned_start)
+        actual_start = self._local_datetime(actual.actual_start) if actual and actual.actual_start else None
+
+        if ev > 0:
+            anchor = max([value for value in [status_dt, actual_start, planned_start] if value])
+        else:
+            candidates = [value for value in [status_dt, planned_start] if value]
+            anchor = max(candidates) if candidates else status_dt
+
+        if not anchor:
+            return self._iso_datetime(tv.planned_finish)
+
+        if forecast_hours <= 0:
+            return self._iso_datetime(anchor)
+
+        try:
+            forecast = engine.add_working_hours(anchor, forecast_hours) if engine else anchor + datetime.timedelta(hours=forecast_hours)
+        except Exception:
+            forecast = anchor + datetime.timedelta(hours=forecast_hours)
+        return self._iso_datetime(forecast)
 
 
 
