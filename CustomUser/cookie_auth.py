@@ -13,6 +13,7 @@ httpOnly Cookie:
 """
 
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.middleware.csrf import get_token
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -55,6 +56,18 @@ REFRESH_MAX_AGE     = int(
 )
 
 
+class CaseInsensitiveTokenObtainPairSerializer(TokenObtainPairSerializer):
+    def validate(self, attrs):
+        username = attrs.get(self.username_field)
+        if username:
+            User = get_user_model()
+            exact_user = User.objects.filter(**{self.username_field: username}).first()
+            user = exact_user or User.objects.filter(**{f"{self.username_field}__iexact": username}).order_by("id").first()
+            if user:
+                attrs[self.username_field] = getattr(user, self.username_field)
+        return super().validate(attrs)
+
+
 def _set_auth_cookies(response: Response, access: str, refresh: str) -> None:
     """هر دو توکن را در httpOnly Cookie ذخیره می‌کند."""
     response.set_cookie(ACCESS_COOKIE_NAME,  access,  **_cookie_settings(ACCESS_MAX_AGE))
@@ -83,7 +96,7 @@ class CookieTokenObtainPairView(APIView):
     throttle_scope = "login"
 
     def post(self, request):
-        serializer = TokenObtainPairSerializer(data=request.data)
+        serializer = CaseInsensitiveTokenObtainPairSerializer(data=request.data)
         username_attempted = request.data.get("username", "")
         try:
             serializer.is_valid(raise_exception=True)
@@ -113,7 +126,6 @@ class CookieTokenObtainPairView(APIView):
 
         # گرفتن یوزر از طریق توکن
         from rest_framework_simplejwt.tokens import AccessToken
-        from django.contrib.auth import get_user_model
         User = get_user_model()
         decoded = AccessToken(access)
         user = User.objects.get(id=decoded["user_id"])
